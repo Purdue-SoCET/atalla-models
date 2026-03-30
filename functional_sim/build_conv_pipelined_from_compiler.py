@@ -15,7 +15,13 @@ import numpy as np
 
 from build import assemble_file, emit_test_format, DRAMWriter, render_testfile
 
-PPCI_ASM_PATH = Path("/home/asicfab/a/zhan4808/aihw-ppci-compiler/atalla_tests/conv_sa_pipelined.s")
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+PPCI_ASM_PATH = Path(
+    __import__("os").environ.get(
+        "ATALLA_COMPILER_PATH",
+        str(_REPO_ROOT / "aihw-ppci-compiler"),
+    )
+) / "atalla_tests/conv_sa_pipelined.s"
 
 SCALAR_REG_MAP = {f"x{i}": f"${i}" for i in range(34)}
 SCALAR_REG_MAP["x33"] = "$33"

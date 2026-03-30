@@ -1,117 +1,111 @@
 # atalla-models
 
-End-to-end pipeline: **PyTorch model → AtallaC → Atalla assembly → functional simulator**.
+End-to-end pipeline: PyTorch model -> AtallaC -> Atalla assembly -> functional simulator.
+
+## Setup
+
+`atalla-models` and `aihw-ppci-compiler` must be cloned as sibling directories:
+
+```
+workspace/
+├── atalla-models/
+└── aihw-ppci-compiler/
+```
+
+Use the `atalla_arch_emul_robert` branch of `aihw-ppci-compiler` for updated ISA fixes
+(sac operand, MTS/STM token layout, rcp.bf, build pipeline updates).
+
+Override the compiler path if your layout differs:
+
+```bash
+export ATALLA_COMPILER_PATH=/path/to/aihw-ppci-compiler
+```
 
 ## Pipeline Flow
 
 ```
 PyTorch nn.Module
-    │  torch.fx.symbolic_trace + ShapeProp
-    ▼
-FX Graph (normalized ops: matmul, conv, relu, softmax, maxpool, add, …)
-    │  tile_planner.py — assign DRAM addresses, compute tiling
-    ▼
+    |  torch.fx.symbolic_trace + ShapeProp
+    v
+FX Graph
+    |  tile_planner.py
+    v
 Tiled FX Graph
-    │  c_emitter.py — generate AtallaC / direct assembly per node
-    ▼
-AtallaC .c  ──► ppci atalla_cc -S ──► .s assembly
-                                          │  asm_converter.py (notation bridge)
-                                          ▼
-                              Emulator-compatible assembly
-                                          │  build.py assemble + render
-                                          ▼
-                                     .in test file
-                                          │  functional_sim run.py
-                                          ▼
-                                   Emulator output
+    |  c_emitter.py -- AtallaC per node + DRAMWriter tensor data
+    v
+AtallaC .c
+    |  ppci atalla_cc -S
+    v
+ppci .s
+    |  build_compiler.compile_asm() -- notation conversion + scheduling + encoding
+    v
+.in test file (instruction packets + .data tensor payloads)
+    |  functional_sim run.py
+    v
+Emulator output
 ```
 
 ## Directory Layout
 
 ```
 atalla-models/
-├── atalla-graph/          # PyTorch frontend + code generation
-│   ├── graph/             # FX capture, op normalization, tile planning
-│   │   ├── fx_capture.py        # symbolic_trace + ShapeProp + op mapping
-│   │   ├── remove_ops.py        # BN folding, dropout removal
-│   │   └── tile_planner.py      # tiling strategy + DRAM layout
-│   ├── codegen/           # Code generation backends
-│   │   ├── c_emitter.py         # AtallaC / hybrid asm emitter (primary)
-│   │   ├── asm_emitter.py       # Direct assembly emitter (reference)
-│   │   ├── asm_converter.py     # Compiler → emulator notation converter
-│   │   └── dram_builder.py      # Tensor serialization to .in data format
-│   ├── model/             # Model definitions
-│   │   ├── basic.py             # BasicModule (matmul + relu)
-│   │   └── alexnet.py           # AlexNetSmall (scaled-down AlexNet)
-│   └── run_model.py       # End-to-end orchestrator
-├── aihw-ppci-compiler/    # AtallaC → assembly compiler (ppci-based)
-│   ├── ppci/              # Compiler internals (IR, codegen, targets)
-│   ├── atalla_cc/         # Atalla C frontend
-│   └── atalla_tests/      # Reference AtallaC programs
-├── functional_sim/        # Atalla functional simulator
-│   ├── src/               # Simulator core (execute, decode, memory, …)
-│   ├── build.py           # Assembler + .in file builder
-│   ├── build_*.py         # Kernel generators (GEMM, conv, relu, …)
-│   ├── run.py             # Simulator entry point
-│   └── tests/             # Pre-built .in test files
-└── out/                   # Generated outputs and benchmarks
-    └── bench/             # Benchmark results + graphs
+    atalla-graph/
+        graph/         fx_capture.py, tile_planner.py, remove_ops.py
+        codegen/       c_emitter.py (primary), asm_emitter.py (reference)
+        model/         basic.py, alexnet.py
+        run_model.py
+    functional_sim/
+        build.py       DRAMWriter, render_testfile
+        build_*.py     kernel generators
+        run.py
+        tests/
+
+# sibling repo (not inside atalla-models):
+aihw-ppci-compiler/
+    ppci/arch/atalla/  compiler backend
+    emulator/          build_compiler.py: scheduler + encoder
+    atalla_cc/         AtallaC frontend
+    atalla_tests/      reference C programs
 ```
 
 ## Usage
 
-### Run a model through the pipeline
-
 ```bash
 cd atalla-graph
-
-# BasicModule (matmul + add + relu, smallest test)
 python run_model.py --model basic
-
-# AlexNet (5 conv, 6 relu, 3 FC, 3 maxpool)
 python run_model.py --model alexnet --scale 0.01
-```
-
-### Run individual kernels on the simulator
-
-```bash
-cd functional_sim
-
-# Build and run a tiled GEMM
-python build_gemm_tiled.py
-python run.py tests/gemm_tiled.in
-
-# Build and run AlexNet layer-by-layer
-python run_alexnet.py
 ```
 
 ## Key Design Decisions
 
-- **Hybrid compilation strategy**: Compute-heavy kernels (GEMM, Conv, Linear, ReLU, Softmax) use direct, proven assembly from `build_*.py` generators rather than C-compiled code. The C compiler path (`c_emitter.py → ppci → asm_converter.py`) is wired and functional but the compiler has a vector register spill bug (stores only 1 of 32 vector elements) that corrupts multi-intrinsic kernels.
+**C compiler path for all compute ops.** ReLU, Softmax, GEMM, Conv, and Linear generate
+AtallaC via `c_emitter.py`, compiled through ppci to `.s`, then scheduled and encoded by
+`build_compiler.compile_asm()` from `aihw-ppci-compiler/emulator/`. Non-compute ops
+(MaxPool, elementwise add/mul, adaptive avg pool) fall back to NumPy.
 
-- **Assembly notation bridge (`asm_converter.py`)**: The ppci compiler outputs underscore-separated mnemonics (`add_s`, `vreg_ld`) with symbolic registers (`x0`, `v1`, `m3`). The emulator expects dot-separated mnemonics (`add.s`, `vreg.ld`) with `$N` registers and numeric mask values. The converter handles all known differences including operand reordering for `vreg.ld/st` and `scpad.ld/st`.
+**`build_compiler.compile_asm()` replaces the legacy `asm_converter.py`.** Handles notation
+conversion (underscore to dot mnemonics, symbolic to $N registers), hazard scheduling, and
+binary encoding in one pass. Supports updated ISA instruction formats (register-based
+scpad_ld/st, 5-arg vreg_ld/st, sac on VV ops).
 
-- **NumPy fallback for non-compute ops**: MaxPool, elementwise add/mul, and adaptive average pooling run in NumPy rather than on the emulator. These ops lack efficient hardware paths and don't benefit from acceleration.
+**DRAMWriter data section.** `c_emitter.py` writes tensor data (weights, inputs, outputs)
+to a `DRAMWriter` keyed by byte address. `render_in_file()` merges instruction packets with
+the `.data` section into a single `.in` file.
 
-- **Per-layer execution**: Each layer runs as a standalone emulator invocation with its own `.in` file. Activations are passed between layers via the Python orchestrator. This matches the emulator's single-kernel execution model.
+**Per-layer execution.** Each layer is a standalone emulator invocation. Activations pass
+between layers via the Python orchestrator.
 
-- **BF16 throughout**: All weights and activations are quantized to bfloat16 before entering the pipeline. Accumulation drift vs. float32 PyTorch reference is expected and tracked via cosine similarity.
+## Compiler Status
 
-## Compiler Limitations Addressed
-
-| Issue | Resolution |
-|-------|------------|
-| Compiler emits `_` mnemonics, emulator expects `.` | `asm_converter.py` regex transforms |
-| Compiler uses `xN`/`vN`/`mK` registers, emulator uses `$N` | `asm_converter.py` register mapping |
-| Compiler emits `halt`, emulator expects `halt.s` | `asm_converter.py` mnemonic remap |
-| Compiler emits `nop`, emulator expects `nop.s` | `asm_converter.py` mnemonic remap |
-| `vreg.ld/st` operand order differs | `asm_converter.py` operand swap |
-| `scpad.ld/st` operand order differs | `asm_converter.py` operand swap |
-| No `lw.vi` intrinsic for weight preload | Direct assembly for GEMM kernels |
-| Vector spill saves only 1/32 elements | Direct assembly for vector-heavy kernels |
-| No `div_vs` in inline assembler | Use `rcp_bf` + masked multiply workaround |
-| Compiler emits `.section`/`.align` directives | `asm_converter.py` strips them |
-
-## Validation
-
-Both `BasicModule` and `AlexNetSmall` produce **identical outputs** (cosine similarity = 1.0) between the new `c_emitter` pipeline and the reference `asm_emitter` pipeline across all emulated kernels.
+| Issue | Status |
+|-------|--------|
+| Notation mismatch (mnemonics, registers) | Fixed via build_compiler.compile_asm() |
+| sac operand missing from VV instructions | Fixed in atalla_arch_emul_robert |
+| MTS/STM token bit layout swapped | Fixed in atalla_arch_emul_robert |
+| halt/nop opcode mismatch | Fixed in atalla_arch_emul_robert |
+| Vector spill stores only 1/32 elements | Fixed: ty="VEC" on AtallaVectorRegister |
+| rcp.bf not recognized | Fixed in atalla_arch_emul_robert |
+| vreg_ld/st 7-arg format in C templates | Fixed in c_emitter.py (now 5-arg) |
+| scpad_ld/st 5-arg format in C templates | Fixed in c_emitter.py (now 3-register) |
+| No lw.vi intrinsic for systolic weight preload | Pending |
+| Compiler only colors v1/v2 vector registers | Pending |

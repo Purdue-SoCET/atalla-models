@@ -71,7 +71,6 @@ class CParser(RecursiveDescentParser):
             "signed",
             "unsigned",
             "vec",
-            "mask",
             "__builtin_va_list",
         }
 
@@ -478,6 +477,7 @@ class CParser(RecursiveDescentParser):
 
     def parse_variable_declaration(self, decl_spec, declarator):
         """Parse variable declaration optionally followed by initializer."""
+        # Create the variable:
         variable = self.semantics.on_variable_declaration(
             decl_spec.storage_class,
             decl_spec.typ,
@@ -486,13 +486,7 @@ class CParser(RecursiveDescentParser):
             declarator.location,
         )
 
-        if self.peek == "asm":
-            self.consume("asm")
-            self.consume("(")
-            reg_name = self.parse_string()
-            self.consume(")")
-            variable.asm_register = reg_name
-
+        # Handle the initial value:
         if self.has_consumed("="):
             initializer = self.parse_initializer(variable.typ)
             self.semantics.on_variable_initialization(variable, initializer)

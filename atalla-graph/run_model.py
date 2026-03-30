@@ -25,9 +25,18 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-# Add functional_sim to path
+# Add functional_sim to path — must import emulator components BEFORE c_emitter
+# because c_emitter adds aihw-ppci-compiler/emulator to sys.path, whose src/
+# package shadows functional_sim/src/.
 _FUNC_SIM = Path(__file__).resolve().parent.parent / "functional_sim"
 sys.path.insert(0, str(_FUNC_SIM))
+
+from src.functional_sim import run as run_emulator
+from src.misc.memory import Memory
+from src.components.scalar_register_file import ScalarRegisterFile
+from src.components.vector_register_file import VectorRegisterFile
+from src.components.execute import ExecuteUnit
+from src.components.scpad import Scratchpad
 
 from graph.fx_capture import capture, normalize_ops, get_node_shape
 from graph.remove_ops import remove_ops
@@ -37,20 +46,13 @@ from codegen.c_emitter import (
 )
 from codegen.dram_builder import extract_input_data
 
-from src.functional_sim import run as run_emulator
-from src.misc.memory import Memory
-from src.components.scalar_register_file import ScalarRegisterFile
-from src.components.vector_register_file import VectorRegisterFile
-from src.components.execute import ExecuteUnit
-from src.components.scpad import Scratchpad
-
 
 def bf16_to_f32(bits: int) -> float:
     return struct.unpack("<f", struct.pack("<I", (bits & 0xFFFF) << 16))[0]
 
 
-def run_on_emulator(in_file: str, out_dir: str, tag: str) -> Memory:
-    """Run the emulator and return post-execution memory."""
+def run_on_emulator(in_file: str, out_dir: str, tag: str):
+    """Run the emulator and return (Memory, ExecuteUnit)."""
     mem = Memory(in_file)
     sregs = ScalarRegisterFile()
     mregs = ScalarRegisterFile(num_regs=16)
@@ -59,6 +61,13 @@ def run_on_emulator(in_file: str, out_dir: str, tag: str) -> Memory:
     SP1 = Scratchpad(slots_per_bank=32)
     EU = ExecuteUnit()
 
+    # ppci compiler uses x2 as scalar stack pointer and x33 as vector
+    # spill base.  Place the stack above all DRAM data so sw.s writes
+    # don't clobber matrix data loaded by DRAMWriter.
+    max_data_addr = max(mem.data_mem.keys()) if mem.data_mem else 0
+    stack_base = ((max_data_addr + 0x1000) & ~0xFFF) + 0x1000
+    sregs.write(2, stack_base)
+    sregs.write(33, stack_base)
     os.makedirs(out_dir, exist_ok=True)
     prefix = f"{out_dir}/{tag}"
 
@@ -72,7 +81,7 @@ def run_on_emulator(in_file: str, out_dir: str, tag: str) -> Memory:
         f"{prefix}_sp1.out",
         f"{prefix}_perf.out",
     )
-    return mem
+    return mem, EU
 
 
 def read_bf16_from_memory(mem: Memory, addr: int, count: int) -> np.ndarray:
@@ -127,6 +136,7 @@ def run_pipeline(model: nn.Module, example_input: torch.Tensor,
     ref_activations = extract_input_data(gm, example_input.bfloat16())
 
     stats = {"nodes_total": 0, "nodes_emulated": 0, "nodes_numpy": 0, "nodes_passthrough": 0}
+    kernel_metrics = []  # per-kernel detailed metrics
 
     for node in gm.graph.nodes:
         atalla_op = node.meta.get("atalla_op")
@@ -196,11 +206,21 @@ def run_pipeline(model: nn.Module, example_input: torch.Tensor,
             continue
 
         if emission.skip_emulator:
-            # NumPy fallback (maxpool, add, adaptive_avg_pool)
             activation_cache[node.name] = emission.numpy_result
             stats["nodes_numpy"] += 1
+            r = emission.numpy_result
+            ref = ref_activations.get(node.name)
+            km = {"name": node.name, "op": atalla_op, "backend": "numpy",
+                  "shape": list(r.shape), "elems": int(r.size),
+                  "min": float(r.min()), "max": float(r.max())}
+            if ref is not None:
+                rf, ef = ref.flatten(), r.flatten()
+                ml = min(len(rf), len(ef))
+                km["max_diff"] = float(np.max(np.abs(rf[:ml] - ef[:ml])))
+                km["cos_sim"] = float(np.dot(rf[:ml], ef[:ml]) /
+                    (np.linalg.norm(rf[:ml]) * np.linalg.norm(ef[:ml]) + 1e-12))
+            kernel_metrics.append(km)
             if verbose:
-                r = emission.numpy_result
                 print(f"  [{node.name}] {atalla_op} -> NumPy ({r.shape}, "
                       f"range=[{r.min():.4f}, {r.max():.4f}])")
             continue
@@ -216,7 +236,7 @@ def run_pipeline(model: nn.Module, example_input: torch.Tensor,
                   f"(out_addr=0x{emission.output_addr:X}, "
                   f"elems={emission.output_elements})...", end=" ", flush=True)
 
-        mem = run_on_emulator(in_file, out_dir, node.name)
+        mem, eu = run_on_emulator(in_file, out_dir, node.name)
         result = read_bf16_from_memory(mem, emission.output_addr, emission.output_elements)
 
         if emission.output_shape:
@@ -227,6 +247,27 @@ def run_pipeline(model: nn.Module, example_input: torch.Tensor,
 
         activation_cache[node.name] = result
         stats["nodes_emulated"] += 1
+
+        pm = eu.perf_metrics.metrics
+        ref = ref_activations.get(node.name)
+        km = {"name": node.name, "op": atalla_op, "backend": "emulator",
+              "shape": list(result.shape) if hasattr(result, 'shape') else [],
+              "elems": int(result.size),
+              "min": float(result.min()), "max": float(result.max()),
+              "cycles": int(pm.get("cycles", 0)),
+              "instructions": int(pm.get("instructions", 0)),
+              "gemm_ops": int(pm.get("gemm_ops", 0)),
+              "sdma_ops": int(pm.get("sdma_ops", 0)),
+              "mem_ops": int(pm.get("mem_ops", 0)),
+              "has_nan": bool(np.any(np.isnan(result)))}
+        if ref is not None:
+            rf, ef = ref.flatten(), result.flatten()
+            ml = min(len(rf), len(ef))
+            km["max_diff"] = float(np.max(np.abs(rf[:ml] - ef[:ml])))
+            d = np.dot(rf[:ml], ef[:ml])
+            n1, n2 = np.linalg.norm(rf[:ml]), np.linalg.norm(ef[:ml])
+            km["cos_sim"] = float(d / (n1 * n2 + 1e-12))
+        kernel_metrics.append(km)
 
         if verbose:
             print(f"done (range=[{result.min():.4f}, {result.max():.4f}])")
@@ -260,6 +301,7 @@ def run_pipeline(model: nn.Module, example_input: torch.Tensor,
         "elapsed_s": elapsed,
         "emulator_output": emulator_output,
         "reference_output": ref_output,
+        "kernel_metrics": kernel_metrics,
     }
 
     if emulator_output is not None and ref_output is not None:

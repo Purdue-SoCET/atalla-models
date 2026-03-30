@@ -646,10 +646,10 @@ def generate_graphs(results: List[BenchResult]):
         sizes_a = [int(r.params.split(",")[0].split("=")[1]) for r in attn]
         fig, axes = plt.subplots(1, 3, figsize=(18, 5))
         axes[0].plot(sizes_a, [int(r.cycles) for r in attn], "o-",
-                    color=COLORS["Attention"], linewidth=2, markersize=8)
+                color=COLORS["Attention"], linewidth=2, markersize=8)
         axes[0].set_title("Cycles"); axes[0].set_xlabel("Seq Length S"); axes[0].grid(True, alpha=0.3)
         axes[1].plot(sizes_a, [int(r.instructions) for r in attn], "s-",
-                    color=COLORS["Attention"], linewidth=2, markersize=8)
+                color=COLORS["Attention"], linewidth=2, markersize=8)
         axes[1].set_title("Instructions"); axes[1].set_xlabel("Seq Length S"); axes[1].grid(True, alpha=0.3)
         axes[2].plot(sizes_a, [int(r.theoretical_flops)/max(int(r.cycles),1) for r in attn],
                     "^-", color=COLORS["Attention"], linewidth=2, markersize=8)
@@ -736,7 +736,7 @@ def generate_graphs(results: List[BenchResult]):
             gemm_f.append(g/ti*100); mem_f.append(m/ti*100)
             branch_f.append(b/ti*100); scalar_f.append(max(0, s/ti*100))
         x = np.arange(len(mix_sub))
-        bottom = np.zeros(len(x))
+    bottom = np.zeros(len(x))
         for data, lbl, col in [(gemm_f,"GEMM ops","#1565C0"), (mem_f,"Memory","#4CAF50"),
                                 (branch_f,"Branch","#FF9800"), (scalar_f,"Scalar/Other","#9E9E9E")]:
             ax.bar(x, data, 0.65, bottom=bottom, label=lbl, color=col)
@@ -744,9 +744,9 @@ def generate_graphs(results: List[BenchResult]):
         ax.set_xticks(x); ax.set_xticklabels(labels_m, rotation=50, ha="right", fontsize=7)
         ax.set_ylabel("% of Instructions"); ax.set_ylim(0, 115)
         ax.set_title("Instruction Mix Breakdown"); ax.legend(loc="upper right", fontsize=8)
-        plt.tight_layout()
+    plt.tight_layout()
         plt.savefig(f"{GD}/08_instruction_mix.png", dpi=150)
-        plt.close()
+    plt.close()
 
     # ======================================================================
     # 09. Instruction Mix — normalized per kernel type (grouped)
@@ -790,9 +790,9 @@ def generate_graphs(results: List[BenchResult]):
         ax.set_xlabel("Arithmetic Intensity (FLOPS / Byte)")
         ax.set_title("Arithmetic Intensity")
         ax.axvline(x=1.0, color="gray", linestyle="--", alpha=0.5)
-        plt.tight_layout()
+    plt.tight_layout()
         plt.savefig(f"{GD}/10_arithmetic_intensity.png", dpi=150)
-        plt.close()
+    plt.close()
 
     # ======================================================================
     # 11. Roofline — all kernel types
@@ -847,7 +847,7 @@ def generate_graphs(results: List[BenchResult]):
             sub = [r for r in alexnet_all if r.params.startswith(sc_tag)]
             type_cyc = {}
             for r in sub:
-                t = r.kernel.split("-")[1]
+            t = r.kernel.split("-")[1]
                 type_cyc[t] = type_cyc.get(t, 0) + int(r.cycles)
             if type_cyc:
                 ax.pie(list(type_cyc.values()), labels=list(type_cyc.keys()),
@@ -940,10 +940,10 @@ def generate_graphs(results: List[BenchResult]):
         ax.set_ylabel("Instructions / Packet")
         ax.set_title("VLIW Packet Utilization (higher = better slot usage)")
         ax.axhline(y=4.0, color="red", linestyle="--", alpha=0.4, label="Max (4 slots)")
-        ax.legend()
-        plt.tight_layout()
+    ax.legend()
+    plt.tight_layout()
         plt.savefig(f"{GD}/17_packet_utilization.png", dpi=150)
-        plt.close()
+    plt.close()
 
     # ======================================================================
     # 18. Memory Bandwidth — bytes loaded vs cycles

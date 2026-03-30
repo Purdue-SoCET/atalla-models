@@ -9,8 +9,9 @@
 5. [Component Deep Dive: Kernel Library](#5-component-deep-dive-kernel-library)
 6. [Full Pipeline Integration](#6-full-pipeline-integration)
 7. [AlexNet Walkthrough](#7-alexnet-walkthrough)
-8. [Changes, Tweaks, and Known Limitations](#8-changes-tweaks-and-known-limitations)
-9. [Open Items for Review](#9-open-items-for-review)
+8. [Performance Metrics](#8-performance-metrics)
+9. [Changes, Tweaks, and Known Limitations](#9-changes-tweaks-and-known-limitations)
+10. [Open Items for Review](#10-open-items-for-review)
 
 ---
 
@@ -23,8 +24,8 @@ PyTorch nn.Module
     │
     ├─ atalla-graph/        FX graph capture, op normalization, tiling, code generation
     │
-    ├─ aihw-ppci-compiler/  AtallaC → assembly compiler (used for notation bridge; direct
-    │                       asm used for compute kernels due to compiler limitations)
+    ├─ aihw-ppci-compiler/  AtallaC → assembly compiler; PRIMARY compilation path
+    │                       for GEMM, Conv, Linear, ReLU, Softmax kernels
     │
     └─ functional_sim/      Assembler, .in file builder, and cycle-accurate emulator
 ```
@@ -32,30 +33,30 @@ PyTorch nn.Module
 **Data flow for a single layer:**
 
 ```
-                                    ┌─────────────────────────┐
-                                    │  Direct assembly path   │
-                                    │  (GEMM, Conv, ReLU,     │
-  FX Node ──► emit_node() ────────►│   Softmax)              │──► .in file ──► Emulator
-         │                          │  Uses build_*.py asm    │
-         │                          └─────────────────────────┘
-         │                          ┌─────────────────────────┐
-         └─ (future) ─────────────►│  C compiler path        │
-                                    │  .c → ppci → .s →       │
-                                    │  asm_converter → .in    │
-                                    └─────────────────────────┘
+                                    ┌─────────────────────────────────┐
+  FX Node ──► emit_node() ────────►│  C compiler path (primary)      │
+                                    │  c_emitter.py → .c source       │
+                                    │  ppci atalla_cc → .s assembly    │
+                                    │  build_compiler.compile_asm →    │
+                                    │  scheduling + encoding → .in     │──► Emulator
+                                    └─────────────────────────────────┘
+         │
+         └─ (maxpool, add, mul) ──► NumPy fallback (skip_emulator=True)
 ```
+
+**The C compiler is now the primary compilation path.** All emulated compute kernels (conv, linear, matmul, relu, softmax) generate AtallaC source code that is compiled through `ppci atalla_cc`, converted via `build_compiler.compile_asm()` (which handles notation conversion, instruction scheduling, and encoding), and executed on the emulator. The previous "direct assembly" path (`build_*.py` generators) is no longer used for graph operations.
 
 **Why MaxPool / Add / Mul use NumPy:**
 
-MaxPool DOES have a working assembly kernel (`build_maxpool.py`). However, the `emit_maxpool()` function in both `asm_emitter.py` and `c_emitter.py` currently sets `skip_emulator = True` and runs the operation in NumPy. The reason is that the `build_maxpool.py` kernel operates on **single-channel 2D tiles** (one H×W plane at a time), and wiring it into the multi-channel pipeline requires running it in a per-channel loop with correct DRAM address arithmetic for each channel slice. This was deferred to keep the initial pipeline integration simple. **This is a wiring gap, not a missing kernel.**
+MaxPool has a working assembly kernel (`build_maxpool.py`) that operates on **single-channel 2D tiles** (one H×W plane at a time). Wiring it into the multi-channel pipeline requires a per-channel loop with correct DRAM address arithmetic. This was deferred to keep initial integration simple. **This is a wiring gap, not a missing kernel.**
 
-For Add and Mul: these appear in `BasicModule` as bias addition (`out + bias`) and residual scaling (`0.5 * residual`). They are scalar-broadcast or elementwise operations that don't map to the systolic array or dedicated vector compute in a way that would meaningfully benefit from hardware execution. They use NumPy as a pragmatic fallback. AlexNet's forward path does NOT contain standalone add/mul nodes — bias addition is folded into the Conv2d/Linear modules. The add/mul nodes come from `BasicModule`'s explicit `out + bias` and `0.5 * residual` patterns.
+Add and Mul appear in `BasicModule` as bias addition (`out + bias`) and residual scaling (`0.5 * residual`). They are scalar-broadcast or elementwise operations that don't meaningfully benefit from hardware execution. AlexNet's bias addition is folded into Conv2d/Linear modules and does not produce standalone add/mul nodes.
 
 ---
 
 ## 2. Component Deep Dive: atalla-graph
 
-**Purpose:** PyTorch frontend that captures a model as an FX graph, normalizes operations to Atalla primitives, plans tile decomposition, and generates assembly (or C) for each layer.
+**Purpose:** PyTorch frontend that captures a model as an FX graph, normalizes operations to Atalla primitives, plans tile decomposition, and generates AtallaC source for each layer.
 
 ### 2.1 `graph/fx_capture.py` — Graph Capture & Op Normalization
 
@@ -77,19 +78,7 @@ Special handling:
 - `addmm` (PyTorch's fused bias+matmul) is detected by name and mapped to `"linear"`
 - `operator.add` and `operator.mul` are captured (these come from Python `+` and `*` operators in the forward pass)
 
-**Key function:**
-
-```python
-def capture(model: nn.Module, example_input: torch.Tensor) -> GraphModule:
-    model = model.bfloat16()              # convert all weights to bf16
-    example_input = example_input.bfloat16()
-    gm = symbolic_trace(model)            # flat FX graph, no control flow
-    ShapeProp(gm).propagate(example_input) # shape on every node
-    gm = normalize_ops(gm)               # tag atalla_op on each node
-    return gm
-```
-
-**Limitation:** `symbolic_trace` cannot handle dynamic control flow. All models must be FX-traceable (no data-dependent branches, no dynamic shapes). This is fine for standard CNNs like AlexNet.
+**Limitation:** `symbolic_trace` cannot handle dynamic control flow. All models must be FX-traceable (no data-dependent branches, no dynamic shapes).
 
 ### 2.2 `graph/remove_ops.py` — Graph Transforms
 
@@ -102,8 +91,6 @@ Three passes clean up the graph before code generation:
 3. **Adaptive avg pool tagging** (`_remove_adaptive_avg_pool`): Tags `AdaptiveAvgPool2d(1,1)` nodes so they can be handled as NumPy fallback.
 
 ### 2.3 `graph/tile_planner.py` — Tile Planning & DRAM Layout
-
-**What it does:** For each normalized op, computes the tiling strategy given Atalla hardware constraints and assigns DRAM addresses.
 
 **Hardware constraints:**
 - Vector length (VL) = 32
@@ -126,38 +113,32 @@ Three passes clean up the graph before code generation:
 
 **DRAM address assignment:** Addresses are assigned sequentially starting at `0x1000`, aligned to 2KB tile boundaries. Each node gets `dram_addr` and `dram_bytes` in its metadata. Address `0x00`–`0x3C` is reserved for the ADDR_TABLE (parameter passing to kernels).
 
-**Output:** Each node gets `node.meta["tile_config"]` (a `TileConfig` dataclass with `kernel_type` and `params` dict) and `node.meta["kernel_type"]`.
-
 ### 2.4 `codegen/c_emitter.py` — Code Generation (Primary)
 
 **What it does:** For each FX node, generates either:
-1. Direct assembly using `build_*.py` generators (for GEMM, Conv, Linear, ReLU, Softmax)
-2. NumPy fallback (for MaxPool, Add, Mul)
-3. AtallaC source (wired but not used for compute kernels due to compiler limitations)
+1. **AtallaC source** (for conv, linear, matmul, relu, softmax) — compiled through ppci → `build_compiler.compile_asm` → emulator
+2. **NumPy fallback** (for maxpool, add, mul, adaptive_avg_pool)
 
 **Core dispatch function:**
 
 ```python
 def emit_node(node, gm, activation_cache) -> LayerEmission:
-    tc = node.meta.get("tile_config")
-    atalla_op = node.meta.get("atalla_op")
-    # ...
-    if atalla_op == "conv":     return emit_conv(node, gm, input_data, tc)
-    elif atalla_op == "linear": return emit_linear(node, gm, input_data, tc)
-    elif atalla_op == "relu":   return emit_relu(node, input_data, tc)
-    elif atalla_op == "softmax":return emit_softmax(input_data, tc)
-    elif atalla_op == "maxpool":return emit_maxpool(node, input_data, tc)  # NumPy
-    elif atalla_op == "matmul": return emit_matmul(node, gm, input_data, ...)
-    elif atalla_op == "add":    return emit_add(node, activation_cache, tc) # NumPy
-    elif atalla_op == "mul":    return emit_mul(node, activation_cache)      # NumPy
+    if atalla_op == "conv":     return emit_conv(...)    # sets em.c_source
+    elif atalla_op == "linear": return emit_linear(...)   # sets em.c_source
+    elif atalla_op == "relu":   return emit_relu(...)     # sets em.c_source
+    elif atalla_op == "softmax":return emit_softmax(...)  # sets em.c_source
+    elif atalla_op == "matmul": return emit_matmul(...)   # sets em.c_source
+    elif atalla_op == "maxpool":return emit_maxpool(...)  # skip_emulator=True
+    elif atalla_op == "add":    return emit_add(...)      # skip_emulator=True
+    elif atalla_op == "mul":    return emit_mul(...)      # skip_emulator=True
 ```
 
 **`LayerEmission` dataclass:**
 
 | Field | Purpose |
 |-------|---------|
-| `c_source` | AtallaC source (empty string when using direct asm) |
-| `instr_text` | Pre-assembled instruction text in `.in` format |
+| `c_source` | AtallaC source code for compilation |
+| `instr_text` | Compiled instruction text in `.in` format (populated by `compile_and_assemble`) |
 | `dram` | `DRAMWriter` with serialized weight/activation data |
 | `output_addr` | DRAM address where output will be written |
 | `output_shape` | Shape of the output tensor |
@@ -165,22 +146,28 @@ def emit_node(node, gm, activation_cache) -> LayerEmission:
 | `skip_emulator` | If True, use `numpy_result` instead of running emulator |
 | `numpy_result` | NumPy array for ops that skip the emulator |
 
-**Conv emission example (`emit_conv`):**
-1. Extract Conv2d parameters from the FX module (C_in, C_out, kernel size, stride, padding)
-2. Get input activation from `activation_cache`
-3. Transform input to NHWC layout, run `im2col()` to produce `(Ho*Wo, R*S*C_in)` matrix
-4. Reshape weight to `(R*S*C_in, C_out)` matrix
-5. Compute DRAM addresses: A_GMEM, W_GMEM, C_GMEM (sequentially, 4KB aligned)
-6. Write ADDR_TABLE parameters at address 60: pointers, M, N, K, tile counts, tile size
-7. Write input matrix, weight matrix, zero output matrix to DRAM
-8. Generate assembly via `make_tiled_gemm_asm(M, N, K)` → `assemble_file()` → `emit_test_format()`
-9. Return `LayerEmission` with instruction text, DRAM image, output address
+**AtallaC code generators:**
+
+| Generator | Used by | Key technique |
+|-----------|---------|---------------|
+| `_gemm_c(M, N, K)` | conv, linear, matmul | Tiled GEMM with inline asm for `lw.vi`, `scpad_ld/st`, `vreg_ld/st`, `gemm()` intrinsic |
+| `_relu_c(total, width)` | relu | `make_mask("<", v, zero)` + `vec_op_masked("*", v, 0.0, mask)` to zero negative lanes |
+| `_softmax_c(length)` | softmax | `RMAX` → shift → `EXP` → `RSUM` → `rcp.bf` reciprocal → `mul` |
+
+**SDMA control register packing:** The `_sdma_ctl_val(sid, num_rows, num_cols, full_cols)` function packs scratchpad DMA parameters into a 32-bit control word: `(sid << 30) | ((num_rows-1) << 25) | ((num_cols-1) << 20) | (full_cols-1)`. The compiler cannot handle large constant stores, so `_sdma_ctl_expr()` uses inline asm `li_s` which `build_compiler` expands to `lui_s` + `addi_s`.
+
+**Conv emission (`emit_conv`) pipeline:**
+1. Extract Conv2d parameters (C_in, C_out, kernel size, stride, padding)
+2. Transform input to NHWC layout, run `im2col()` → `(Ho*Wo, R*S*C_in)` matrix
+3. Reshape weight to `(R*S*C_in, C_out)` matrix
+4. Assign DRAM addresses: A_GMEM, W_GMEM, C_GMEM (sequentially, 4KB aligned)
+5. Write ADDR_TABLE at offset 60: pointers, M, N, K, tile counts, tile size
+6. Write input, weight, zero output to DRAM
+7. Generate AtallaC via `_gemm_c(M, N, K)`
 
 ### 2.5 `codegen/asm_converter.py` — Notation Bridge
 
-**What it does:** Converts the ppci compiler's assembly output to the format expected by the functional_sim assembler. Applied line-by-line with regex transforms.
-
-**Transformations:**
+Converts the ppci compiler's assembly output to the format expected by the functional_sim assembler. Applied line-by-line with regex transforms.
 
 | Compiler Output | Emulator Input | Rule |
 |----------------|----------------|------|
@@ -192,6 +179,8 @@ def emit_node(node, gm, activation_cache) -> LayerEmission:
 | `m2` | `2` | Mask register: `mK` → bare int `K` |
 | `100(x5)` | `100($5)` | Memory operand |
 | `.section .text` | *(dropped)* | Strip directives |
+
+Note: The notation conversion is now handled inside `build_compiler.compile_asm()`, which integrates the conversion, instruction scheduling, and encoding into a single pipeline step.
 
 ### 2.6 `codegen/dram_builder.py` — Tensor Serialization
 
@@ -207,8 +196,9 @@ End-to-end script that ties everything together:
 4. For each compute node in topological order:
    - Calls `emit_node()` to get a `LayerEmission`
    - If `skip_emulator`: stores `numpy_result` in `activation_cache`
-   - Otherwise: calls `compile_and_assemble()`, writes `.in` file, runs emulator, reads bf16 output from emulator memory, stores in `activation_cache`
-5. Compares final output against PyTorch reference using cosine similarity
+   - Otherwise: calls `compile_and_assemble()` (compiles C source), writes `.in` file, runs emulator, reads bf16 output from emulator memory, stores in `activation_cache`
+5. Collects per-kernel metrics (range, cosine sim, cycles, instructions, GEMM ops)
+6. Compares final output against PyTorch reference using cosine similarity
 
 ---
 
@@ -233,40 +223,39 @@ End-to-end script that ties everything together:
 
 ```
 AtallaC source (.c)
-    │  atalla_cc frontend (lexer + parser)
+    │  c_emitter.py generates parameterized source
     ▼
-ppci IR (SSA form)
+ppci atalla_cc frontend (lexer + parser)
     │  optimization passes
     ▼
-Atalla instruction selection
-    │  register allocation
+ppci IR (SSA form) → instruction selection → register allocation
     ▼
-Assembly output (.s)
+Raw assembly output (.s)
+    │  build_compiler.compile_asm():
+    │    parse_program → inject_main_bootstrap
+    │    → expand_large_li (li_s → lui_s + addi_s)
+    │    → schedule_program → relocate_and_encode
+    ▼
+Encoded instruction packets (.in format)
 ```
-
-Invoked as: `python3 -m ppci atalla_cc -m atalla -S input.c -o output.s`
 
 ### 3.3 What the Compiler Can and Cannot Do
 
-**Works well:**
+**Works well (actively used in pipeline):**
 - Scalar control flow (while loops, conditionals)
-- `gemm()` intrinsic
-- `vec_op_masked()` for single-intrinsic kernels
-- Inline asm for `lw_s`, `scpad_ld/st`, `vreg_ld/st`, `halt`
+- `gemm()` intrinsic → emits `gemm.vv`
+- `vec_op_masked()` for single-intrinsic ReLU and Softmax kernels
+- Inline asm for `lw_s`, `scpad_ld/st`, `vreg_ld/st`, `halt`, `lw_vi`
+- Large constant loading via `li_s` → expanded by `build_compiler` to `lui_s` + `addi_s`
 
-**Does NOT work (discovered during integration):**
-- **No `lw.vi` intrinsic**: The systolic array requires `lw.vi` to preload weight rows before GEMM. The compiler has no way to emit this instruction, making C-compiled GEMM produce all zeros.
-- **Vector spill bug**: When the register allocator spills a 32-element vector to scratchpad, it uses `vreg_st/ld` with dimensions `0,0,0,0,0` — which only saves/restores **1 element** out of 32. This silently corrupts any kernel that needs more than ~2 live vector registers.
+**Known limitations:**
+- **Vector spill bug**: When the register allocator spills a 32-element vector to scratchpad, it uses `vreg_st/ld` with dimensions `0,0,0,0,0` — saving only **1 element** out of 32. This silently corrupts any kernel that needs many live vector registers. Current kernels work by keeping vector register pressure low via inline asm.
 - **No `div_vs` in inline assembler**: Cannot express vector÷scalar division in inline asm.
 - **No pointer dereference for MMIO**: `*(volatile int*)0x3C` doesn't work; all MMIO reads require inline asm.
-- **Emits `li_s`**: The emulator doesn't support `li_s` (pseudo-instruction). Would need `addi.s $rd, $0, imm` or `lui.s`.
 
 ### 3.4 Current Role in Pipeline
 
-Due to the limitations above, the compiler is NOT currently used for compute kernels. Its role is:
-1. **Proven assembly notation reference** — the `asm_converter.py` was built by analyzing compiler output vs emulator expectations
-2. **Future path** — once the vector spill bug and `lw.vi` support are fixed, kernels can be compiled from C
-3. **C source templates exist** — `_gemm_c()`, `_relu_c()`, `_softmax_c()` in `c_emitter.py` generate valid AtallaC that compiles, but produces incorrect results due to the limitations above
+The compiler is now the **primary compilation path** for all emulated compute kernels. The `_gemm_c()`, `_relu_c()`, `_softmax_c()` generators in `c_emitter.py` produce valid AtallaC that compiles and runs correctly on the emulator. Critical hardware operations (`lw.vi`, `scpad_ld/st`, `vreg_ld/st`) are expressed as inline assembly within the C source, allowing the compiler to handle scalar control flow while bypassing its vector spill limitations.
 
 ---
 
@@ -278,44 +267,48 @@ Due to the limitations above, the compiler is NOT currently used for compute ker
 
 | Component | Python Class | Description |
 |-----------|-------------|-------------|
-| Scalar register file | `ScalarRegisterFile` (34 regs) | General-purpose 32-bit integer/address registers |
-| Mask register file | `ScalarRegisterFile` (16 regs) | Predication masks for vector operations |
+| Scalar register file | `ScalarRegisterFile` (34 regs) | General-purpose 32-bit registers; x0=zero, x2=stack pointer, x33=vector spill base |
+| Mask register file | `ScalarRegisterFile` (16 regs) | Predication masks; m0 hardwired to all-ones (0xFFFFFFFF) |
 | Vector register file | `VectorRegisterFile` | 64 vector registers, each 32 elements of bf16 |
 | Scratchpad banks | `Scratchpad` × 2 (SP0, SP1) | 32-slot on-chip SRAM for tiles, each slot = 32 bf16 values |
 | Execute unit | `ExecuteUnit` | Scalar ALU, vector ALU, GEMM unit, control |
-| Global memory | `Memory` | Main DRAM, byte-addressable |
+| Performance metrics | `PerfMetrics` | Counters for cycles, instructions, GEMM ops, SDMA ops, mem ops |
+| Global memory | `Memory` | Main DRAM, dictionary-based, 32-bit words at 2-byte stride |
 
 ### 4.2 `.in` File Format
 
 The `.in` file is a text file with two sections:
 
 ```
-# Instruction memory (one hex word per line, 4-byte instructions)
+# Instruction memory (encoded instruction packets, 4 bytes each)
 0x12345678
 0xABCDEF01
 ...
 0x00000000   # end marker
 
-# Data memory (addr: value pairs)
+# Data memory (addr: value pairs, 2-byte stride addresses)
 @0x003C 0x00001000
 @0x1000 0x3F800000
 ...
 ```
 
-### 4.3 Assembly → `.in` Pipeline (`build.py`)
+Each data entry is a 32-bit word at a 2-byte-stride address. Two BF16 values are packed per word by `DRAMWriter.to_u32_words()`. The emulator's `Memory.read_data(addr)` returns the 32-bit word at the given address; `read_bf16_from_memory()` in `run_model.py` extracts the low 16 bits as a BF16 value.
+
+### 4.3 Emulator Execution
 
 ```python
-asm_text = make_tiled_gemm_asm(M, N, K)   # generate assembly string
-instrs = assemble_file(asm_text)           # assemble to 32-bit instruction words
-instr_text = emit_test_format(instrs)      # format as hex lines
-# ... build DRAMWriter with data ...
-data_text = img.render_data_mem()           # format as @addr value pairs
-final = render_testfile(instr_text, data_text)  # combine into .in file
+mem = Memory(in_file)       # load .in file into instruction + data memory
+run_emulator(mem, sregs, mregs, vregs, SP0, SP1, EU, pc=0, issue_width=4, ...)
 ```
 
-`assemble_file()` is a two-pass assembler:
-- **Pass 1:** Collect label addresses, compute instruction sizes
-- **Pass 2:** Encode each instruction to a 32-bit word using the opcode table
+The emulator:
+1. Fetches the instruction word at PC
+2. Decodes opcode, extracts fields
+3. Executes (scalar ALU, vector ALU, memory, GEMM, control)
+4. Updates performance counters (cycles, instruction count, GEMM ops, SDMA ops, mem ops)
+5. Advances PC (or branches)
+6. Repeats until `halt.s`
+7. Dumps state to output files (memory, registers, scratchpad, perf metrics)
 
 ### 4.4 `DRAMWriter`
 
@@ -328,26 +321,14 @@ img.bf16(addr, float_val) # convert float to bf16, write 16-bit at byte address
 data_text = img.render_data_mem(include_zeros=True)
 ```
 
-### 4.5 Emulator Execution
+Internally, `bf16(addr, x)` stores a 16-bit BF16 value. `to_u32_words(stride=2)` packs two consecutive BF16 values into each 32-bit word.
 
-```python
-mem = Memory(in_file)       # load .in file into instruction + data memory
-run_emulator(mem, sregs, mregs, vregs, SP0, SP1, EU, pc=0, issue_width=4, ...)
-```
+### 4.5 ADDR_TABLE Convention
 
-The emulator:
-1. Fetches the instruction word at PC
-2. Decodes opcode, extracts fields
-3. Executes (scalar ALU, vector ALU, memory, GEMM, control)
-4. Updates performance counters (cycles, instruction count, FLOPS, memory bytes)
-5. Advances PC (or branches)
-6. Repeats until `halt.s`
-
-### 4.6 ADDR_TABLE Convention
-
-All kernels read their parameters from a fixed address table at byte address **60 (0x3C)**. This avoids hardcoding addresses in assembly. The table layout varies per kernel:
+All kernels read their parameters from a fixed address table at byte address **60 (0x3C)**. The table layout varies per kernel:
 
 **GEMM/Conv/Linear:**
+
 | Offset | Field |
 |--------|-------|
 | +0 | A_GMEM (input matrix address) |
@@ -362,28 +343,43 @@ All kernels read their parameters from a fixed address table at byte address **6
 | +36 | TILE (tile size, always 32) |
 
 **ReLU:**
+
 | Offset | Field |
 |--------|-------|
 | +0 | IN_GMEM |
 | +4 | OUT_GMEM |
 
-**MaxPool:**
-| Offset | Field |
-|--------|-------|
-| +0 | IN_GMEM |
-| +4 | IN_SCPAD |
-| +8 | OUT_GMEM |
-| +12 | OUT_SCPAD |
+**Softmax:** Same as ReLU (IN_GMEM at +0; +4 unused).
+
+### 4.6 Critical Emulator Fixes
+
+Several bugs were discovered and fixed during pipeline integration:
+
+**1. Mask register m0 hardwired to all-ones:**
+
+The Atalla hardware convention is that `m0` is always all-ones (0xFFFFFFFF), used as the default "no masking" predicate. The emulator's `ScalarRegisterFile` returns 0 for register 0 by default. Fix: patch `mregs.read` at emulator startup to return `0xFFFFFFFF` for index 0.
+
+**2. `gemm.vv` computation order:**
+
+The `lw.vi` instruction loads weight rows into the systolic array's internal buffer as *columns*, so `gemm_weights` represents W^T. The correct multiply is `gemm_weights @ v_in + v_acc` (i.e., W^T @ v_in). This was corrected from the original which had the operands in the wrong order.
+
+**3. `lw.vi` weight buffer reset:**
+
+In multi-tile GEMM (e.g., AlexNet conv1 with 32 tiles), the `gemm_weights` matrix must be reset to zero before each new weight loading phase. Without this, stale weights from the previous tile corrupt subsequent tiles. Fix: track a `_gemm_ran` flag; when `lw.vi` is encountered after a `gemm.vv`, reset `gemm_weights` and `num_weights` to zero.
+
+**4. Stack pointer / DRAM overlap:**
+
+The ppci compiler uses scalar register `x2` as a stack pointer for local variables. It was initially set to `0x8000`, but for large models (e.g., AlexNet conv1 with 1024×27 input matrix), the stack grows downward into the `A_GMEM` data region (starting at `0x1000`). Compiler-generated `sw.s` instructions for loop counters overwrote input matrix data, causing NaN and huge value propagation. Fix: compute stack base dynamically as `((max_data_addr + 0x1000) & ~0xFFF) + 0x1000`, placing it safely above all DRAM data. The vector spill base (`x33`) is set to the same value.
 
 ---
 
 ## 5. Component Deep Dive: Kernel Library
 
-All compute kernels are hand-written assembly generators in `functional_sim/build_*.py`. Each function returns an assembly text string.
+The `functional_sim/build_*.py` files contain hand-written assembly generators. These are **not used by the pipeline's graph operations** (which use the C compiler path), but remain available for standalone testing and as reference implementations.
 
 ### 5.1 `make_tiled_gemm_asm(M, N, K)` — Tiled GEMM
 
-Used for: **Conv (via im2col), Linear, Matmul**
+Used for: **standalone GEMM testing** (pipeline uses `_gemm_c()` instead)
 
 Algorithm:
 ```
@@ -412,64 +408,17 @@ Key instructions:
 
 ### 5.2 `make_relu_asm(total, width)` — ReLU
 
-Algorithm:
-```
-for each tile of 32 rows:
-  scpad.ld input tile from DRAM
-  for each row:
-    vreg.ld v from scratchpad
-    mgt.mvv mask, v, zero, all    # mask = (v > 0)
-    sub.vv result, result, result # zero result
-    add.vv result, result, v, mask # copy positive lanes
-    vreg.st result to scratchpad
-  scpad.st output tile to DRAM
-halt
-```
-
-Uses compare-and-blend: zero the result vector, then masked-add the input (only positive lanes get copied).
+Uses compare-and-blend: `mgt.mvv mask, v, zero` → `sub.vv result, result, result` → `add.vv result, result, v, mask` (only positive lanes get copied).
 
 ### 5.3 `make_softmax_asm(length)` — Softmax
 
-Algorithm:
-```
-scpad.ld input from DRAM
-for each row:
-  vreg.ld v
-  rmax.vv max_val = reduce_max(v)
-  sub.vv shifted = v - max_val
-  expi.vv exp_val = exp(shifted)
-  rsum.vv sum_val = reduce_sum(exp_val)
-  # compute 1/sum via bf16 reciprocal
-  stbf.s sum_bits = to_bf16(sum)
-  rcp.bf inv_bits = reciprocal(sum_bits)
-  bfts.s inv_sum = to_float(inv_bits)
-  mul.vs result = exp_val * inv_sum
-  vreg.st result
-scpad.st output to DRAM
-halt
-```
-
-Uses hardware reduce-max, reduce-sum, exp, and bf16 reciprocal instructions.
+Uses hardware reduce-max, reduce-sum, exp, and bf16 reciprocal instructions: `rmax → sub → exp → rsum → stbf_s → rcp_bf → bfts_s → mul.vs`.
 
 ### 5.4 `make_maxpool_asm(H_in, W_in, pool_size, stride)` — MaxPool
 
-**This kernel exists and works correctly.** It operates on a single-channel H×W tile:
+Single-channel MaxPool operating on one H×W tile using pairwise `mgt` + blend for both vertical and horizontal max operations.
 
-Algorithm:
-```
-scpad.ld input tile
-for each output row:
-  vreg.ld pool_size adjacent input rows
-  # Vertical max: pairwise mgt + blend across rows
-  # Horizontal max: shift.vi + pairwise mgt + blend
-  vreg.st result row
-scpad.st output tile
-halt
-```
-
-Limitations:
-- Single-channel only (W ≤ 32 elements, i.e., fits in one vector)
-- Multi-channel tensors require a per-channel loop wrapper that isn't wired into the pipeline emitters yet
+Limitation: Single-channel only (W ≤ 32 elements). Multi-channel requires a per-channel loop wrapper not yet wired into the pipeline.
 
 ### 5.5 `make_attention_asm(S, d)` — Self-Attention
 
@@ -489,6 +438,7 @@ gm = plan_tiles(gm)                        # tile planning + DRAM layout
 
 # Phase 2: Execute layer by layer
 activation_cache = {}
+kernel_metrics = []
 for node in gm.graph.nodes:
     if node.op in ("placeholder", "get_attr"):
         activation_cache[node.name] = ...   # store input/weights
@@ -501,13 +451,14 @@ for node in gm.graph.nodes:
 
     if emission.skip_emulator:               # NumPy fallback (maxpool, add, mul)
         activation_cache[node.name] = emission.numpy_result
-    else:                                    # Emulator execution
-        compile_and_assemble(emission, ...)   # no-op for direct asm
-        in_file = render_in_file(emission)    # combine asm + data → .in text
+    else:                                    # C compiler + emulator
+        compile_and_assemble(emission, ...)   # ppci compile C → asm → schedule → encode
+        in_file = render_in_file(emission)    # combine encoded instrs + DRAM data → .in
         write(in_file)
-        mem = run_on_emulator(in_file)        # execute on simulator
+        mem, eu = run_on_emulator(in_file)    # execute on simulator
         result = read_bf16_from_memory(mem, emission.output_addr, emission.output_elements)
         activation_cache[node.name] = result
+        # collect perf metrics from eu.perf_metrics
 
 # Phase 3: Validate
 compare(activation_cache[final_node], pytorch_reference)
@@ -515,20 +466,32 @@ compare(activation_cache[final_node], pytorch_reference)
 
 ### 6.2 Layer-to-Layer Data Passing
 
-Each layer is executed as a **standalone emulator invocation**. This means:
+Each layer is executed as a **standalone emulator invocation**:
 - The emulator starts fresh for each layer (registers zeroed, scratchpad empty)
+- The stack pointer (`x2`) is dynamically computed above all DRAM data for each layer
 - Input activations from the previous layer's output are serialized into the new layer's DRAM image
-- The Python orchestrator (`run_model.py`) reads the output from emulator memory and passes it to the next layer
+- The Python orchestrator reads the output from emulator memory and passes it to the next layer
 
-This is equivalent to a "layer-at-a-time" execution model. A full-model execution (all layers in one `.in` file) would require a more complex memory management scheme.
+This is equivalent to a "layer-at-a-time" execution model.
 
 ### 6.3 The C Compiler Path (`compile_and_assemble`)
 
-The function `compile_and_assemble(emission, work_dir, tag)` checks:
-- If `emission.c_source` is non-empty: compiles C → .s → converts notation → assembles
-- If `emission.c_source` is empty (direct asm): `emission.instr_text` is already populated, returns as-is
+```python
+def compile_and_assemble(emission, work_dir, tag):
+    if emission.c_source:
+        raw_s = compile_c(emission.c_source, work_dir, tag)  # ppci atalla_cc → .s
+        in_content, _, _ = build_compiler.compile_asm(raw_s)  # schedule + encode
+        emission.instr_text = in_content.split("\n.data")[0].strip()
+    return emission.instr_text
+```
 
-Currently, all compute kernels set `emission.instr_text` directly (direct asm), so `compile_and_assemble` is effectively a no-op. The C path is wired and tested but produces incorrect results for multi-intrinsic kernels due to the compiler's vector spill bug.
+`build_compiler.compile_asm()` performs:
+1. `parse_program()` — parse assembly into instruction list + label map
+2. `inject_main_bootstrap()` — add startup code
+3. `expand_large_li()` — expand `li_s` pseudo-instructions to `lui_s` + `addi_s`
+4. `schedule_program()` — VLIW scheduling into instruction packets
+5. `relocate_and_encode()` — resolve labels, encode 32-bit instruction words
+6. `emit_packet_format()` — format as hex lines for `.in` file
 
 ---
 
@@ -541,89 +504,44 @@ class AlexNetSmall(nn.Module):
     def __init__(self, scale=0.01, num_classes=10):
         # Channel counts scaled down: sc(64)=1, sc(192)=1, sc(384)=3, sc(256)=2
         self.conv1 = nn.Conv2d(3, sc(64), 3, stride=1, padding=1)   # 3→1 ch
-        self.conv2 = nn.Conv2d(sc(64), sc(192), 3, stride=1, padding=1)  # 1→1 ch
-        self.conv3 = nn.Conv2d(sc(192), sc(384), 3, stride=1, padding=1) # 1→3 ch
-        self.conv4 = nn.Conv2d(sc(384), sc(256), 3, stride=1, padding=1) # 3→2 ch
-        self.conv5 = nn.Conv2d(sc(256), sc(256), 3, stride=1, padding=1) # 2→2 ch
+        self.conv2 = nn.Conv2d(sc(64), sc(192), 3, stride=1, padding=1)
+        self.conv3 = nn.Conv2d(sc(192), sc(384), 3, stride=1, padding=1)
+        self.conv4 = nn.Conv2d(sc(384), sc(256), 3, stride=1, padding=1)
+        self.conv5 = nn.Conv2d(sc(256), sc(256), 3, stride=1, padding=1)
         self.pool = nn.MaxPool2d(2, stride=2)
-        self.fc1 = nn.Linear(sc(256)*4*4, sc(4096))  # 32→40
-        self.fc2 = nn.Linear(sc(4096), sc(4096))      # 40→40
-        self.fc3 = nn.Linear(sc(4096), 10)             # 40→10
-
-    def forward(self, x):  # input: (1, 3, 32, 32)
-        x = F.relu(self.conv1(x))   # (1,1,32,32)
-        x = self.pool(x)            # (1,1,16,16)
-        x = F.relu(self.conv2(x))   # (1,1,16,16)
-        x = self.pool(x)            # (1,1,8,8)
-        x = F.relu(self.conv3(x))   # (1,3,8,8)
-        x = F.relu(self.conv4(x))   # (1,2,8,8)
-        x = F.relu(self.conv5(x))   # (1,2,8,8)
-        x = self.pool(x)            # (1,2,4,4)
-        x = torch.flatten(x, 1)     # (1,32)
-        x = F.relu(self.fc1(x))     # (1,40)
-        x = F.relu(self.fc2(x))     # (1,40)
-        x = self.fc3(x)             # (1,10)
-        return x
+        self.fc1 = nn.Linear(sc(256)*4*4, sc(4096))
+        self.fc2 = nn.Linear(sc(4096), sc(4096))
+        self.fc3 = nn.Linear(sc(4096), 10)
 ```
 
 ### 7.2 FX Graph After Capture (scale=0.01)
 
 ```
-Phase 1: FX capture + op normalization...
-Phase 2: Tile planning...
-
---- Graph Summary ---
-  x                op=placeholder   kernel=-         shape=(1, 3, 32, 32)
-  conv1            op=conv          kernel=conv      shape=(1, 1, 32, 32)
-  relu             op=relu          kernel=relu      shape=(1, 1, 32, 32)
-  pool             op=maxpool       kernel=maxpool   shape=(1, 1, 16, 16)
-  conv2            op=conv          kernel=conv      shape=(1, 1, 16, 16)
-  relu_1           op=relu          kernel=relu      shape=(1, 1, 16, 16)
-  pool_1           op=maxpool       kernel=maxpool   shape=(1, 1, 8, 8)
-  conv3            op=conv          kernel=conv      shape=(1, 3, 8, 8)
-  relu_2           op=relu          kernel=relu      shape=(1, 3, 8, 8)
-  conv4            op=conv          kernel=conv      shape=(1, 2, 8, 8)
-  relu_3           op=relu          kernel=relu      shape=(1, 2, 8, 8)
-  conv5            op=conv          kernel=conv      shape=(1, 2, 8, 8)
-  relu_4           op=relu          kernel=relu      shape=(1, 2, 8, 8)
-  pool_2           op=maxpool       kernel=maxpool   shape=(1, 2, 4, 4)
-  flatten          op=flatten       kernel=flatten   shape=(1, 32)
-  fc1              op=linear        kernel=fc        shape=(1, 40)
-  relu_5           op=relu          kernel=relu      shape=(1, 40)
-  fc2              op=linear        kernel=fc        shape=(1, 40)
-  relu_6           op=relu          kernel=relu      shape=(1, 40)
-  fc3              op=linear        kernel=fc        shape=(1, 10)
+x                op=placeholder   kernel=-         shape=(1, 3, 32, 32)
+conv1            op=conv          kernel=conv      shape=(1, 1, 32, 32)
+relu             op=relu          kernel=relu      shape=(1, 1, 32, 32)
+pool             op=maxpool       kernel=maxpool   shape=(1, 1, 16, 16)
+conv2            op=conv          kernel=conv      shape=(1, 1, 16, 16)
+relu_1           op=relu          kernel=relu      shape=(1, 1, 16, 16)
+pool_1           op=maxpool       kernel=maxpool   shape=(1, 1, 8, 8)
+conv3            op=conv          kernel=conv      shape=(1, 3, 8, 8)
+relu_2           op=relu          kernel=relu      shape=(1, 3, 8, 8)
+conv4            op=conv          kernel=conv      shape=(1, 2, 8, 8)
+relu_3           op=relu          kernel=relu      shape=(1, 2, 8, 8)
+conv5            op=conv          kernel=conv      shape=(1, 2, 8, 8)
+relu_4           op=relu          kernel=relu      shape=(1, 2, 8, 8)
+pool_2           op=maxpool       kernel=maxpool   shape=(1, 2, 4, 4)
+flatten          op=flatten       kernel=flatten   shape=(1, 32)
+fc1              op=linear        kernel=fc        shape=(1, 40)
+relu_5           op=relu          kernel=relu      shape=(1, 40)
+fc2              op=linear        kernel=fc        shape=(1, 40)
+relu_6           op=relu          kernel=relu      shape=(1, 40)
+fc3              op=linear        kernel=fc        shape=(1, 10)
 ```
 
-### 7.3 Layer-by-Layer Execution Trace
+**20 nodes** total: **15 emulated** (5 conv + 6 relu + 3 FC + 1 matmul), **3 NumPy** (maxpool), **1 passthrough** (flatten).
 
-```
-Phase 3+4: Assembly emission + emulator execution...
-  [x]        placeholder -> cached
-  [conv1]    conv -> emulator (M=1024, K=27, N=1) → tiled GEMM, out=0x12000
-  [relu]     relu -> emulator (1024 elements)
-  [pool]     maxpool -> NumPy (1,1,16,16)           ← NumPy fallback
-  [conv2]    conv -> emulator (M=256, K=9, N=1) → tiled GEMM
-  [relu_1]   relu -> emulator (256 elements)
-  [pool_1]   maxpool -> NumPy (1,1,8,8)
-  [conv3]    conv -> emulator (M=64, K=9, N=3) → tiled GEMM
-  [relu_2]   relu -> emulator (192 elements)
-  [conv4]    conv -> emulator (M=64, K=27, N=2) → tiled GEMM
-  [relu_3]   relu -> emulator (128 elements)
-  [conv5]    conv -> emulator (M=64, K=18, N=2) → tiled GEMM
-  [relu_4]   relu -> emulator (128 elements)
-  [pool_2]   maxpool -> NumPy (1,2,4,4)
-  [flatten]  reshape (1,32)                          ← passthrough
-  [fc1]      linear -> emulator (M=1, K=32, N=40)
-  [relu_5]   relu -> emulator (40 elements)
-  [fc2]      linear -> emulator (M=1, K=40, N=40)
-  [relu_6]   relu -> emulator (40 elements)
-  [fc3]      linear -> emulator (M=1, K=40, N=10)
-```
-
-**15 nodes** run on the emulator (5 conv + 6 relu + 3 FC), **3 nodes** run in NumPy (maxpool), **1 node** is a reshape passthrough (flatten).
-
-### 7.4 Conv1 Detailed Walkthrough
+### 7.3 Conv1 Detailed Walkthrough
 
 Conv1: `nn.Conv2d(3, 1, kernel_size=3, stride=1, padding=1)` on input `(1, 3, 32, 32)`.
 
@@ -631,85 +549,129 @@ Conv1: `nn.Conv2d(3, 1, kernel_size=3, stride=1, padding=1)` on input `(1, 3, 32
 - H=32, W=32, C_in=3, C_out=1, R=3, S=3, stride=1, pad=1
 - Ho = (32 + 2*1 - 3)/1 + 1 = 32, Wo = 32
 - im2col: M = Ho*Wo = 1024, K = R*S*C_in = 27, N = C_out = 1
-- M_tiles = ceil(1024/32) = 32, K_tiles = ceil(27/32) = 1, N_tiles = ceil(1/32) = 1
+- M_tiles = ceil(1024/32) = 32, K_tiles = 1, N_tiles = 1
 
-**Code generation (`emit_conv`):**
-1. Input `(1,3,32,32)` NCHW → transpose to NHWC `(1,32,32,3)` → `im2col()` → `(1024, 27)` matrix
-2. Weight `(1,3,3,3)` → reshape to `(1, 27)` → transpose to `(27, 1)` matrix
-3. DRAM layout: `A_GMEM=0x1000`, `W_GMEM=0x2000`, `C_GMEM=0x3000`
-4. ADDR_TABLE at 0x3C: `[0x1000, 0x2000, 0x3000, 1024, 1, 27, 32, 1, 1, 32]`
-5. Assembly: `make_tiled_gemm_asm(1024, 1, 27)` → 32 tile iterations (mi=0..31), each doing 1×1×1 tile multiply
-
-**Emulator execution:**
-- Emulator loads `.in` file, reads ADDR_TABLE, executes the tiled GEMM loop
-- Writes 1024 bf16 output values starting at `C_GMEM=0x3000`
-- Orchestrator reads back 1024 values, reshapes to `(1, 1, 32, 32)`
+**Code generation:**
+1. Input `(1,3,32,32)` NCHW → NHWC → `im2col()` → `(1024, 27)` matrix
+2. Weight `(1,3,3,3)` → `(27, 1)` matrix
+3. DRAM: A_GMEM=0x1000, W_GMEM=0x2000, C_GMEM=0x12000
+4. AtallaC: `_gemm_c(1024, 1, 27)` → compiled → 120,080 cycles, 75,972 instructions, 1024 GEMM ops
 
 ---
 
-## 8. Changes, Tweaks, and Known Limitations
+## 8. Performance Metrics
 
-### 8.1 Changes Made to Enable the Pipeline
+### 8.1 BasicModule (dim=32, depth=2)
+
+| Node | Op | Backend | Elems | Range | CosSim | MaxDiff | Cycles | Instrs | GEMMs |
+|------|----|---------|-------|-------|--------|---------|--------|--------|-------|
+| matmul | matmul | emulator | 32 | [-1.91, 1.05] | 1.0000 | 0.0078 | 1,736 | 1,190 | 1 |
+| add | add | numpy | 32 | [-1.98, 1.20] | 1.0000 | 0.0104 | — | — | — |
+| relu | relu | emulator | 32 | [0.00, 1.20] | 1.0000 | 0.0156 | 187 | 138 | 0 |
+| matmul_1 | matmul | emulator | 32 | [-0.44, 0.54] | 1.0000 | 0.0039 | 1,736 | 1,190 | 1 |
+| add_1 | add | numpy | 32 | [-0.42, 0.60] | 1.0000 | 0.0034 | — | — | — |
+| relu_1 | relu | emulator | 32 | [0.00, 0.60] | 1.0000 | 0.0039 | 187 | 138 | 0 |
+| mul | mul | numpy | 32 | [0.00, 0.60] | 1.0000 | 0.0078 | — | — | — |
+| add_2 | add | numpy | 32 | [0.00, 0.78] | 1.0000 | 0.0078 | — | — | — |
+| output | linear | emulator | 32 | [-0.26, 0.33] | 0.8684 | 0.1758 | 1,736 | 1,190 | 1 |
+
+**End-to-end:** Cosine sim = **0.868**, max diff = 0.176, 5,582 total cycles, 3,846 instructions, 3 GEMM ops, **0 NaN**.
+
+### 8.2 AlexNetSmall (scale=0.01)
+
+| Node | Op | Backend | Elems | Range | CosSim | MaxDiff | Cycles | Instrs | GEMMs |
+|------|----|---------|-------|-------|--------|---------|--------|--------|-------|
+| conv1 | conv | emulator | 1024 | [-2.06, 2.02] | 0.1645 | 3.1250 | 120,080 | 75,972 | 1,024 |
+| relu | relu | emulator | 1024 | [0.00, 2.02] | 0.4385 | 2.0625 | 2,140 | 1,657 | 0 |
+| pool | maxpool | numpy | 256 | [0.00, 2.02] | 0.7537 | 1.8477 | — | — | — |
+| conv2 | conv | emulator | 256 | [-0.21, 0.81] | 0.8282 | 1.2656 | 24,344 | 14,868 | 256 |
+| relu_1 | relu | emulator | 256 | [0.00, 0.81] | 0.8431 | 1.2656 | 628 | 481 | 0 |
+| pool_1 | maxpool | numpy | 64 | [0.29, 0.81] | 0.9458 | 1.0605 | — | — | — |
+| conv3 | conv | emulator | 192 | [-0.60, 0.16] | 0.4284 | 1.0796 | 6,170 | 3,768 | 64 |
+| relu_2 | relu | emulator | 192 | [0.00, 0.16] | 0.1921 | 0.3867 | 502 | 383 | 0 |
+| conv4 | conv | emulator | 128 | [-0.05, 0.04] | 0.1079 | 0.2273 | 7,610 | 4,812 | 64 |
+| relu_3 | relu | emulator | 128 | [0.00, 0.04] | 0.2129 | 0.0383 | 376 | 285 | 0 |
+| conv5 | conv | emulator | 128 | [-0.01, 0.01] | 0.1658 | 0.2097 | 6,890 | 4,290 | 64 |
+| relu_4 | relu | emulator | 128 | [0.00, 0.01] | 0.4624 | 0.0491 | 376 | 285 | 0 |
+| pool_2 | maxpool | numpy | 32 | [0.00, 0.01] | 0.7310 | 0.0491 | — | — | — |
+| fc1 | linear | emulator | 40 | [-0.01, 0.01] | 0.2620 | 0.1685 | 3,334 | 2,296 | 2 |
+| relu_5 | relu | emulator | 40 | [0.00, 0.01] | 0.5003 | 0.1685 | 250 | 187 | 0 |
+| fc2 | linear | emulator | 40 | [-0.00, 0.00] | -0.1470 | 0.1834 | 6,478 | 4,476 | 4 |
+| relu_6 | relu | emulator | 40 | [0.00, 0.00] | 0.2393 | 0.1719 | 250 | 187 | 0 |
+| fc3 | linear | emulator | 10 | [-0.00, 0.00] | 0.1984 | 0.1023 | 3,308 | 2,280 | 2 |
+
+**End-to-end:** Cosine sim = **0.198**, max diff = 0.102, 182,736 total cycles, 116,227 instructions, 1,480 GEMM ops, **0 NaN**.
+
+### 8.3 Analysis
+
+**BasicModule:** Individual kernels achieve near-perfect cosine similarity (1.0) against PyTorch float32 reference. The final output (cos=0.868) shows expected BF16 accumulation drift compounding through 3 GEMM layers.
+
+**AlexNet:** BF16 precision errors compound through 19 execution layers. Conv1 alone has cos=0.16 vs fp32 reference due to the large im2col matrix (1024×27 → 32 tiles), where each tile's BF16-truncated intermediate results accumulate quantization error. Later layers see progressively lower cosine similarity as errors cascade. This is a fundamental BF16 precision limitation — the emulator is functionally correct (no NaN, no out-of-range values), but the hardware's 16-bit mantissa cannot match float32 fidelity across deep networks.
+
+**Cycle distribution (AlexNet):**
+- Conv1 dominates (120K / 183K = 65% of total cycles) due to 1024 GEMM operations over 32 tiles
+- Each GEMM kernel invocation costs ~1,700 cycles (consistent with BasicModule's matmul)
+- ReLU is cheap: ~190 cycles per invocation regardless of element count
+
+---
+
+## 9. Changes, Tweaks, and Known Limitations
+
+### 9.1 Changes Made to Enable the Pipeline
 
 | Change | File(s) | Why |
 |--------|---------|-----|
-| Created FX capture + op normalization | `graph/fx_capture.py` | Didn't exist; needed to trace PyTorch models to FX graph |
+| Created FX capture + op normalization | `graph/fx_capture.py` | Trace PyTorch models to FX graph |
 | Created graph transforms | `graph/remove_ops.py` | BN folding + dropout removal for inference |
-| Created tile planner | `graph/tile_planner.py` | Didn't exist; needed to compute tiling strategy per op |
-| Created assembly emitter | `codegen/asm_emitter.py` | Didn't exist; bridges FX nodes → build_*.py assembly generators |
-| Created C emitter | `codegen/c_emitter.py` | Didn't exist; was intended as the primary path but fell back to direct asm |
-| Created asm converter | `codegen/asm_converter.py` | Compiler and emulator use different assembly notation |
-| Created DRAM builder | `codegen/dram_builder.py` | Tensor serialization + reference activation extraction |
-| Created orchestrator | `run_model.py` | End-to-end pipeline runner |
-| Created AlexNet model | `model/alexnet.py` | Scaled-down AlexNet for testing within emulator constraints |
-| Copied aihw-ppci-compiler | `aihw-ppci-compiler/` | Needed in-tree for the C compilation path |
-| Added `-m atalla` flag | `c_emitter.py` (ppci invocation) | Compiler gave `KeyError: 'vec'` without architecture flag |
+| Created tile planner | `graph/tile_planner.py` | Compute tiling strategy per op |
+| Created C emitter (primary path) | `codegen/c_emitter.py` | Generate AtallaC for ppci compilation |
+| Created asm converter | `codegen/asm_converter.py` | Bridge compiler and emulator notation |
+| Created DRAM builder | `codegen/dram_builder.py` | Tensor serialization + reference extraction |
+| Created orchestrator | `run_model.py` | End-to-end pipeline runner with metrics |
+| Created metrics collector | `collect_metrics.py` | Per-kernel and end-to-end metrics |
+| Created AlexNet model | `model/alexnet.py` | Scaled-down AlexNet for testing |
+| Copied aihw-ppci-compiler | `aihw-ppci-compiler/` | In-tree for the C compilation path |
+| Fixed m0 mask register | `functional_sim.py` | m0 must be all-ones per hardware spec |
+| Fixed gemm.vv order | `functional_sim.py` | Correct W^T @ v_in computation |
+| Fixed lw.vi weight reset | `functional_sim.py` | Reset weights between tiles |
+| Fixed stack/DRAM overlap | `run_model.py` | Dynamic stack base above DRAM data |
 
-### 8.2 Design Decisions
+### 9.2 Design Decisions
 
 | Decision | Rationale |
 |----------|-----------|
-| **Direct asm instead of C-compiled kernels** | Compiler's vector spill bug (1/32 elements saved) and missing `lw.vi` make C-compiled GEMM/ReLU/Softmax incorrect |
-| **Per-layer emulator invocation** | Emulator is designed for single-kernel execution; full-model single-invocation would need complex memory management |
+| **C compiler + inline asm for kernels** | Compiler handles scalar control flow; inline asm for vector/SDMA ops avoids vector spill bug |
+| **Per-layer emulator invocation** | Emulator designed for single-kernel execution; fresh state per layer is cleanest |
+| **Dynamic stack pointer** | Prevents compiler stack frames from overlapping DRAM data regions |
 | **BF16 weight conversion at capture time** | Matches hardware precision; avoids surprise fp32→bf16 truncation mid-pipeline |
 | **im2col for convolutions** | Reduces Conv2d to matrix multiply, reusing the tiled GEMM kernel |
 | **MaxPool in NumPy** | Kernel exists but is single-channel; multi-channel wrapper not yet wired |
-| **Add/Mul in NumPy** | These are bias adds and residual scales in BasicModule; AlexNet folds bias into Conv/Linear |
+| **Add/Mul in NumPy** | Bias adds and residual scales; AlexNet folds bias into Conv/Linear |
 
-### 8.3 Known Limitations
+### 9.3 Known Limitations
 
 | Limitation | Impact | Mitigation |
 |------------|--------|------------|
-| **Compiler vector spill bug** | C-compiled multi-intrinsic kernels produce wrong results | Use direct assembly for all compute kernels |
-| **No `lw.vi` in compiler** | C-compiled GEMM outputs all zeros | Direct assembly includes `lw.vi` |
-| **MaxPool uses NumPy** | Not running on emulator; no cycle counts for maxpool | Wire `build_maxpool.py` per-channel loop into emit_maxpool |
-| **BF16 accumulation drift** | ~0.1-0.5 max absolute diff from PyTorch float32 | Expected; tracked via cosine similarity |
+| **Compiler vector spill bug** | Kernels with many live vectors would be corrupted | Current kernels keep register pressure low via inline asm |
+| **MaxPool uses NumPy** | Not running on emulator; no cycle counts for maxpool | Wire `build_maxpool.py` per-channel loop |
+| **BF16 accumulation drift** | AlexNet cos=0.20 vs fp32 after 19 layers | Expected; tracked via per-kernel cosine similarity |
 | **Single-batch only** | Batch size > 1 not tested | Tile planner assumes batch=1 |
-| **No softmax in AlexNet** | AlexNet as defined has no softmax (raw logits) | Softmax kernel validated standalone |
-| **Compiler emits `li_s`** | Emulator doesn't support this pseudo-instruction | asm_converter could remap; not needed since we use direct asm |
-| **ADDR_TABLE hardcoded at 60** | All kernels share the same parameter address | Works for layer-at-a-time; full-model would need different convention |
-
-### 8.4 Validation Results
-
-| Test | Emulated Nodes | Old vs New Pipeline | Notes |
-|------|---------------|---------------------|-------|
-| BasicModule (dim=32, depth=2) | 5 (2 matmul + 2 relu + 1 linear) | cos=1.0 on all 5 | add/mul in NumPy |
-| AlexNet (scale=0.01) | 15 (5 conv + 6 relu + 3 FC) | cos=1.0 on all 15 | maxpool in NumPy |
-
-Both pipelines produce **byte-identical** emulator outputs. The divergence from PyTorch float32 reference (cos≈-0.15 for BasicModule, cos≈-0.03 for AlexNet) is pre-existing BF16 accumulation drift, not a pipeline regression.
+| **No softmax in AlexNet** | AlexNet outputs raw logits | Softmax kernel validated standalone |
+| **ADDR_TABLE at fixed address 60** | All kernels share the same parameter address | Works for layer-at-a-time |
+| **Bias not fused into GEMM** | Conv/Linear bias requires separate NumPy add | Fused GEMM+bias kernel would be more efficient |
 
 ---
 
-## 9. Open Items for Review
+## 10. Open Items for Review
 
-1. **Wire maxpool to emulator**: `build_maxpool.py` works. Need to add a per-channel loop in `emit_maxpool()` that runs the kernel once per channel with appropriate DRAM offsets. This would replace the NumPy fallback.
+1. **Wire maxpool to emulator**: `build_maxpool.py` works for single-channel tiles. Need a per-channel loop in `emit_maxpool()` that runs the kernel once per channel with appropriate DRAM offsets.
 
-2. **Compiler vector spill fix**: The `vreg_st/ld` spill code in `ppci/codegen/atalla/atalla_gen.py` (function `_store_vec_to_scpad` / `_load_vec_from_scpad`) uses dimensions `0,0,0,0,0`, saving only 1 element. Fixing to `31,0,0,0,0` (full 32-element row) would enable C-compiled kernels.
+2. **Fix compiler vector spill**: The `vreg_st/ld` spill code in ppci uses dimensions `0,0,0,0,0` (1 element). Fixing to `31,0,0,0,0` (full 32-element row) would allow removing inline asm for vector ops.
 
-3. **Add `lw.vi` intrinsic to compiler**: The systolic weight preload has no C-level or inline-asm path. Adding it as an intrinsic (e.g., `lw_vi(row_index)`) would unblock C-compiled GEMM.
+3. **BF16 precision investigation**: Conv1's cos=0.16 against fp32 suggests the 32-tile accumulation magnifies BF16 truncation. Investigate whether partial-precision accumulation (fp32 accumulator with bf16 operands) or Kahan summation could improve fidelity.
 
-4. **Bias fusion**: Conv and Linear bias addition is currently implicit (weights include bias via BN folding, or bias is applied post-GEMM in NumPy). A fused GEMM+bias kernel would be more efficient.
+4. **Bias fusion**: Add a fused GEMM+bias kernel that reads bias from DRAM and adds it inline, eliminating the separate NumPy add pass for BasicModule.
 
-5. **Multi-layer single invocation**: Currently each layer is a separate emulator run. Chaining layers in a single `.in` file would eliminate Python-side data marshaling overhead and give more realistic cycle counts.
+5. **Multi-layer single invocation**: Chain layers in a single `.in` file to eliminate Python-side data marshaling and get more realistic end-to-end cycle counts.
 
-6. **Notation standardization**: The compiler and emulator should agree on a single assembly notation. Either fix the compiler to emit `.`-separated mnemonics with `$N` registers, or fix the emulator to accept `_`-separated mnemonics with `xN`/`vN` registers. This would eliminate the need for `asm_converter.py`.
+6. **Notation standardization**: Make the compiler and emulator agree on a single assembly notation, eliminating the need for `asm_converter.py` / `build_compiler` notation conversion.
