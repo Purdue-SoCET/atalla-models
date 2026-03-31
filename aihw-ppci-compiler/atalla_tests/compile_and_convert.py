@@ -6,7 +6,7 @@ Usage:
     python compile_and_convert.py <file.c> --s-only     # produces file.s only
     python compile_and_convert.py <file.c> --show-emu   # also print emulator asm
 
-Pipeline: .c -> atalla_cc -> .s -> asm_converter -> build.assemble_file -> .in
+Pipeline: .c -> atalla_cc -> .s -> build_compiler.compile_asm() -> .in
 """
 import argparse
 import os
@@ -16,11 +16,9 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 COMPILER_ROOT = SCRIPT_DIR.parent
-FUNC_SIM = COMPILER_ROOT.parent / "atalla-models" / "functional_sim"
-ASM_CONVERTER = COMPILER_ROOT.parent / "atalla-models" / "atalla-graph" / "codegen" / "asm_converter.py"
+FUNC_SIM = COMPILER_ROOT.parent / "functional_sim"
 
 sys.path.insert(0, str(FUNC_SIM))
-sys.path.insert(0, str(ASM_CONVERTER.parent))
 
 
 def compile_c(c_path: Path, s_path: Path) -> str:
@@ -35,18 +33,11 @@ def compile_c(c_path: Path, s_path: Path) -> str:
     return s_path.read_text()
 
 
-def convert_to_emu_asm(compiler_asm: str) -> str:
-    """Convert compiler .s output to emulator-compatible assembly text."""
-    from asm_converter import convert
-    return convert(compiler_asm)
-
-
-def assemble_to_in(emu_asm: str) -> str:
-    """Assemble emulator asm text into .in hex format (no data section)."""
-    from build import assemble_file, emit_test_format, render_testfile
-    instrs = assemble_file(emu_asm)
-    instr_hex = emit_test_format(instrs)
-    return render_testfile(instr_hex, "")
+def assemble_to_in(compiler_asm: str) -> str:
+    """Encode compiler .s assembly into .in hex format via build_compiler."""
+    import build_compiler
+    in_text, _ready, _packets = build_compiler.compile_asm(compiler_asm)
+    return in_text
 
 
 def main():
@@ -63,30 +54,26 @@ def main():
     s_path = out_dir / f"{stem}.s"
     in_path = out_dir / f"{stem}.in"
 
-    print(f"[1/3] Compiling {c_path.name} -> {s_path.name}")
+    print(f"[1/2] Compiling {c_path.name} -> {s_path.name}")
     compiler_asm = compile_c(c_path, s_path)
     print(f"      wrote {s_path}")
 
     if args.s_only:
         return
 
-    print(f"[2/3] Converting to emulator assembly")
-    emu_asm = convert_to_emu_asm(compiler_asm)
+    print(f"[2/2] Assembling to .in format -> {in_path.name}")
     if args.show_emu:
-        print("--- emulator asm ---")
-        print(emu_asm)
+        print("--- compiler asm ---")
+        print(compiler_asm)
         print("--- end ---")
 
-    print(f"[3/3] Assembling to .in format -> {in_path.name}")
     try:
-        in_text = assemble_to_in(emu_asm)
+        in_text = assemble_to_in(compiler_asm)
         in_path.write_text(in_text)
         print(f"      wrote {in_path}")
     except Exception as e:
         print(f"      assembly to .in failed: {e}", file=sys.stderr)
-        emu_path = out_dir / f"{stem}.emu.s"
-        emu_path.write_text(emu_asm)
-        print(f"      saved emulator asm to {emu_path} for debugging")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
