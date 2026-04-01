@@ -259,20 +259,6 @@ Look for your op in the output — it should say `emulator` not `NumPy`:
 | `cosine_sim = 0.0` (all zeros) | Check BF16 register convention in `functional_sim.py :: bf16_reg_to_f32` |
 | Op runs as NumPy | Make sure `emit_myop` does NOT set `em.skip_emulator = True` and returns `em.c_source` |
 
-## Kernel Ownership
-
-| Kernel | Owner | Status |
-|--------|-------|--------|
-| conv | Robert | Done |
-| gemm | Mary | Done |
-| softmax | Soumil/Jiayi | Done |
-| relu | Soumil/Jiayi | Done |
-| sigmoid | Soumil/Jiayi | Done (functional_sim only) |
-| maxpool | Robert | Done |
-| add | Robert | Done |
-| mul | Unassigned | Needed for BasicModule residual |
-| layernorm | — | Done (functional_sim only) |
-
 ## File Quick Reference
 
 | What | Where |

@@ -371,13 +371,8 @@ def load_model(name: str, scale: float = 0.01):
         from model.basic import BasicModule
         return BasicModule(dim=32, depth=2), torch.randn(1, 32)
     elif name == "alexnet_small":
-        import importlib.util
-        _spec = importlib.util.spec_from_file_location(
-            "alexnet_small",
-            str(Path(__file__).resolve().parent / "_backup" / "model" / "alexnet.py"))
-        _mod = importlib.util.module_from_spec(_spec)
-        _spec.loader.exec_module(_mod)
-        return _mod.AlexNetSmall(scale=scale, num_classes=10), torch.randn(1, 3, 32, 32)
+        from model.alexnet_small import AlexNetSmall
+        return AlexNetSmall(scale=scale, num_classes=10), torch.randn(1, 3, 32, 32)
     else:
         raise ValueError(f"Unknown model: {name}")
 
