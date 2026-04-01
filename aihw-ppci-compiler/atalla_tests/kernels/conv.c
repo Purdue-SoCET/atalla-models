@@ -47,20 +47,19 @@ int main() {
     int sdma_ctl_c = 0b00101010101010;
 
     /* SDMA: load A tile (SP0) and W tile (SP1) from GMEM */
-    asm("scpad_ld %0, %1, %2" : : "r"(a_sp), "r"(a_gmem), "r"(sdma_ctl_a));
-    asm("scpad_ld %0, %1, %2" : : "r"(w_sp), "r"(w_gmem), "r"(sdma_ctl_w));
+    scpad_load(a_sp, a_gmem, sdma_ctl_a);
+    scpad_load(w_sp, w_gmem, sdma_ctl_w);
 
-    /* preload weight rows into vector register file */
+    /* preload weight rows into vector register file / systolic array */
     int wi = 0;
-    vec wvec;
     while (wi < K_OUT) {
-        asm("vreg_ld %0, %1, %2, 26, 1"
-            : "=v"(wvec) : "r"(wi), "r"(ncols));
+        vec wvec = vector_load(wi, ncols, 26, 1);
+        load_weights(wvec);
         wi = wi + 1;
     }
 
     /* SDMA: load C tile (SP1) from GMEM */
-    asm("scpad_ld %0, %1, %2" : : "r"(c_sp), "r"(c_gmem), "r"(sdma_ctl_c));
+    scpad_load(c_sp, c_gmem, sdma_ctl_c);
 
     /* pipelined GEMM loop (double-buffered A/C vectors) */
     int row = 0;
@@ -70,16 +69,14 @@ int main() {
     /* prologue: seed first A and C vectors into buf0 */
     int a_addr0 = a_sp + row;
     int c_addr0 = c_sp + row;
-    vec a_buf0;
-    vec c_buf0;
-    asm("vreg_ld %0, %1, %2, 26, 0" : "=v"(a_buf0) : "r"(a_addr0), "r"(ncols));
-    asm("vreg_ld %0, %1, %2, 3, 1"  : "=v"(c_buf0) : "r"(c_addr0), "r"(ncols));
+    vec a_buf0 = vector_load(a_addr0, ncols, 26, 0);
+    vec c_buf0 = vector_load(c_addr0, ncols, 3, 1);
 
     while (row < M) {
         /* stage C0: compute + store using buf0 */
         int c_st_addr = c_sp + row;
         vec result0 = gemm(a_buf0, c_buf0, all_mask);
-        asm("vreg_st %0, %1, %2, 3, 1" : : "v"(result0), "r"(c_st_addr), "r"(ncols));
+        vector_store(result0, c_st_addr, ncols, 3, 1);
         row = row + 1;
         if (row >= M) break;
 
@@ -89,15 +86,15 @@ int main() {
         if (prefetch_row < M) {
             int a_addr1 = a_sp + prefetch_row;
             int c_addr1 = c_sp + prefetch_row;
-            asm("vreg_ld %0, %1, %2, 26, 0" : "=v"(a_buf1) : "r"(a_addr1), "r"(ncols));
-            asm("vreg_ld %0, %1, %2, 3, 1"  : "=v"(c_buf1) : "r"(c_addr1), "r"(ncols));
+            a_buf1 = vector_load(a_addr1, ncols, 26, 0);
+            c_buf1 = vector_load(c_addr1, ncols, 3, 1);
         }
         prefetch_row = prefetch_row + 1;
 
         /* stage C1: compute + store using buf1 */
         c_st_addr = c_sp + row;
         vec result1 = gemm(a_buf1, c_buf1, all_mask);
-        asm("vreg_st %0, %1, %2, 3, 1" : : "v"(result1), "r"(c_st_addr), "r"(ncols));
+        vector_store(result1, c_st_addr, ncols, 3, 1);
         row = row + 1;
         if (row >= M) break;
 
@@ -105,14 +102,14 @@ int main() {
         if (prefetch_row < M) {
             a_addr0 = a_sp + prefetch_row;
             c_addr0 = c_sp + prefetch_row;
-            asm("vreg_ld %0, %1, %2, 26, 0" : "=v"(a_buf0) : "r"(a_addr0), "r"(ncols));
-            asm("vreg_ld %0, %1, %2, 3, 1"  : "=v"(c_buf0) : "r"(c_addr0), "r"(ncols));
+            a_buf0 = vector_load(a_addr0, ncols, 26, 0);
+            c_buf0 = vector_load(c_addr0, ncols, 3, 1);
         }
         prefetch_row = prefetch_row + 1;
     }
 
     /* drain: write C tile from SP1 back to GMEM */
-    asm("scpad_st %0, %1, %2" : : "r"(c_sp), "r"(c_gmem), "r"(sdma_ctl_c));
+    scpad_store(c_sp, c_gmem, sdma_ctl_c);
 
     asm("halt");
     return 0;

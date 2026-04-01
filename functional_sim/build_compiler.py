@@ -55,6 +55,14 @@ MNEMONIC_ALIASES = {
     "nop": "nop.s",
     "halt": "halt.s",
     "barrier": "barrier.s",
+    "sqrt_bf": "sqrt.bf",
+    "rcp_bf": "rcp.bf",
+    "stbf_s": "stbf.s",
+    "bfts_s": "bfts.s",
+    "add_bf": "add.bf",
+    "sub_bf": "sub.bf",
+    "mul_bf": "mul.bf",
+    "slt_bf": "slt.bf",
 }
 
 

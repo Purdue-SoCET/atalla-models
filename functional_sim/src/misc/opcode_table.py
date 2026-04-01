@@ -22,7 +22,7 @@ OPCODES = {
     0b0010000: ("mul.bf",  "R"),
     0b0010001: ("rcp.bf",  "R"),
     0b0010010: ("slt.bf",  "R"),
-    0b0010011: ("sltu.bf", "R"),
+    0b0010011: ("sqrt.bf", "R"),  # ppci maps sqrt_bf here (was sltu.bf)
     0b0010100: ("stbf.s",  "R"),
     0b0010101: ("bfts.s",  "R"),
 

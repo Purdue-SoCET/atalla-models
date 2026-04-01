@@ -33,6 +33,24 @@ def fp32_to_hex(f):
 def hex_to_fp32(x):
     return struct.unpack('<f', struct.pack('<I', x & 0xFFFFFFFF))[0]
 
+def bf16_reg_to_f32(x):
+    """Interpret scalar register as BF16.
+
+    ppci stores BF16 constants in the lower 16 bits (li_s 16256 for 1.0),
+    while vmov.vts stores full float32 bits. Detect which convention is in
+    use: if x <= 0xFFFF the upper half is empty, so treat lower 16 bits as
+    BF16 and left-shift. Otherwise interpret as a float32 bit pattern.
+    """
+    x = x & 0xFFFFFFFF
+    if x <= 0xFFFF:
+        return struct.unpack('<f', struct.pack('<I', x << 16))[0]
+    return struct.unpack('<f', struct.pack('<I', x))[0]
+
+def f32_to_bf16_reg(f):
+    """Store float32 result back as BF16 bit pattern in scalar register."""
+    bits = struct.unpack('<I', struct.pack('<f', float(f)))[0]
+    return (bits >> 16) & 0xFFFF
+
 def apply_imm_vector_op(
     imm: int,
     vs: Sequence[np.float32],
@@ -284,42 +302,42 @@ def run(mem: Memory, sregs: ScalarRegisterFile, mregs: ScalarRegisterFile, vregs
                     src1 = sregs.read(inst['rs1'])
                     src2 = sregs.read(inst['rs2'])
                     if(m == "add.bf"):
-                        src1 = hex_to_fp32(src1)
-                        src2 = hex_to_fp32(src2)
+                        src1 = bf16_reg_to_f32(src1)
+                        src2 = bf16_reg_to_f32(src2)
                 else:
                     src1 = sregs.read(inst['rs1'])
                     src2 = inst['imm']
                 WBdata = EU.execute(m, sA=src1, sB=src2)
                 if(m == "add.bf"):
-                    WBdata = fp32_to_hex(WBdata)
+                    WBdata = f32_to_bf16_reg(WBdata)
                 sregs.write(inst['rd'], int(WBdata))
             elif m in ("sub.s", "subi.s", "sub.bf"):
                 if(m == "sub.s" or m == "sub.bf"):
                     src1 = sregs.read(inst['rs1'])
                     src2 = sregs.read(inst['rs2'])
                     if(m == "sub.bf"):
-                        src1 = hex_to_fp32(src1)
-                        src2 = hex_to_fp32(src2)
+                        src1 = bf16_reg_to_f32(src1)
+                        src2 = bf16_reg_to_f32(src2)
                 else:
                     src1 = sregs.read(inst['rs1'])
                     src2 = inst['imm']
                 WBdata = EU.execute(m, sA=src1, sB=src2)
                 if(m == "sub.bf"):
-                    WBdata = fp32_to_hex(WBdata)
+                    WBdata = f32_to_bf16_reg(WBdata)
                 sregs.write(inst['rd'], int(WBdata))
             elif m in ("mul.s", "muli.s", "mul.bf"):
                 if(m == "mul.s" or m == "mul.bf"):
                     src1 = sregs.read(inst['rs1'])
                     src2 = sregs.read(inst['rs2'])
                     if(m == "mul.bf"):
-                        src1 = hex_to_fp32(src1)
-                        src2 = hex_to_fp32(src2)
+                        src1 = bf16_reg_to_f32(src1)
+                        src2 = bf16_reg_to_f32(src2)
                 else:
                     src1 = sregs.read(inst['rs1'])
                     src2 = inst['imm']
                 WBdata = EU.execute(m, sA=src1, sB=src2)
                 if(m == "mul.bf"):
-                    WBdata = fp32_to_hex(WBdata)
+                    WBdata = f32_to_bf16_reg(WBdata)
                 sregs.write(inst['rd'], int(WBdata))
             elif m == "divi.s":
                 src1 = sregs.read(inst['rs1'])
@@ -328,10 +346,16 @@ def run(mem: Memory, sregs: ScalarRegisterFile, mregs: ScalarRegisterFile, vregs
                 sregs.write(inst['rd'], int(WBdata))
             elif m == "rcp.bf":
                 src1 = sregs.read(inst['rs1'])
-                src1 = hex_to_fp32(src1)
+                src1 = bf16_reg_to_f32(src1)
                 WBdata = EU.execute(m, sA=src1)
-                WBdata = fp32_to_hex(WBdata)
-                sregs.write(inst['rd'], int(WBdata))
+                sregs.write(inst['rd'], int(f32_to_bf16_reg(WBdata)))
+            elif m == "sqrt.bf":
+                src1 = sregs.read(inst['rs1'])
+                fval = bf16_reg_to_f32(src1)
+                WBdata = EU.execute(m, sA=fval)
+                result = f32_to_bf16_reg(WBdata)
+                if debug: print(f"  sqrt.bf: x{inst['rs1']}=0x{src1:08X}={fval:.6e} -> sqrt={WBdata:.6e} -> 0x{result:04X}")
+                sregs.write(inst['rd'], int(result))
             elif m in ("mod.s", "modi.s"):
                 if(m == "mod.s"):
                     src1 = sregs.read(inst['rs1'])
@@ -400,8 +424,8 @@ def run(mem: Memory, sregs: ScalarRegisterFile, mregs: ScalarRegisterFile, vregs
                     src1 = sregs.read(inst['rs1'])
                     src2 = sregs.read(inst['rs2'])
                     if(m == "slt.bf"):
-                        src1 = hex_to_fp32(src1)
-                        src2 = hex_to_fp32(src2)
+                        src1 = bf16_reg_to_f32(src1)
+                        src2 = bf16_reg_to_f32(src2)
                 else:
                     src1 = sregs.read(inst['rs1'])
                     src2 = inst['imm']
@@ -412,23 +436,22 @@ def run(mem: Memory, sregs: ScalarRegisterFile, mregs: ScalarRegisterFile, vregs
                     src1 = sregs.read(inst['rs1'])
                     src2 = sregs.read(inst['rs2'])
                     if(m == "sltu.bf"):
-                        src1 = hex_to_fp32(src1)
-                        src2 = hex_to_fp32(src2)
+                        src1 = bf16_reg_to_f32(src1)
+                        src2 = bf16_reg_to_f32(src2)
                 else:
                     src1 = sregs.read(inst['rs1'])
                     src2 = inst['imm']
                 WBdata = EU.execute(m, sA=src1, sB=src2)
                 sregs.write(inst['rd'], int(WBdata))
             elif m == "stbf.s":
+                # Scalar int → BF16: convert int to float, store as BF16 bits
                 src1 = sregs.read(inst['rs1'])
-                src1 = np.float32(src1)
-                temp = fp32_to_hex(src1)
-                sregs.write(inst['rd'], int(temp))
+                sregs.write(inst['rd'], f32_to_bf16_reg(float(src1)))
             elif m == "bfts.s":
+                # BF16 → scalar int: read BF16 bits, convert to float, truncate to int
                 src1 = sregs.read(inst['rs1'])
-                src1 = hex_to_fp32(src1)
-                src1 = np.int32(src1)
-                sregs.write(inst['rd'], int(src1))
+                fval = bf16_reg_to_f32(src1)
+                sregs.write(inst['rd'], int(np.int32(fval)))
             # ---------------- VV (Vector-Vector) ----------------
             elif m.endswith(".vv"):
                 # ------------ GEMM ------------------------------
@@ -485,7 +508,8 @@ def run(mem: Memory, sregs: ScalarRegisterFile, mregs: ScalarRegisterFile, vregs
                 num_weights += 1
             elif (m == "vmov.vts"):
                 src1 = vregs.read(inst['vs1'])
-                temp = fp32_to_hex(src1[inst['imm8']])
+                temp = f32_to_bf16_reg(src1[inst['imm8']])
+                if debug: print(f"  vmov.vts: v{inst['vs1']}[{inst['imm8']}]={src1[inst['imm8']]:.6e} -> x{inst['rd']}=0x{temp:04X}")
                 sregs.write(inst['rd'], temp)
             # ---------------- VI (Vector-Immediate) ----------------
             elif m.endswith(".vi") and (m != "lw.vi"):
@@ -517,7 +541,7 @@ def run(mem: Memory, sregs: ScalarRegisterFile, mregs: ScalarRegisterFile, vregs
                 else:
                     slr = 0
                     src2 = sregs.read(inst['rs1'])
-                    src2 = hex_to_fp32(int(src2))
+                    src2 = bf16_reg_to_f32(int(src2))
                 WBdata = EU.execute(m, vA=src1, sA=src2, slr=slr)
                 mask = mregs.read(inst['mask'])
                 old_vec = vregs.read(inst['vd'])
@@ -531,7 +555,7 @@ def run(mem: Memory, sregs: ScalarRegisterFile, mregs: ScalarRegisterFile, vregs
                 src1 = vregs.read(inst['vs1'])
                 slr = 0
                 src2 = sregs.read(inst['rs1'])
-                src2 = hex_to_fp32(int(src2))
+                src2 = bf16_reg_to_f32(int(src2))
                 WBdata = EU.execute(m, vA=src1, sA=src2, slr=slr)
                 mask = mregs.read(inst['mask'])
                 old_mask = mregs.read(inst['vmd'])

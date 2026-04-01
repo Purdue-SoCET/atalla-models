@@ -261,6 +261,10 @@ class ScalarALU:
     # -------------------------
     # BF16 comparisons
     # -------------------------
+    def sqrtbf(self, a, b=None):
+        import math
+        return math.sqrt(float(a)) if float(a) >= 0 else 0.0
+
     def sltbf(self, a, b):
         """
         Signed float comparison: (float32(A) < float32(B)) ? 1 : 0
@@ -316,6 +320,8 @@ class ScalarALU:
             return self.mulbf(a, b)
         elif op == "rcpbf":
             return self.rcpbf(a, b)
+        elif op == "sqrtbf":
+            return self.sqrtbf(a, b)
         elif op == "sltbf":
             return self.sltbf(a, b)
         elif op == "sltubf":

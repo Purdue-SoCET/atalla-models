@@ -49,7 +49,7 @@ MNEMONIC_SCALAR = {
     "mul.bf": "mulbf",
     "rcp.bf": "rcpbf",
     "slt.bf": "sltbf",
-    "sltu.bf": "sltubf",
+    "sqrt.bf": "sqrtbf",
     "addi.s": "add",
     "subi.s": "sub",
     "muli.s": "mul",

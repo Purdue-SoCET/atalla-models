@@ -42,8 +42,7 @@ int main() {
     asm("li_s %0, 108003335" : "=r"(sdma_out));
 
     /* zero vector for blend */
-    vec zero_vec;
-    asm("vreg_ld %0, %1, %2, 7, 0" : "=v"(zero_vec) : "r"(0), "r"(ncols));
+    vec zero_vec = vector_load(0, ncols, 7, 0);
     zero_vec = vec_op_masked("*", zero_vec, 0.0, all_mask);
 
     int ch = 0;
@@ -52,30 +51,28 @@ int main() {
         int out_ptr = OUT_BASE + ch * OUT_CH_BYTES;
 
         /* load input spatial tile */
-        asm("scpad_ld %0, %1, %2" : : "r"(sp), "r"(in_ptr), "r"(sdma_in));
+        scpad_load(sp, in_ptr, sdma_in);
 
         int oh = 0;
         while (oh < H_OUT) {
             int in_row = oh * STRIDE;
 
             /* load first row of pool window */
-            vec best;
-            asm("vreg_ld %0, %1, %2, 7, 0" : "=v"(best) : "r"(in_row), "r"(ncols));
+            vec best = vector_load(in_row, ncols, 7, 0);
 
             /* load second row, vertical max */
             int r1 = in_row + 1;
-            vec v1;
-            asm("vreg_ld %0, %1, %2, 7, 0" : "=v"(v1) : "r"(r1), "r"(ncols));
+            vec v1 = vector_load(r1, ncols, 7, 0);
             int gt1 = make_mask(">", v1, best, all_mask);
             best = vec_op_masked("+", v1, zero_vec, gt1);
 
             /* store vertically-maxed row */
-            asm("vreg_st %0, %1, %2, 7, 0" : : "v"(best), "r"(oh), "r"(ncols));
+            vector_store(best, oh, ncols, 7, 0);
             oh = oh + 1;
         }
 
         /* store output tile back to DRAM */
-        asm("scpad_st %0, %1, %2" : : "r"(sp), "r"(out_ptr), "r"(sdma_out));
+        scpad_store(sp, out_ptr, sdma_out);
         ch = ch + 1;
     }
 

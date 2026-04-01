@@ -33,6 +33,7 @@ BASE_LATENCY = {
     "stbf": 1,
     "bfts": 1,
     "rcp": 8,
+    "sqrt": 8,
 
     # Scalar long latency
     "mul": 3,

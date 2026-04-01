@@ -14,7 +14,7 @@ from .tokens import (
     AtallaVIToken,
     AtallaVMemToken,
 )
-from .vector_registers import AtallaVectorRegister
+from .vector_registers import AtallaVectorRegister, V0
 from .mask_registers import M0, AtallaMaskRegister
 from .registers import R0, AtallaRegister
 from .instructions import Lis
@@ -52,10 +52,9 @@ def make_vv(mnemonic: str, opcode: int):
     vs1 = Operand("vs1", AtallaVectorRegister, read=True)
     vs2 = Operand("vs2", AtallaVectorRegister, read=True)
     mask_reg = Operand("mask_reg", AtallaMaskRegister, read=True)
-    sac = Operand("sac", int)
-    syntax   = Syntax([mnemonic, " ", vd, ",", " ", vs1, ",", " ", vs2, ",", " ", mask_reg, ",", " ", sac])
-    patterns = {"opcode": opcode, "vd": vd, "vs1": vs1, "vs2": vs2, "mask_reg": mask_reg, "sac": sac}
-    members  = {"syntax": syntax, "vd": vd, "vs1": vs1, "vs2": vs2, "patterns": patterns, "opcode": opcode, "mask_reg": mask_reg, "sac": sac}
+    syntax   = Syntax([mnemonic, " ", vd, ",", " ", vs1, ",", " ", vs2, ",", " ", mask_reg])
+    patterns = {"opcode": opcode, "vd": vd, "vs1": vs1, "vs2": vs2, "mask_reg": mask_reg}
+    members  = {"syntax": syntax, "vd": vd, "vs1": vs1, "vs2": vs2, "patterns": patterns, "opcode": opcode, "mask_reg": mask_reg}
     return type(mnemonic.replace(".", "_"), (AtallaVVInstruction,), members)
 
 
@@ -345,19 +344,19 @@ def pattern_reg(context, tree):
 @isa.pattern("vecreg", "ADDVEC(vecreg, vecreg, maskreg)", size=2)
 def patt_add_vv(ctx, tree, v0, v1, mask = M0):
     d = _new_v(ctx)
-    ctx.emit(AddVv(d, v0, v1, mask, 0))
+    ctx.emit(AddVv(d, v0, v1, mask))
     return d
 
 @isa.pattern("vecreg", "SUBVEC(vecreg, vecreg, maskreg)", size=2)
 def patt_sub_vv(ctx, tree, v0, v1, mask = M0):
     d = _new_v(ctx)
-    ctx.emit(SubVv(d, v0, v1, mask, 0))
+    ctx.emit(SubVv(d, v0, v1, mask))
     return d
 
 @isa.pattern("vecreg", "MULVEC(vecreg, vecreg, maskreg)", size=2)
 def patt_mul_vv(ctx, tree, v0, v1, mask = M0):
     d = _new_v(ctx)
-    ctx.emit(MulVv(d, v0, v1, mask, 0))
+    ctx.emit(MulVv(d, v0, v1, mask))
     return d
 
 # @isa.pattern("vecreg", "DIVVEC(vecreg, vecreg, stm)", size=2)
@@ -389,7 +388,7 @@ def patt_mul_vv(ctx, tree, v0, v1, mask = M0):
 @isa.pattern("vecreg", "GEMMVEC(vecreg, vecreg, maskreg)", size=2)
 def patt_gemm_vv(ctx, tree, v0, v1, mask):
     d = _new_v(ctx)
-    ctx.emit(GemmVv(d, v0, v1, mask, 0))
+    ctx.emit(GemmVv(d, v0, v1, mask))
     return d
 
 # ---------- VI (vector-immediate) ----------
@@ -601,3 +600,33 @@ def pattern_vecidx(context, tree, vsrc):
     d = context.new_reg(AtallaRegister)
     context.emit(VecIdx(d, vsrc, tree.children[1].value))
     return d
+
+@isa.pattern("stm", "LOADWEIGHTS(vecreg)")
+def pattern_loadweights(context, tree, vsrc):
+    context.emit(LwVi(V0, vsrc, 0, M0))
+
+
+@isa.pattern("stm", "SCPADLD(reg, reg, reg)", size=1)
+def pattern_scpadld(context, tree, rx, ry, rz):
+    context.emit(ScpadLd(rx, ry, rz))
+
+
+@isa.pattern("stm", "SCPADST(reg, reg, reg)", size=1)
+def pattern_scpadst(context, tree, rx, ry, rz):
+    context.emit(ScpadSt(rx, ry, rz))
+
+
+@isa.pattern("vecreg", "VLOADVEC(reg, reg, CONSTI32, CONSTI32)", size=2)
+def pattern_vload(context, tree, addr, rs2):
+    d = context.new_reg(AtallaVectorRegister)
+    num_cols = tree.children[2].value
+    sid = tree.children[3].value
+    context.emit(VregLd(d, addr, rs2, num_cols, sid))
+    return d
+
+
+@isa.pattern("stm", "VSTORE(vecreg, reg, reg, CONSTI32, CONSTI32)", size=2)
+def pattern_vstore(context, tree, vec, addr, rs2):
+    num_cols = tree.children[3].value
+    sid = tree.children[4].value
+    context.emit(VregSt(vec, addr, rs2, num_cols, sid))

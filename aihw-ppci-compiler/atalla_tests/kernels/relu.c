@@ -28,28 +28,26 @@ int main() {
     asm("li_s %0, 133169183" : "=r"(sdma_ctl));
 
     /* load input tile from DRAM to scratchpad */
-    asm("scpad_ld %0, %1, %2" : : "r"(sp), "r"(IN_GMEM), "r"(sdma_ctl));
+    scpad_load(sp, IN_GMEM, sdma_ctl);
 
     /* create zero vector: load any row then multiply by 0 */
-    vec zero_vec;
-    asm("vreg_ld %0, %1, %2, 31, 0" : "=v"(zero_vec) : "r"(0), "r"(ncols));
+    vec zero_vec = vector_load(0, ncols, 31, 0);
     zero_vec = vec_op_masked("*", zero_vec, 0.0, all_mask);
 
     int row = 0;
     while (row < ROWS) {
-        vec v;
-        asm("vreg_ld %0, %1, %2, 31, 0" : "=v"(v) : "r"(row), "r"(ncols));
+        vec v = vector_load(row, ncols, 31, 0);
 
         /* build mask of negative elements, then zero them out */
         int m_neg = make_mask("<", v, zero_vec, all_mask);
         vec result = vec_op_masked("*", v, 0.0, m_neg);
 
-        asm("vreg_st %0, %1, %2, 31, 0" : : "v"(result), "r"(row), "r"(ncols));
+        vector_store(result, row, ncols, 31, 0);
         row = row + 1;
     }
 
     /* store result tile back to DRAM */
-    asm("scpad_st %0, %1, %2" : : "r"(sp), "r"(OUT_GMEM), "r"(sdma_ctl));
+    scpad_store(sp, OUT_GMEM, sdma_ctl);
 
     asm("halt");
     return 0;

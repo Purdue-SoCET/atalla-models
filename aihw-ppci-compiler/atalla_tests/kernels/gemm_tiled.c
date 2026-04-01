@@ -33,14 +33,12 @@ int main() {
     asm("lw_s %0, 36(%1)" : "=r"(tile_sz) : "r"(cfg));
 
     int all_mask = -1;
-    int sp_a = 0;
-    int sp_w = 512;
-    int sp_c = 0;
+    int sp_base = 0;
     int ncols = 1;
-    int sdma_ctl_a;
-    asm("li_s %0, 103809027" : "=r"(sdma_ctl_a));
-    int sdma_ctl_c;
-    asm("li_s %0, 103809027" : "=r"(sdma_ctl_c));
+    int sdma_ctl_sp0;
+    asm("li_s %0, 103809027" : "=r"(sdma_ctl_sp0));
+    int sdma_ctl_sp1;
+    asm("li_s %0, 1177550851" : "=r"(sdma_ctl_sp1));
 
     int mi = 0;
     while (mi < M_tiles) {
@@ -50,8 +48,8 @@ int main() {
             int c_byte = c_off * 2;
             int c_addr = C_GMEM + c_byte;
 
-            /* load C tile accumulator */
-            asm("scpad_ld %0, %1, %2" : : "r"(sp_c), "r"(c_addr), "r"(sdma_ctl_c));
+            /* load C tile accumulator into SP1 */
+            scpad_load(sp_base, c_addr, sdma_ctl_sp1);
 
             int ki = 0;
             while (ki < K_tiles) {
@@ -63,41 +61,36 @@ int main() {
                 int w_byte = w_off * 2;
                 int w_addr = W_GMEM + w_byte;
 
-                /* load A and W tiles */
-                asm("scpad_ld %0, %1, %2" : : "r"(sp_a), "r"(a_addr), "r"(sdma_ctl_a));
-                asm("scpad_ld %0, %1, %2" : : "r"(sp_w), "r"(w_addr), "r"(sdma_ctl_a));
+                /* load W tile into SP0, preload into systolic array */
+                scpad_load(sp_base, w_addr, sdma_ctl_sp0);
 
-                /* preload W rows into systolic array */
                 int wi = 0;
                 while (wi < TILE) {
-                    vec wvec;
-                    asm("vreg_ld %0, %1, %2, 3, 0"
-                        : "=v"(wvec) : "r"(wi), "r"(ncols));
+                    vec wvec = vector_load(wi, ncols, 3, 0);
+                    load_weights(wvec);
                     wi = wi + 1;
                 }
 
-                /* GEMM: each row of A against preloaded W */
+                /* load A tile into SP0 (safe: W already in systolic array) */
+                scpad_load(sp_base, a_addr, sdma_ctl_sp0);
+
+                /* GEMM: A from SP0, C accumulator from SP1 */
                 int ri = 0;
                 while (ri < TILE) {
-                    vec a_row;
-                    vec c_row;
-                    asm("vreg_ld %0, %1, %2, 3, 0"
-                        : "=v"(a_row) : "r"(ri), "r"(ncols));
-                    asm("vreg_ld %0, %1, %2, 3, 1"
-                        : "=v"(c_row) : "r"(ri), "r"(ncols));
+                    vec a_row = vector_load(ri, ncols, 3, 0);
+                    vec c_row = vector_load(ri, ncols, 3, 1);
 
                     vec result = gemm(a_row, c_row, all_mask);
 
-                    asm("vreg_st %0, %1, %2, 3, 1"
-                        : : "v"(result), "r"(ri), "r"(ncols));
+                    vector_store(result, ri, ncols, 3, 1);
                     ri = ri + 1;
                 }
 
                 ki = ki + 1;
             }
 
-            /* store C tile back to DRAM */
-            asm("scpad_st %0, %1, %2" : : "r"(sp_c), "r"(c_addr), "r"(sdma_ctl_c));
+            /* store C tile from SP1 back to DRAM */
+            scpad_store(sp_base, c_addr, sdma_ctl_sp1);
             ni = ni + 1;
         }
         mi = mi + 1;

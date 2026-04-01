@@ -5,7 +5,7 @@
  *   [0] IN_GMEM    [4] unused
  *
  * Fixed: 1 row x 32 elements. Result written back in-place.
- * Uses rmax, exp, rsum reductions, then scalar reciprocal + broadcast multiply.
+ * Uses rmax, exp, rsum reductions, then 1.0/sum (compiles to rcp_bf+mul_bf).
  */
 
 #define CFG_BASE  0x3C
@@ -28,12 +28,11 @@ int main() {
     asm("li_s %0, 32505887" : "=r"(sdma_ctl));
 
     /* load input from DRAM */
-    asm("scpad_ld %0, %1, %2" : : "r"(sp), "r"(IN_GMEM), "r"(sdma_ctl));
+    scpad_load(sp, IN_GMEM, sdma_ctl);
 
     int row = 0;
     while (row < ROWS) {
-        vec v;
-        asm("vreg_ld %0, %1, %2, 31, 0" : "=v"(v) : "r"(row), "r"(ncols));
+        vec v = vector_load(row, ncols, 31, 0);
 
         /* subtract max for numerical stability */
         vec vmax = vec_op_masked("RMAX", v, 0.0, mask_val);
@@ -45,23 +44,18 @@ int main() {
         /* sum reduction */
         vec sum_v = vec_op_masked("RSUM", exp_v, 0.0, mask_val);
 
-        /* extract scalar sum, compute reciprocal, multiply */
+        /* scalar reciprocal: 1.0/x compiles to rcp_bf + mul_bf */
         float sum_f = sum_v[0];
-        int sum_bits;
-        int inv_bits;
-        asm("stbf_s %0, %1, %2" : "=r"(sum_bits) : "r"(sum_f), "r"(0));
-        asm("rcp_bf %0, %1, %2" : "=r"(inv_bits) : "r"(sum_bits), "r"(0));
-        float inv_sum;
-        asm("bfts_s %0, %1, %2" : "=r"(inv_sum) : "r"(inv_bits), "r"(0));
+        float inv_sum = 1.0 / sum_f;
 
         vec result = vec_op_masked("*", exp_v, inv_sum, mask_val);
 
-        asm("vreg_st %0, %1, %2, 31, 0" : : "v"(result), "r"(row), "r"(ncols));
+        vector_store(result, row, ncols, 31, 0);
         row = row + 1;
     }
 
     /* store result back in-place */
-    asm("scpad_st %0, %1, %2" : : "r"(sp), "r"(IN_GMEM), "r"(sdma_ctl));
+    scpad_store(sp, IN_GMEM, sdma_ctl);
 
     asm("halt");
     return 0;
