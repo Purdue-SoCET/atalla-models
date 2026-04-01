@@ -296,39 +296,32 @@ The functional simulator is not cycle-accurate. Primary efficiency metric is **V
 
 ### Compiler (`aihw-ppci-compiler`)
 
-1 file differs in `ppci/` (`arch.py` minor guard change — should re-sync). All other changes are additive: `atalla_tests/kernels/` reference C kernels + validation scripts.
+- `ppci/arch.py` minor guard change
+- additive: `atalla_tests/kernels/` reference C kernels + validation scripts
 
 ### Emulator (`functional_sim`)
 
-**Bug fixes:** m0 mask, BF16 register convention, gemm.vv order, lw.vi weight reset, stbf/bfts semantics, stack/DRAM overlap.
+- bugs: m0 mask, BF16 register convention, gemm.vv order, lw.vi weight reset, stbf/bfts semantics, stack/DRAM overlap.
 
-**New features:** 3-reg SDMA decode, sqrt.bf, div.vv/vs, vector spill memory, li.s, perf counters, sqrt/div latencies.
+- new: ** 3-reg SDMA decode, sqrt.bf, div.vv/vs, vector spill memory, li.s, perf counters, sqrt/div latencies.
 
-**Import fixes:** Relative → fallback imports for standalone execution.
+- import fixes: relative → fallback imports for standalone execution.
 
-**Additive:** `build_compiler.py`, `_asm_encoding.py`, `build_alexnet_layer.py`, `build_maxpool.py`, `validate_and_benchmark.py`.
+- added: `build_compiler.py`, `_asm_encoding.py`, `build_alexnet_layer.py`, `build_maxpool.py`, `validate_and_benchmark.py`.
 
 ### Graph (`atalla-graph`)
 
-**Vihaan's files untouched:** `graph/export_fx.py`, `graph/lower_modules.py`, `graph/memoryallocator.py`, `scripts/generate_schedule.py`, `model/`, `main.py`, `kernels/kernels.c/h`.
+- untouched: `graph/export_fx.py`, `graph/lower_modules.py`, `graph/memoryallocator.py`, `scripts/generate_schedule.py`, `model/`, `main.py`, `kernels/kernels.c/h`.
 
-**Additive only:** `graph/fx_capture.py`, `graph/tile_planner.py`, `codegen/c_emitter.py`, `codegen/dram_builder.py`, `kernels/*.py`, `run_graph.py`, `model/alexnet_small.py`.
+- added: `graph/fx_capture.py`, `graph/tile_planner.py`, `codegen/c_emitter.py`, `codegen/dram_builder.py`, `kernels/*.py`, `run_graph.py`, `model/alexnet_small.py`.
 
 ### Known Limitations
 
-| Limitation | Mitigation |
-|------------|------------|
-| Compiler stack frame overflow | Reduce live vector count |
-| No vector SQRT / shift.vi | Scalar sqrt; vertical-only maxpool |
-| `mul` still NumPy | Assign to team member |
-| `sltu.bf` reassigned to `sqrt.bf` | Verify with Sahil |
+- compiler stack frame overflow (reduce live vector count)
+- due to no vector sqrt / shift.vi -> use decompose + scalar sqrt , vertical-only maxpool
 
 ---
 
 ## 10. Open Items
 
-1. **`mul` kernel** — last NumPy fallback
-2. **Re-sync vendored compiler** from `atalla-arch`
-3. **Confirm `sqrt.bf` opcode** with ISA spec owner
-4. **Upstream emulator fixes** to `functional_sim` branch
-5. **Missing ISA ops** (`shift.vi`, `sqrti.vi`)
+`mul` kernel** (last NumPy fallback, not needed for alexnet), `sqrt.bf` opcode discrepancy b/w ppci and functional_sim (`sltu.bf` reassigned to `sqrt.bf`)

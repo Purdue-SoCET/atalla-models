@@ -248,7 +248,7 @@ Look for your op in the output — it should say `emulator` not `NumPy`:
 ```
 [myop_node] myop -> emulator (0x3000, 32 elems)... done (cos=0.9998)
 ```
-
+<!-- 
 ## Common Issues
 
 | Problem | Fix |
@@ -258,6 +258,7 @@ Look for your op in the output — it should say `emulator` not `NumPy`:
 | `Tree ... not covered` | Reduce live vector variables; compiler stack frame may exceed 12-bit offset range |
 | `cosine_sim = 0.0` (all zeros) | Check BF16 register convention in `functional_sim.py :: bf16_reg_to_f32` |
 | Op runs as NumPy | Make sure `emit_myop` does NOT set `em.skip_emulator = True` and returns `em.c_source` |
+-->
 
 ## File Quick Reference
 
@@ -269,5 +270,4 @@ Look for your op in the output — it should say `emulator` not `NumPy`:
 | Instruction opcodes | `functional_sim/src/misc/opcode_table.py` |
 | Compiler backend | `aihw-ppci-compiler/ppci/arch/atalla/` |
 | AtallaC frontend | `aihw-ppci-compiler/ppci/lang/atalla_c/` |
-| ISA spec | `ISA Atalla Bit Spec Updated.csv` |
-| Technical reference | `PIPELINE_TECHNICAL_REFERENCE.md` |
+| Technical reference | `pipeline_reference.md` |

@@ -12,7 +12,7 @@ This repo vendors and extends three upstream components:
 | `functional_sim/` | [Purdue-SoCET/atalla](https://github.com/Purdue-SoCET/atalla/tree/functional_sim/functional_sim) | `functional_sim` |
 | `atalla-graph/` | [vihaanrc/atalla-graph](https://github.com/vihaanrc/atalla-graph) | `temp` (now `main`) |
 
-Our changes are documented in `PIPELINE_TECHNICAL_REFERENCE.md` §9.
+Our changes are documented in `pipeline_reference.md` §9.
 
 ## Pipeline Flow
 
@@ -54,14 +54,14 @@ instruction section ──── + ────── data section
 atalla-models/
     atalla-graph/                      Graph frontend + kernel codegen
         graph/                         Vihaan's: export_fx, lower_modules, memoryallocator
-                                       Ours: fx_capture.py, tile_planner.py
+                                       Added: fx_capture.py, tile_planner.py
         codegen/                       c_emitter.py, dram_builder.py
         kernels/                       AtallaC generators: gemm, relu, softmax, maxpool, add
-        model/                         basic.py, alexnet.py (Vihaan's), alexnet_small.py (ours)
-        scripts/                       generate_schedule.py (Vihaan's C schedule emitter)
-        run_graph.py                   Unified entry point: validate or schedule mode
+        model/                         basic.py, alexnet.py (Vihaan's), alexnet_small.py (added)
+        scripts/                       generate_schedule.py (Vihaan's)
+        run_graph.py                   unified entry point: validate or schedule mode (--validate, --schedule)
     functional_sim/                    Emulator + encoding toolchain
-        src/                           functional_sim.py, components/, misc/
+        src/                           functional_sim.py
         build.py                       DRAMWriter, render_testfile, assembler
         build_compiler.py              VLIW scheduler + encoder
         _asm_encoding.py               Instruction encoding library
@@ -71,7 +71,7 @@ atalla-models/
         ppci/arch/atalla/              Backend
         ppci/lang/atalla_c/            AtallaC frontend
         atalla_tests/kernels/          Reference .c kernels
-    PIPELINE_TECHNICAL_REFERENCE.md    Full technical documentation
+    pipeline_reference.md    Full technical documentation
     CONTRIBUTING.md                    How to add a new kernel (step-by-step)
 ```
 
@@ -91,14 +91,13 @@ python run_graph.py --model basic --mode schedule --out-dir out/basic
 | BasicModule (dim=32, depth=2) | 9 | 1 (mul) | 1 | 0.9999 |
 | AlexNetSmall (scale=0.01) | 21 | 0 | 4 | 0.969 |
 
-AlexNet runs **fully on-chip** with zero NumPy fallbacks. BasicModule has 1 remaining
-NumPy op (`mul` for residual scaling). Cosine degradation is expected BF16 drift.
+alexnet runs fully on chip.
 
 ## Key Design Decisions
 
 - **C compiler path for all compute ops.** Conv, Linear, Matmul, ReLU, Softmax, MaxPool, Add all generate AtallaC via `kernels/*.py`, compile through ppci, schedule via `build_compiler`, and run on the emulator.
 - **Passthrough ops need no kernel.** Flatten, transpose, and dropout are pure reshapes — the orchestrator just reshapes the numpy array, no `.in` file generated.
-- **atalla-graph owns the .data section.** Each `emit_<op>()` creates a `DRAMWriter` with config (ADDR_TABLE at 0x3C) + tensors. Combined with instruction section via `render_testfile()`. See `PIPELINE_TECHNICAL_REFERENCE.md` §6.2.
+- **atalla-graph owns the .data section.** Each `emit_<op>()` creates a `DRAMWriter` with config (ADDR_TABLE at 0x3C) + tensors. Combined with instruction section via `render_testfile()`. See `pipeline_reference.md` §6.2.
 - **Per-layer emulator invocation.** Each layer gets a fresh emulator. Activations pass between layers via `activation_cache`.
 - **Stack pointer set dynamically.** `x2` placed above all DRAM data to prevent stack/tensor overlap.
 
