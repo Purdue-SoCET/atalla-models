@@ -140,7 +140,7 @@ relu_loop:
         vreg.ld $4, $9, {w_m1}, {sp_r_m1}, 0, 1, $25
         mgt.mvv 2, $4, $2, 1
         addi.vi $1, $0, 0.0, 1
-        add.vv  $1, $4, $2, 2, 0
+        add.vv  $1, $4, $2, 2
         vreg.st $1, $9, {w_m1}, {sp_r_m1}, 0, 1, $25
         addi.s  $25, $25, 1
         blt.s   $25, $26, relu_loop
@@ -267,7 +267,7 @@ wt_done:
 row_loop:
         vreg.ld $30, $70, {tk1}, {tm1}, 0, 1, $25
         vreg.ld $31, $72, {tn1}, {tm1}, 1, 1, $25
-        gemm.vv $32, $30, $31, 0, 0
+        gemm.vv $32, $30, $31, 0
         vreg.st $32, $72, {tn1}, {tm1}, 1, 1, $25
         addi.s  $25, $25, 1
         blt.s   $25, $26, row_loop
@@ -312,32 +312,32 @@ def make_maxpool_asm(H_in: int, W_in: int, pool_size: int, stride: int) -> str:
         a(f"addi.s  $27, $29, {p}")
         a(f"vreg.ld ${40 + p}, $3, {w_m1}, {h_m1}, 0, 1, $27")
     # vertical max
-    a(f"sub.vv  $50, $50, $50, 1, 0")
-    a(f"add.vv  $50, $50, $41, 1, 0")
+    a(f"sub.vv  $50, $50, $50, 1")
+    a(f"add.vv  $50, $50, $41, 1")
     a(f"mgt.mvv 2, $40, $41, 1")
-    a(f"sub.vv  $50, $50, $50, 2, 0")
-    a(f"add.vv  $50, $50, $40, 2, 0")
+    a(f"sub.vv  $50, $50, $50, 2")
+    a(f"add.vv  $50, $50, $40, 2")
     if pool_size >= 3:
-        a(f"sub.vv  $51, $51, $51, 1, 0")
-        a(f"add.vv  $51, $51, $42, 1, 0")
+        a(f"sub.vv  $51, $51, $51, 1")
+        a(f"add.vv  $51, $51, $42, 1")
         a(f"mgt.mvv 2, $50, $42, 1")
-        a(f"sub.vv  $51, $51, $51, 2, 0")
-        a(f"add.vv  $51, $51, $50, 2, 0")
+        a(f"sub.vv  $51, $51, $51, 2")
+        a(f"add.vv  $51, $51, $50, 2")
     vert = "$51" if pool_size >= 3 else "$50"
     # horizontal max
     a(f"shift.vi $52, {vert}, 1, 1")
     a(f"mgt.mvv 2, {vert}, $52, 1")
-    a(f"sub.vv  $53, $53, $53, 1, 0")
-    a(f"add.vv  $53, $53, $52, 1, 0")
-    a(f"sub.vv  $53, $53, $53, 2, 0")
-    a(f"add.vv  $53, $53, {vert}, 2, 0")
+    a(f"sub.vv  $53, $53, $53, 1")
+    a(f"add.vv  $53, $53, $52, 1")
+    a(f"sub.vv  $53, $53, $53, 2")
+    a(f"add.vv  $53, $53, {vert}, 2")
     if pool_size >= 3:
         a(f"shift.vi $52, {vert}, 2, 1")
         a(f"mgt.mvv 2, $53, $52, 1")
-        a(f"sub.vv  $54, $54, $54, 1, 0")
-        a(f"add.vv  $54, $54, $52, 1, 0")
-        a(f"sub.vv  $54, $54, $54, 2, 0")
-        a(f"add.vv  $54, $54, $53, 2, 0")
+        a(f"sub.vv  $54, $54, $54, 1")
+        a(f"add.vv  $54, $54, $52, 1")
+        a(f"sub.vv  $54, $54, $54, 2")
+        a(f"add.vv  $54, $54, $53, 2")
         hz = "$54"
     else:
         hz = "$53"

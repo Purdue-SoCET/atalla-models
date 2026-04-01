@@ -108,18 +108,16 @@ def encode_instruction(instr_dict):
         pass
         
     elif instr_type == "VV":
-        # VV-Type: vd 7-14, vs1 15-22, vs2 23-30, mask 31-34, sac 35-39
+        # VV-Type: vd 7-14, vs1 15-22, vs2 23-30, mask 31-34
         vd = instr_dict.get('vd', 0)
         vs1 = instr_dict.get('vs1', 0)
         vs2 = instr_dict.get('vs2', 0)
         mask = instr_dict.get('mask', 0)
-        sac = instr_dict.get('sac', 0)
         
         instruction |= (vd & 0xFF) << 7
         instruction |= (vs1 & 0xFF) << 15
         instruction |= (vs2 & 0xFF) << 23
         instruction |= (mask & 0xF) << 31
-        instruction |= (sac & 0x1F) << 35
         
     elif instr_type == "VS":
         # VS-Type: vd 7-14, vs1 15-22, rs1 23-30, mask 31-34
@@ -148,7 +146,7 @@ def encode_instruction(instr_dict):
         instruction |= (imm8_2 & 0xFF) << 35
         
     elif instr_type == "VM":
-        # VM-Type (new): vd 7-14, rs1 15-22, rs2 23-30, num_cols 31-35, sid 36-37
+        # VM-Type (new): vd 7-14, rs1 15-22, rs2 23-30, num_cols 31-35, sid 36-37, flag bit 40=1
         # VM-Type (old): vd 7-14, rs1 15-22, num_cols 23-27, num_rows 28-32, sid 33, rc 34, rc_id 35-39
         vd = instr_dict.get('vd', 0)
         rs1 = instr_dict.get('rs1', 0)
@@ -479,12 +477,11 @@ def asm_to_instr_dict(
         return d
 
     if instr_type == "VV":
-        # add.vv vd, vs1, vs2, mask, sac
+        # add.vv vd, vs1, vs2, mask
         d["vd"] = parse_reg(ops[0])
         d["vs1"] = parse_reg(ops[1])
         d["vs2"] = parse_reg(ops[2])
         d["mask"] = parse_int(ops[3])
-        d["sac"] = parse_int(ops[4])
         return d
 
     if instr_type == "VS":

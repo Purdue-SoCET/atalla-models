@@ -30,7 +30,7 @@ int main() {
     asm("li_s %0, 133169183" : "=r"(sdma_ctl_sp0));
     /* sdma_ctl for 4 rows x 32 cols, sid=1 */
     int sdma_ctl_sp1;
-    asm("li_s %0, 1206910975" : "=r"(sdma_ctl_sp1));
+    asm("li_s %0, 1206911007" : "=r"(sdma_ctl_sp1));
 
     /* load A into SP0, B into SP1 */
     scpad_load(sp, A_GMEM, sdma_ctl_sp0);

@@ -79,30 +79,30 @@ def main():
         rsum.vi  $22, $12, {RSUM_IMM}, 1                    # reduce row 2 -> partial sum 2, imm = 1 << 6
         rsum.vi  $23, $13, {RSUM_IMM}, 1                    # reduce row 3 -> partial sum 3, imm = 1 << 6
         
-        add.vv   $21, $20, $21, 1, 0                # partial sum 0 + partial sum 1
-        add.vv   $22, $22, $23, 1, 0                # partial sum 2 + partial sum 3
-        add.vv   $24, $21, $22, 1, 0                # layer mean sum in $24
+        add.vv   $21, $20, $21, 1                # partial sum 0 + partial sum 1
+        add.vv   $22, $22, $23, 1                # partial sum 2 + partial sum 3
+        add.vv   $24, $21, $22, 1                # layer mean sum in $24
 
         mul.vs   $24, $24, $14, 1                   # layer mean sum * inv(N^2) -> final mean in $24
 
-        sub.vv   $30, $10, $24, 1, 0                # normalized numerator row 0 = row 0 - mean
-        sub.vv   $31, $11, $24, 1, 0                # normalized numerator row 1 = row 1 - mean
-        sub.vv   $32, $12, $24, 1, 0                # normalized numerator row 2 = row 2 - mean
-        sub.vv   $33, $13, $24, 1, 0                # normalized numerator row 3 = row 3 - mean
+        sub.vv   $30, $10, $24, 1                # normalized numerator row 0 = row 0 - mean
+        sub.vv   $31, $11, $24, 1                # normalized numerator row 1 = row 1 - mean
+        sub.vv   $32, $12, $24, 1                # normalized numerator row 2 = row 2 - mean
+        sub.vv   $33, $13, $24, 1                # normalized numerator row 3 = row 3 - mean
 
-        mul.vv   $34, $30, $30, 1, 0                # row variance contribution for row 0
-        mul.vv   $35, $31, $31, 1, 0                # row variance contribution for row 1
-        mul.vv   $36, $32, $32, 1, 0                # row variance contribution for row 2
-        mul.vv   $37, $33, $33, 1, 0                # row variance contribution for row 3
+        mul.vv   $34, $30, $30, 1                # row variance contribution for row 0
+        mul.vv   $35, $31, $31, 1                # row variance contribution for row 1
+        mul.vv   $36, $32, $32, 1                # row variance contribution for row 2
+        mul.vv   $37, $33, $33, 1                # row variance contribution for row 3
 
         rsum.vi  $34, $34, {RSUM_IMM}, 1                    # reduce row variance contribution 0
         rsum.vi  $35, $35, {RSUM_IMM}, 1                    # reduce row variance contribution 1
         rsum.vi  $36, $36, {RSUM_IMM}, 1                    # reduce row variance contribution 2
         rsum.vi  $37, $37, {RSUM_IMM}, 1                    # reduce row variance contribution 3
 
-        add.vv   $35, $34, $35, 1, 0                # partial variance pair 0+1
-        add.vv   $37, $36, $37, 1, 0                # partial variance pair 2+3
-        add.vv   $38, $35, $37, 1, 0                # variance sum in $38
+        add.vv   $35, $34, $35, 1                # partial variance pair 0+1
+        add.vv   $37, $36, $37, 1                # partial variance pair 2+3
+        add.vv   $38, $35, $37, 1                # variance sum in $38
         
         mul.vs   $39, $38, $14, 1                   # variance sum * inv(N^2) -> final variance in $39
 

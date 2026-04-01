@@ -166,9 +166,9 @@ def asm_to_instr_dict(
     labels: dict[str, int] | None = None,
     pc: int | None = None,
 ) -> dict:
-    # Compiler output sometimes omits VV sac; default to 0.
+    # VV-type: compiler emits 4 operands (vd, vs1, vs2, mask) — pass through directly.
     if mnemonic in {"add.vv", "sub.vv", "mul.vv", "div.vv", "and.vv", "or.vv", "xor.vv", "gemm.vv"} and len(ops) == 4:
-        return base.asm_to_instr_dict(mnemonic, [ops[0], ops[1], ops[2], ops[3], "0"], labels=labels, pc=pc)
+        return base.asm_to_instr_dict(mnemonic, ops, labels=labels, pc=pc)
 
     # base assembler resolves labels for BR, but not for JAL immediates.
     if mnemonic == "jal" and len(ops) in (1, 2):

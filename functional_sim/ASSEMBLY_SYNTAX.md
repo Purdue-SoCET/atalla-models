@@ -309,61 +309,54 @@ barrier.s
 
 ## Vector-Vector (VV-Type)
 
-add.vv vd, vs1, vs2, mask, sac
+add.vv vd, vs1, vs2, mask
 - Operation: Element-wise add.
 - `vd`: vector destination.
 - `vs1`: vector input A.
 - `vs2`: vector input B.
 - `mask`: lane-enable mask register index.
-- `sac`: vector control field.
 
-sub.vv vd, vs1, vs2, mask, sac
+sub.vv vd, vs1, vs2, mask
 - Operation: Element-wise subtract.
 - `vd`: vector destination.
 - `vs1`: vector minuend.
 - `vs2`: vector subtrahend.
 - `mask`: lane-enable mask register index.
-- `sac`: vector control field.
 
-mul.vv vd, vs1, vs2, mask, sac
+mul.vv vd, vs1, vs2, mask
 - Operation: Element-wise multiply.
 - `vd`: vector destination.
 - `vs1`: vector multiplicand.
 - `vs2`: vector multiplier.
 - `mask`: lane-enable mask register index.
-- `sac`: vector control field.
 
-and.vv vd, vs1, vs2, mask, sac
+and.vv vd, vs1, vs2, mask
 - Operation: Element-wise bitwise AND.
 - `vd`: vector destination.
 - `vs1`: vector input A.
 - `vs2`: vector input B.
 - `mask`: lane-enable mask register index.
-- `sac`: vector control field.
 
-or.vv vd, vs1, vs2, mask, sac
+or.vv vd, vs1, vs2, mask
 - Operation: Element-wise bitwise OR.
 - `vd`: vector destination.
 - `vs1`: vector input A.
 - `vs2`: vector input B.
 - `mask`: lane-enable mask register index.
-- `sac`: vector control field.
 
-xor.vv vd, vs1, vs2, mask, sac
+xor.vv vd, vs1, vs2, mask
 - Operation: Element-wise bitwise XOR.
 - `vd`: vector destination.
 - `vs1`: vector input A.
 - `vs2`: vector input B.
 - `mask`: lane-enable mask register index.
-- `sac`: vector control field.
 
-gemm.vv vd, vs1, vs2, mask, sac
+gemm.vv vd, vs1, vs2, mask
 - Operation: GEMM/systolic-array accumulate (`vd = vs1 * weights + vs2`).
 - `vd`: vector destination/output.
 - `vs1`: vector activation/input tile.
 - `vs2`: vector partial-sum input.
 - `mask`: lane-enable mask register index.
-- `sac`: vector control field.
 
 ## Vector-Immediate (VI-Type)
 

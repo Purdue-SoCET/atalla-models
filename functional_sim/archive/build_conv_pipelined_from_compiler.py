@@ -62,22 +62,6 @@ UNDERSCORE_TO_DOT = {
 
 SKIP_DIRECTIVES = {".section", ".align", "global", "type"}
 
-VV_MNEMONICS = {"add.vv", "sub.vv", "mul.vv", "gemm.vv", "and.vv", "or.vv", "xor.vv"}
-
-
-def fixup_vv_sac(asm: str) -> str:
-    """Append sac=0 to VV-type instructions that only have 4 operands."""
-    out = []
-    for line in asm.splitlines():
-        stripped = line.strip()
-        parts = stripped.split(None, 1)
-        if len(parts) == 2 and parts[0] in VV_MNEMONICS:
-            ops = [o.strip() for o in parts[1].split(",")]
-            if len(ops) == 4:
-                line = "        " + parts[0] + " " + ", ".join(ops) + ", 0"
-        out.append(line)
-    return "\n".join(out)
-
 
 def convert_ppci_to_emulator(ppci_asm: str) -> str:
     lines = ppci_asm.splitlines()
@@ -215,8 +199,6 @@ def main():
     emu_lines = strip_prologue_epilogue(emu_asm.splitlines())
     emu_asm_clean = "\n".join(emu_lines)
     emu_asm_clean = resolve_jal_labels(emu_asm_clean)
-
-    emu_asm_clean = fixup_vv_sac(emu_asm_clean)
 
     print("=== Converted assembly (emulator format) ===")
     print(emu_asm_clean)

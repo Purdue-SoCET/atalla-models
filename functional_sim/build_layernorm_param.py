@@ -78,7 +78,7 @@ def main():
         addi.s   $8, $0, {N}                         # load loop bound N into $8
 
         ############## PHASE 1: MEAN (pipelined) ##############
-        sub.vv   $20, $20, $20, 1, 0                 # zero mean accumulator
+        sub.vv   $20, $20, $20, 1                 # zero mean accumulator
         addi.s   $7, $0, 0                            # i = 0
         vreg.ld  $10, $3, {MAX_COL_IND}, {MAX_ROW_IND}, {SID}, 1, $7  # fetch row 0, store in $10
         addi.s   $7, $7, 1                            # i += 1
@@ -86,35 +86,35 @@ def main():
     MEAN_LOOP:
         rsum.vi  $11, $10, {RSUM_IMM}, 1              # reduction sum row i - 1
         vreg.ld  $10, $3, {MAX_COL_IND}, {MAX_ROW_IND}, {SID}, 1, $7  # load row i (pipelined with rsum)
-        add.vv   $20, $20, $11, 1, 0                  # accumulate partial sum of row i - 1
+        add.vv   $20, $20, $11, 1                  # accumulate partial sum of row i - 1
         addi.s   $7, $7, 1                             # i += 1
         blt.s    $7, $8, MEAN_LOOP                     # loop while i < N
 
     MEAN_DONE:
         rsum.vi  $11, $10, {RSUM_IMM}, 1              # reduce last row
-        add.vv   $20, $20, $11, 1, 0                  # accumulate last partial sum
+        add.vv   $20, $20, $11, 1                  # accumulate last partial sum
         mul.vs   $24, $20, $14, 1                      # mean = total_sum * inv(N^2)
 
         ############## PHASE 2: VARIANCE (pipelined) ##############
-        sub.vv   $38, $38, $38, 1, 0                  # zero variance accumulator
+        sub.vv   $38, $38, $38, 1                  # zero variance accumulator
         addi.s   $7, $0, 0                             # i = 0
         vreg.ld  $10, $3, {MAX_COL_IND}, {MAX_ROW_IND}, {SID}, 1, $7  # prefetch row 0
-        sub.vv   $30, $10, $24, 1, 0                   # diff = row 0 - mean
+        sub.vv   $30, $10, $24, 1                   # diff = row 0 - mean
         addi.s   $7, $7, 1                              # i = 1
         bge.s    $7, $8, VAR_DONE                       # skip loop if N == 1
     VAR_LOOP:
-        mul.vv   $12, $30, $30, 1, 0                   # square previous diff
+        mul.vv   $12, $30, $30, 1                   # square previous diff
         vreg.ld  $10, $3, {MAX_COL_IND}, {MAX_ROW_IND}, {SID}, 1, $7  # load row i (pipelined)
         rsum.vi  $12, $12, {RSUM_IMM}, 1                # reduce squared diff
-        sub.vv   $30, $10, $24, 1, 0                    # diff = row i - mean (pipelined)
-        add.vv   $38, $38, $12, 1, 0                    # accumulate variance
+        sub.vv   $30, $10, $24, 1                    # diff = row i - mean (pipelined)
+        add.vv   $38, $38, $12, 1                    # accumulate variance
         addi.s   $7, $7, 1                               # i++
         blt.s    $7, $8, VAR_LOOP                        # loop while i < N
 
     VAR_DONE:
-        mul.vv   $12, $30, $30, 1, 0                   # square last diff
+        mul.vv   $12, $30, $30, 1                   # square last diff
         rsum.vi  $12, $12, {RSUM_IMM}, 1                # reduce last squared diff
-        add.vv   $38, $38, $12, 1, 0                    # accumulate last variance contribution
+        add.vv   $38, $38, $12, 1                    # accumulate last variance contribution
         mul.vs   $39, $38, $14, 1                        # variance = sum * inv(N^2)
         add.vs   $39, $39, $4, 1                         # add epsilon for stability
         sqrti.vi $39, $39, 0, 1                          # denominator = sqrt(variance + epsilon)
@@ -125,7 +125,7 @@ def main():
         ############## PHASE 3: NORMALIZE + STORE (pipelined) ##############
         addi.s   $7, $0, 0                              # i = 0
         vreg.ld  $10, $3, {MAX_COL_IND}, {MAX_ROW_IND}, {SID}, 1, $7  # load row 0
-        sub.vv   $30, $10, $24, 1, 0                     # row 0 - mean
+        sub.vv   $30, $10, $24, 1                     # row 0 - mean
         mul.vs   $30, $30, $15, 1                        # normalize row 0 via reciprocal multiply
         addi.s   $7, $7, 1                                # i = 1
         bge.s    $7, $8, NORM_DONE                        # skip loop if N == 1
@@ -133,7 +133,7 @@ def main():
         vreg.ld  $10, $3, {MAX_COL_IND}, {MAX_ROW_IND}, {SID}, 1, $7   # load row i (pipelined)
         subi.s   $9, $7, 1                                # prev = i - 1
         vreg.st  $30, $3, {MAX_COL_IND}, {MAX_ROW_IND}, {SID}, 1, $9   # store prev normalized row (pipelined)
-        sub.vv   $30, $10, $24, 1, 0                      # row i - mean
+        sub.vv   $30, $10, $24, 1                      # row i - mean
         mul.vs   $30, $30, $15, 1                         # normalize row i via reciprocal multiply
         addi.s   $7, $7, 1                                 # i++
         blt.s    $7, $8, NORM_LOOP                         # loop while i < N

@@ -114,7 +114,7 @@ wt_done:
 row_loop:
         vreg.ld $30, $70, {tk1}, {tm1}, 0, 1, $25
         vreg.ld $31, $72, {tn1}, {tm1}, 1, 1, $25
-        gemm.vv $32, $30, $31, 0, 0
+        gemm.vv $32, $30, $31, 0
         vreg.st $32, $72, {tn1}, {tm1}, 1, 1, $25
         addi.s  $25, $25, 1
         blt.s   $25, $26, row_loop

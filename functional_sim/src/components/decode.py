@@ -124,13 +124,12 @@ def decode_instruction(instr):
         decoded.update({"info": "no operands"})
 
     elif instr_type == "VV":
-        # VV-Type: vd 7-14, vs1 15-22, vs2 23-30, mask 31-34, sac 35-39
+        # VV-Type: vd 7-14, vs1 15-22, vs2 23-30, mask 31-34
         decoded.update({
             "vd": get_bits(instr, 14, 7),
             "vs1": get_bits(instr, 22, 15),
             "vs2": get_bits(instr, 30, 23),
             "mask": get_bits(instr, 34, 31),
-            "sac": get_bits(instr, 39, 35)
         })
 
     elif instr_type == "VS":
@@ -154,15 +153,7 @@ def decode_instruction(instr):
         })
 
     elif instr_type == "VM":
-        # VM-Type: vd 7-14, rs1 15-22, tile r/c count 23-27, rc 28, sp 29-30, mask 31-34, rc_id 35-39
         decoded.update({
-            # "vd": get_bits(instr, 14, 7),
-            # "rs1": get_bits(instr, 22, 15),
-            # "tile_rc": get_bits(instr, 27, 23),
-            # "rc": get_bits(instr, 28, 28),
-            # "sp": get_bits(instr, 30, 29),
-            # "mask": get_bits(instr, 34, 31),
-            # "rc_id": get_bits(instr, 39, 35)
             "vd": get_bits(instr, 14, 7),
             "rs1": get_bits(instr, 22, 15),
             "num_cols": get_bits(instr, 27, 23),

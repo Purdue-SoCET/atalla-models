@@ -123,7 +123,7 @@ tile_loop:
 row_loop:
         vreg.ld $4, $21, {COLS}, {ROWS}, {SID0}, 1, $27
         vreg.ld $5, $23, {COLS}, {ROWS}, {SID1}, 1, $27
-        gemm.vv $6, $4, $5, 0, 0
+        gemm.vv $6, $4, $5, 0
         vreg.st $6, $23, {COLS}, {ROWS}, {SID1}, 1, $27
 
         addi.s  $27, $27, 1

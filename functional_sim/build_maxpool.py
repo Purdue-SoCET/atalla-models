@@ -67,29 +67,29 @@ def make_maxpool_asm(H_in: int, W_in: int, pool_size: int, stride: int) -> str:
     a( "")
     a( "# vertical max: compare rows pairwise")
     a(f"mgt.mvv 2, $40, $41, 1      # mask2 = (row0 > row1)")
-    a(f"add.vv  $50, $40, $0, 2, 0  # $50 = row0 where row0>row1")
-    a(f"add.vv  $50, $41, $0, 1, 0  # temp: $50 = row1 everywhere under mask1")
+    a(f"add.vv  $50, $40, $0, 2  # $50 = row0 where row0>row1")
+    a(f"add.vv  $50, $41, $0, 1  # temp: $50 = row1 everywhere under mask1")
     # Need proper blend: $50[i] = row0[i] if mask2[i] else row1[i]
-    # Actually: add.vv $50, $41, $0, 1, 0 sets $50 = row1 under mask1
-    # Then: add.vv $50, $40, $0, 2, 0 overwrites with row0 where mask2 is set
+    # Actually: add.vv $50, $41, $0, 1 sets $50 = row1 under mask1
+    # Then: add.vv $50, $40, $0, 2 overwrites with row0 where mask2 is set
     # But add.vv writes under mask, and preserves old value where mask is 0.
     # So order matters: first set $50 = row1, then overwrite with row0 where row0 > row1.
 
     # Corrected blend: use sub.vv to zero $50, then two masked adds
     a( "# blend: $50 = max(row0, row1)")
-    a(f"sub.vv  $50, $50, $50, 1, 0 # zero $50")
-    a(f"add.vv  $50, $50, $41, 1, 0 # $50 = row1 (all lanes)")
+    a(f"sub.vv  $50, $50, $50, 1 # zero $50")
+    a(f"add.vv  $50, $50, $41, 1 # $50 = row1 (all lanes)")
     a(f"mgt.mvv 2, $40, $41, 1      # mask2 = row0 > row1")
-    a(f"sub.vv  $50, $50, $50, 2, 0 # zero lanes where row0 > row1")
-    a(f"add.vv  $50, $50, $40, 2, 0 # write row0 into those lanes")
+    a(f"sub.vv  $50, $50, $50, 2 # zero lanes where row0 > row1")
+    a(f"add.vv  $50, $50, $40, 2 # write row0 into those lanes")
 
     if pool_size >= 3:
         a( "# max($50, row2) -> $50")
         a(f"mgt.mvv 2, $50, $42, 1")
-        a(f"sub.vv  $51, $51, $51, 1, 0")
-        a(f"add.vv  $51, $51, $42, 1, 0")
-        a(f"sub.vv  $51, $51, $51, 2, 0")
-        a(f"add.vv  $51, $51, $50, 2, 0")
+        a(f"sub.vv  $51, $51, $51, 1")
+        a(f"add.vv  $51, $51, $42, 1")
+        a(f"sub.vv  $51, $51, $51, 2")
+        a(f"add.vv  $51, $51, $50, 2")
         a( "# $51 = max across 3 rows")
     else:
         a( "# $50 = max across 2 rows")
@@ -103,19 +103,19 @@ def make_maxpool_asm(H_in: int, W_in: int, pool_size: int, stride: int) -> str:
     a( "# horizontal max: shift + compare")
     a(f"shift.vi $52, {vert_result}, 1, 1  # shift right by 1")
     a(f"mgt.mvv 2, {vert_result}, $52, 1")
-    a(f"sub.vv  $53, $53, $53, 1, 0")
-    a(f"add.vv  $53, $53, $52, 1, 0")
-    a(f"sub.vv  $53, $53, $53, 2, 0")
-    a(f"add.vv  $53, $53, {vert_result}, 2, 0")
+    a(f"sub.vv  $53, $53, $53, 1")
+    a(f"add.vv  $53, $53, $52, 1")
+    a(f"sub.vv  $53, $53, $53, 2")
+    a(f"add.vv  $53, $53, {vert_result}, 2")
     # $53 = max(v[i], v[i+1])
 
     if pool_size >= 3:
         a(f"shift.vi $52, {vert_result}, 2, 1  # shift right by 2")
         a(f"mgt.mvv 2, $53, $52, 1")
-        a(f"sub.vv  $54, $54, $54, 1, 0")
-        a(f"add.vv  $54, $54, $52, 1, 0")
-        a(f"sub.vv  $54, $54, $54, 2, 0")
-        a(f"add.vv  $54, $54, $53, 2, 0")
+        a(f"sub.vv  $54, $54, $54, 1")
+        a(f"add.vv  $54, $54, $52, 1")
+        a(f"sub.vv  $54, $54, $54, 2")
+        a(f"add.vv  $54, $54, $53, 2")
         hz_result = "$54"
     else:
         hz_result = "$53"

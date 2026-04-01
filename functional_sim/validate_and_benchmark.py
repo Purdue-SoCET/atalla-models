@@ -79,6 +79,11 @@ def run_on_emulator(in_text: str, work_dir: str, tag: str) -> Tuple[Memory, Dict
     sregs.write(2, stack_base)
     sregs.write(33, stack_base)
 
+    _orig_mread = mregs.read
+    def _m0_patched(idx):
+        return 0xFFFFFFFF if idx == 0 else _orig_mread(idx)
+    mregs.read = _m0_patched
+
     prefix = f"{work_dir}/{tag}"
     run_emulator(
         mem, sregs, mregs, vregs, SP0, SP1, EU, 0, 4,
@@ -155,12 +160,9 @@ class KernelResult:
     def summary_line(self) -> str:
         status = self.status
         if status == "PASS":
-            return (f"  {self.name:15s} PASS  cos={self.cosine_sim:.4f}  "
-                    f"max_err={self.max_error:.6f}  pkts={self.packets}  "
-                    f"instrs={self.instructions}  slot_util={self.slot_utilization:.3f}")
+            return f"  {self.name:15s} PASS  cos={self.cosine_sim:.4f}  max_err={self.max_error:.6f}"
         elif status == "FAIL":
-            return (f"  {self.name:15s} FAIL  cos={self.cosine_sim:.4f}  "
-                    f"max_err={self.max_error:.6f}  {self.error_msg}")
+            return f"  {self.name:15s} FAIL  cos={self.cosine_sim:.4f}  max_err={self.max_error:.6f}"
         else:
             return f"  {self.name:15s} ERROR {self.error_msg}"
 
@@ -426,6 +428,49 @@ def test_layernorm(work_dir: str) -> KernelResult:
     )
 
 
+def test_add(work_dir: str) -> KernelResult:
+    ROWS, COLS = 4, 32
+    total = ROWS * COLS
+    A_GMEM, B_GMEM, C_GMEM = 0x1000, 0x2000, 0x3000
+
+    rng = np.random.default_rng(42)
+    A = rng.standard_normal(total).astype(np.float32)
+    B = rng.standard_normal(total).astype(np.float32)
+    A_bf16 = to_bf16_array(A)
+    B_bf16 = to_bf16_array(B)
+    expected = A_bf16 + B_bf16
+
+    img = DRAMWriter()
+    img.u32(CFG_BASE + 0, A_GMEM)
+    img.u32(CFG_BASE + 4, B_GMEM)
+    img.u32(CFG_BASE + 8, C_GMEM)
+    for i in range(total):
+        img.bf16(A_GMEM + i * 2, float(A[i]))
+        img.bf16(B_GMEM + i * 2, float(B[i]))
+    for i in range(total):
+        img.bf16(C_GMEM + i * 2, 0.0)
+    data_text = img.render_data_mem(include_zeros=True)
+
+    c_path = KERNELS_DIR / "add.c"
+    s_path = Path(work_dir) / "add.s"
+    asm_text = compile_c_to_asm(c_path, s_path)
+    instr_text, n_pkts, n_instrs = asm_to_in_text(asm_text)
+
+    final = render_testfile(instr_text, data_text)
+    mem, metrics = run_on_emulator(final, work_dir, "add")
+    actual = read_bf16_from_memory(mem, C_GMEM, total)
+
+    cos, maxe, meane = compare(actual, expected)
+    slot_util = n_instrs / (n_pkts * 4) if n_pkts > 0 else 0
+    status = "PASS" if cos > 0.99 else "FAIL"
+    return KernelResult(
+        name="add", status=status, cosine_sim=cos, max_error=maxe, mean_error=meane,
+        packets=n_pkts, instructions=n_instrs, slot_utilization=slot_util,
+        emulator_packets=int(metrics.get("packets", 0)),
+        emulator_instructions=int(metrics.get("instructions", 0)),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
@@ -436,6 +481,7 @@ KERNEL_TESTS = {
     "maxpool": test_maxpool,
     "gemm_tiled": test_gemm_tiled,
     "layernorm": test_layernorm,
+    "add": test_add,
 }
 
 

@@ -100,18 +100,16 @@ def encode_instruction(instr_dict):
         pass
         
     elif instr_type == "VV":
-        # VV-Type: vd 7-14, vs1 15-22, vs2 23-30, mask 31-34, sac 35-39
+        # VV-Type: vd 7-14, vs1 15-22, vs2 23-30, mask 31-34
         vd = instr_dict.get('vd', 0)
         vs1 = instr_dict.get('vs1', 0)
         vs2 = instr_dict.get('vs2', 0)
         mask = instr_dict.get('mask', 0)
-        sac = instr_dict.get('sac', 0)
         
         instruction |= (vd & 0xFF) << 7
         instruction |= (vs1 & 0xFF) << 15
         instruction |= (vs2 & 0xFF) << 23
         instruction |= (mask & 0xF) << 31
-        instruction |= (sac & 0x1F) << 35
         
     elif instr_type == "VS":
         # VS-Type: vd 7-14, vs1 15-22, rs1 23-30, mask 31-34
@@ -393,12 +391,11 @@ def asm_to_instr_dict(mnemonic: str, ops: List[str]) -> Dict:
         return d
 
     if instr_type == "VV":
-        # add.vv vd, vs1, vs2, mask, sac
+        # add.vv vd, vs1, vs2, mask
         d["vd"] = parse_reg(ops[0])
         d["vs1"] = parse_reg(ops[1])
         d["vs2"] = parse_reg(ops[2])
         d["mask"] = parse_int(ops[3])
-        d["sac"] = parse_int(ops[4])
         return d
 
     if instr_type == "VS":
@@ -709,7 +706,7 @@ if __name__ == "__main__":
     muli.vi $1, $1, -1.0, 1         # -x
     expi.vi $1, $1, 0, 1            # e^(-x)
     addi.vi $1, $1, 1.0, 1          # 1 + e^(-x)
-    div.vv  $1, $2, $1, 1, 0        # 1 / (1 + e^(-x)) 
+    div.vv  $1, $2, $1, 1        # 1 / (1 + e^(-x)) 
     vreg.st $1, $9, 8, 4, 0, 1, 0   # store back to scpad
 
     # Row 1
@@ -717,7 +714,7 @@ if __name__ == "__main__":
     muli.vi $1, $1, -1.0, 1
     expi.vi $1, $1, 0, 1
     addi.vi $1, $1, 1.0, 1
-    div.vv  $1, $2, $1, 1, 0
+    div.vv  $1, $2, $1, 1
     vreg.st $1, $9, 8, 4, 0, 1, 1
 
     # Row 2
@@ -725,7 +722,7 @@ if __name__ == "__main__":
     muli.vi $1, $1, -1.0, 1
     expi.vi $1, $1, 0, 1
     addi.vi $1, $1, 1.0, 1
-    div.vv  $1, $2, $1, 1, 0
+    div.vv  $1, $2, $1, 1
     vreg.st $1, $9, 8, 4, 0, 1, 2
 
     # Row 3
@@ -733,7 +730,7 @@ if __name__ == "__main__":
     muli.vi $1, $1, -1.0, 1
     expi.vi $1, $1, 0, 1
     addi.vi $1, $1, 1.0, 1
-    div.vv  $1, $2, $1, 1, 0
+    div.vv  $1, $2, $1, 1
     vreg.st $1, $9, 8, 4, 0, 1, 3
 
     scpad.st $9, $8, 8, 4, 0
@@ -764,7 +761,7 @@ if __name__ == "__main__":
     muli.vi $1, $1, -1.0, 1
     expi.vi $1, $1, 0, 1
     addi.vi $1, $1, 1.0, 1
-    div.vv  $1, $2, $1, 1, 0
+    div.vv  $1, $2, $1, 1
     vreg.st $1, $9, 8, 4, 0, 1, 0
 
     # Sigmoid on v4 while loading row2 into v1
@@ -772,7 +769,7 @@ if __name__ == "__main__":
     muli.vi $4, $4, -1.0, 1
     expi.vi $4, $4, 0, 1
     addi.vi $4, $4, 1.0, 1
-    div.vv  $4, $2, $4, 1, 0
+    div.vv  $4, $2, $4, 1
     vreg.st $4, $9, 8, 4, 0, 1, 1
 
     # Sigmoid on v1 while loading row3 into v4
@@ -780,14 +777,14 @@ if __name__ == "__main__":
     muli.vi $1, $1, -1.0, 1
     expi.vi $1, $1, 0, 1
     addi.vi $1, $1, 1.0, 1
-    div.vv  $1, $2, $1, 1, 0
+    div.vv  $1, $2, $1, 1
     vreg.st $1, $9, 8, 4, 0, 1, 2
 
     # sigmoid on v4
     muli.vi $4, $4, -1.0, 1
     expi.vi $4, $4, 0, 1
     addi.vi $4, $4, 1.0, 1
-    div.vv  $4, $2, $4, 1, 0
+    div.vv  $4, $2, $4, 1
     vreg.st $4, $9, 8, 4, 0, 1, 3
 
     # store back into dram
