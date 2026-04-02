@@ -1,0 +1,13 @@
+flops_total: 266
+flops_scalar: 42
+flops_vector: 224
+flops_matmul: 0
+bytes_loaded: 128
+cycles: 234
+packets: 234
+instructions: 176
+branches: 14
+mem_ops: 2
+gemm_ops: 0
+sdma_ops: 2
+arithmetic_intensity: 2.078125

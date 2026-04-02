@@ -14,13 +14,15 @@ Usage:
 """
 from __future__ import annotations
 
-import os
-import sys
-import struct
-import time
 import argparse
+import json
+import os
+import shutil
+import struct
+import sys
+import time
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, FrozenSet, Optional, Set
 
 import numpy as np
 import torch
@@ -48,6 +50,11 @@ from codegen.c_emitter import (
     emit_node, render_in_file, compile_and_assemble, LayerEmission, _to_bf16_array,
 )
 from codegen.dram_builder import extract_input_data
+
+
+DEFAULT_KERNEL_BUNDLE_OPS: FrozenSet[str] = frozenset(
+    {"conv", "relu", "maxpool", "matmul", "add"}
+)
 
 
 def bf16_to_f32(bits: int) -> float:
@@ -149,11 +156,27 @@ def run_schedule(gm, example_input: torch.Tensor, out_dir: str,
 
 # ── Validate mode ────────────────────────────────────────────────────────────
 
-def run_validate(gm, model: nn.Module, example_input: torch.Tensor,
-                 out_dir: str, verbose: bool = True) -> Dict:
-    """Per-node compile → emulate → compare vs PyTorch golden."""
+def run_validate(
+    gm,
+    model: nn.Module,
+    example_input: torch.Tensor,
+    out_dir: str,
+    verbose: bool = True,
+    *,
+    kernel_bundle_dir: Optional[str] = None,
+    kernel_bundle_ops: Optional[FrozenSet[str]] = None,
+) -> Dict:
+    """Per-node compile → emulate → compare vs PyTorch golden.
+
+    If ``kernel_bundle_dir`` is set, the first emulated node for each op in
+    ``kernel_bundle_ops`` (default: conv, relu, maxpool, matmul, add) copies
+    ``.c`` / ``.s`` / ``.in``, and ``verify.json`` (cosine / metrics)
+    into a subdirectory.
+    """
     t0 = time.time()
     os.makedirs(out_dir, exist_ok=True)
+    bundle_ops = kernel_bundle_ops or DEFAULT_KERNEL_BUNDLE_OPS
+    bundle_exported: Optional[Set[str]] = set() if kernel_bundle_dir else None
 
     ref_activations = extract_input_data(gm, example_input.bfloat16())
     activation_cache: Dict[str, np.ndarray] = {}
@@ -305,6 +328,21 @@ def run_validate(gm, model: nn.Module, example_input: torch.Tensor,
                 ref.flatten()[:result.size] - result.flatten()[:result.size])))
         kernel_metrics.append(km)
 
+        if (
+            bundle_exported is not None
+            and atalla_op in bundle_ops
+            and atalla_op not in bundle_exported
+        ):
+            bundle_exported.add(atalla_op)
+            bdir = Path(kernel_bundle_dir) / f"{atalla_op}_{node.name}"
+            bdir.mkdir(parents=True, exist_ok=True)
+            tag = node.name
+            for ext in (".c", ".s", ".in"):
+                src = Path(out_dir) / f"{tag}{ext}"
+                if src.is_file():
+                    shutil.copy(src, bdir / src.name)
+            (bdir / "verify.json").write_text(json.dumps(km, indent=2) + "\n")
+
         if verbose:
             cos = km.get("cos_sim", "?")
             print(f"done (cos={cos:.4f})" if isinstance(cos, float) else "done")
@@ -385,6 +423,15 @@ def main():
                         choices=["schedule", "validate", "both"])
     parser.add_argument("--scale", type=float, default=0.01)
     parser.add_argument("--out-dir", default="out/graph")
+    parser.add_argument(
+        "--export-kernel-bundle",
+        metavar="DIR",
+        default=None,
+        help=(
+            "During validate, copy first conv/relu/maxpool/matmul/add artifacts "
+            "(.c, .s, .in, verify.json) into DIR/<op>_<node>/"
+        ),
+    )
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
 
@@ -397,7 +444,14 @@ def main():
     gm = build_graph(model, example_input, verbose=verbose)
 
     if args.mode in ("validate", "both"):
-        run_validate(gm, model, example_input, args.out_dir, verbose=verbose)
+        run_validate(
+            gm,
+            model,
+            example_input,
+            args.out_dir,
+            verbose=verbose,
+            kernel_bundle_dir=args.export_kernel_bundle,
+        )
 
     if args.mode in ("schedule", "both"):
         import copy

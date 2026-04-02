@@ -1,0 +1,16 @@
+{
+  "name": "pool",
+  "op": "maxpool",
+  "backend": "emulator",
+  "shape": [
+    1,
+    1,
+    16,
+    16
+  ],
+  "elems": 256,
+  "packets": 1433,
+  "instructions": 1055,
+  "cos_sim": 0.5537810325622559,
+  "max_diff": 1.46875
+}
