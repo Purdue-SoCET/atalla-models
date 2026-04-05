@@ -4,12 +4,12 @@ End-to-end pipeline: PyTorch model → AtallaC → Atalla assembly → functiona
 
 ## Upstream Sources
 
-This repo vendors and extends three upstream components:
+This repo pulls two upstream components as **Git submodules** and vendors the graph frontend in-tree:
 
-| Component | Upstream | Branch |
-|-----------|----------|--------|
-| `aihw-ppci-compiler/` | [Purdue-SoCET/aihw-ppci-compiler](https://github.com/Purdue-SoCET/aihw-ppci-compiler/tree/atalla-arch) | `atalla-arch` |
-| `functional_sim/` | [Purdue-SoCET/atalla](https://github.com/Purdue-SoCET/atalla/tree/functional_sim/functional_sim) | `functional_sim` |
+| Path | Upstream | Branch |
+|------|----------|--------|
+| `aihw-ppci-compiler/` | [Purdue-SoCET/aihw-ppci-compiler](https://github.com/Purdue-SoCET/aihw-ppci-compiler) | `atalla-models` |
+| `functional_sim/` | [Purdue-SoCET/atalla-functional-sim](https://github.com/Purdue-SoCET/atalla-functional-sim) | `main` |
 | `atalla-graph/` | [vihaanrc/atalla-graph](https://github.com/vihaanrc/atalla-graph) | `temp` (now `main`) |
 
 Our changes are documented in `pipeline_reference.md` §9.
@@ -60,14 +60,13 @@ atalla-models/
         model/                         basic.py, alexnet.py (Vihaan's), alexnet_small.py (added)
         scripts/                       generate_schedule.py (Vihaan's)
         run_graph.py                   unified entry point: validate or schedule mode (--validate, --schedule)
-    functional_sim/                    Emulator + encoding toolchain
+    functional_sim/                    Submodule: emulator + encoding toolchain
         src/                           functional_sim.py
         build.py                       DRAMWriter, render_testfile, assembler
         build_compiler.py              VLIW scheduler + encoder
-        _asm_encoding.py               Instruction encoding library
         build_*.py                     Standalone kernel builders (team reference)
         run.py                         Standalone emulator entry
-    aihw-ppci-compiler/                Vendored compiler
+    aihw-ppci-compiler/                Compiler submodule
         ppci/arch/atalla/              Backend
         ppci/lang/atalla_c/            AtallaC frontend
         atalla_tests/kernels/          Reference .c kernels
@@ -76,6 +75,16 @@ atalla-models/
 ```
 
 ## Usage
+
+Clone with submodules (required for the compiler and emulator):
+
+```bash
+git clone --recurse-submodules <URL>
+# or, if already cloned:
+git submodule update --init --recursive
+```
+
+Then:
 
 ```bash
 cd atalla-graph

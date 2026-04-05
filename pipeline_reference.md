@@ -290,8 +290,8 @@ The functional simulator is not cycle-accurate. Primary efficiency metric is **V
 
 | Component | Upstream | Branch |
 |-----------|----------|--------|
-| `aihw-ppci-compiler/` | [Purdue-SoCET/aihw-ppci-compiler](https://github.com/Purdue-SoCET/aihw-ppci-compiler/tree/atalla-arch) | `atalla-arch` |
-| `functional_sim/` | [Purdue-SoCET/atalla](https://github.com/Purdue-SoCET/atalla/tree/functional_sim/functional_sim) | `functional_sim` |
+| `aihw-ppci-compiler/` | [Purdue-SoCET/aihw-ppci-compiler](https://github.com/Purdue-SoCET/aihw-ppci-compiler) | `atalla-models` |
+| `functional_sim/` | [Purdue-SoCET/atalla-functional-sim](https://github.com/Purdue-SoCET/atalla-functional-sim) | `main` |
 | `atalla-graph/` | [vihaanrc/atalla-graph](https://github.com/vihaanrc/atalla-graph) | `temp`/`main` |
 
 ### Compiler (`aihw-ppci-compiler`)
