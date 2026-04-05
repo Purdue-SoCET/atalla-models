@@ -26,7 +26,7 @@ def relu_c(total: int, width: int) -> str:
         "    int ncols = 1;\n"
         f"{sdma_s}"
         "\n"
-        f"    vec zero_vec = vector_load(0, ncols, {w_m1}, 0);\n"
+        f"    vec zero_vec = vector_load(sp, 0, {w_m1}, 0);\n"
         '    zero_vec = vec_op_masked("*", zero_vec, 0.0, all_mask);\n'
         "\n"
         "    int tile = 0;\n"
@@ -35,12 +35,12 @@ def relu_c(total: int, width: int) -> str:
         "\n"
         "        int row = 0;\n"
         f"        while (row < {sp_rows}) {{\n"
-        f"            vec v = vector_load(row, ncols, {w_m1}, 0);\n"
+        f"            vec v = vector_load(sp, row, {w_m1}, 0);\n"
         "\n"
         '            int m_neg = make_mask("<", v, zero_vec, all_mask);\n'
         '            vec result = vec_op_masked("*", v, 0.0, m_neg);\n'
         "\n"
-        f"            vector_store(result, row, ncols, {w_m1}, 0);\n"
+        f"            vector_store(result, sp, row, {w_m1}, 0);\n"
         "            row = row + 1;\n"
         "        }\n"
         "\n"

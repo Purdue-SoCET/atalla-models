@@ -36,7 +36,7 @@ if str(_FUNC_SIM) not in sys.path:
 
 from src.functional_sim import run as run_emulator
 from src.misc.memory import Memory
-from src.components.scalar_register_file import ScalarRegisterFile
+from src.components.scalar_register_file import ScalarRegisterFile, mask_register_file
 from src.components.vector_register_file import VectorRegisterFile
 from src.components.execute import ExecuteUnit
 from src.components.scpad import Scratchpad
@@ -64,7 +64,7 @@ def bf16_to_f32(bits: int) -> float:
 def _run_emulator(in_file: str, out_dir: str, tag: str):
     mem = Memory(in_file)
     sregs = ScalarRegisterFile()
-    mregs = ScalarRegisterFile(num_regs=16)
+    mregs = mask_register_file()
     vregs = VectorRegisterFile()
     SP0 = Scratchpad(slots_per_bank=32)
     SP1 = Scratchpad(slots_per_bank=32)
@@ -73,7 +73,8 @@ def _run_emulator(in_file: str, out_dir: str, tag: str):
     max_data_addr = max(mem.data_mem.keys()) if mem.data_mem else 0
     stack_base = ((max_data_addr + 0x1000) & ~0xFFF) + 0x1000
     sregs.write(2, stack_base)
-    sregs.write(33, stack_base)
+    # x33-64/-128 vector spills must not alias the frame (sdma_ctl_* live near x8+72).
+    sregs.write(33, stack_base + 0x1000)
     os.makedirs(out_dir, exist_ok=True)
     prefix = f"{out_dir}/{tag}"
 
@@ -104,6 +105,10 @@ def _cos_sim(a: np.ndarray, b: np.ndarray) -> float:
     af, bf = af[:n], bf[:n]
     d = np.dot(af, bf)
     return float(d / (np.linalg.norm(af) * np.linalg.norm(bf) + 1e-12))
+
+
+def _nz_count(a: np.ndarray, eps: float = 1e-8) -> int:
+    return int(np.count_nonzero(np.abs(a) > eps))
 
 
 # ── Front-end: shared across modes ──────────────────────────────────────────
@@ -202,7 +207,9 @@ def run_validate(
         stats["total"] += 1
 
         if node.op == "placeholder":
-            activation_cache[node.name] = example_input.detach().float().cpu().numpy()
+            activation_cache[node.name] = (
+                example_input.detach().bfloat16().float().cpu().numpy()
+            )
             if verbose:
                 print(f"  [{node.name}] placeholder")
             continue
@@ -212,7 +219,7 @@ def run_validate(
             for part in node.target.split("."):
                 attr = getattr(attr, part)
             activation_cache[node.name] = (
-                attr.detach().float().cpu().numpy()
+                attr.detach().bfloat16().float().cpu().numpy()
                 if isinstance(attr, torch.Tensor) else np.array(attr)
             )
             if verbose:
@@ -298,6 +305,11 @@ def run_validate(
             except ValueError:
                 pass
 
+        if emission.conv_post is not None:
+            cp = emission.conv_post
+            raw = result.reshape(cp["Ho"], cp["Wo"], cp["C"])
+            result = raw.transpose(2, 0, 1).reshape(cp["final_shape"])
+
         if emission.maxpool_post is not None:
             pp = emission.maxpool_post
             raw = result.reshape(pp["C"], pp["H_out"], pp["W"])
@@ -326,6 +338,10 @@ def run_validate(
             km["cos_sim"] = _cos_sim(ref, result)
             km["max_diff"] = float(np.max(np.abs(
                 ref.flatten()[:result.size] - result.flatten()[:result.size])))
+            km["emu_norm"] = float(np.linalg.norm(result.flatten()))
+            km["ref_norm"] = float(np.linalg.norm(ref.flatten()))
+            km["emu_nz"] = _nz_count(result)
+            km["ref_nz"] = _nz_count(ref)
         kernel_metrics.append(km)
 
         if (
@@ -344,8 +360,17 @@ def run_validate(
             (bdir / "verify.json").write_text(json.dumps(km, indent=2) + "\n")
 
         if verbose:
-            cos = km.get("cos_sim", "?")
-            print(f"done (cos={cos:.4f})" if isinstance(cos, float) else "done")
+            cos = km.get("cos_sim")
+            if isinstance(cos, float):
+                extra = (
+                    f", max_diff={km['max_diff']:.6f}, "
+                    f"emu_norm={km['emu_norm']:.6f}, ref_norm={km['ref_norm']:.6f}, "
+                    f"emu_nz={km['emu_nz']}, ref_nz={km['ref_nz']}"
+                    if "max_diff" in km else ""
+                )
+                print(f"done (cos={cos:.6f}{extra})")
+            else:
+                print("done")
 
     # Final output comparison
     output_node = next((n for n in gm.graph.nodes if n.op == "output"), None)
@@ -381,8 +406,6 @@ def run_validate(
             print(f"  Mean diff:  {mean_d:.6f}")
             if cos > 0.95:
                 print("  PASS")
-            else:
-                print("  WARN: divergence (expected with BF16)")
 
     return {"stats": stats, "elapsed_s": elapsed, "kernel_metrics": kernel_metrics,
             "emulator_output": emu_out, "reference_output": ref_out}

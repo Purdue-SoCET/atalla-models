@@ -29,7 +29,7 @@ def softmax_c(length: int) -> str:
         "\n"
         "    int row = 0;\n"
         f"    while (row < {rows}) {{\n"
-        f"        vec v = vector_load(row, ncols, {w_m1}, 0);\n"
+        f"        vec v = vector_load(sp, row, {w_m1}, 0);\n"
         "\n"
         '        vec vmax = vec_op_masked("RMAX", v, 0.0, mask_val);\n'
         '        vec shifted = vec_op_masked("-", v, vmax, mask_val);\n'
@@ -40,7 +40,7 @@ def softmax_c(length: int) -> str:
         "        float inv_sum = 1.0 / sum_f;\n"
         '        vec result = vec_op_masked("*", exp_v, inv_sum, mask_val);\n'
         "\n"
-        f"        vector_store(result, row, ncols, {w_m1}, 0);\n"
+        f"        vector_store(result, sp, row, {w_m1}, 0);\n"
         "        row = row + 1;\n"
         "    }\n"
         "\n"

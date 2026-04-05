@@ -38,10 +38,10 @@ def add_c(total: int, width: int = 32) -> str:
         "\n"
         "        int row = 0;\n"
         f"        while (row < {sp_rows}) {{\n"
-        f"            vec a = vector_load(row, ncols, {w_m1}, 0);\n"
-        f"            vec b = vector_load(row, ncols, {w_m1}, 1);\n"
+        f"            vec a = vector_load(sp, row, {w_m1}, 0);\n"
+        f"            vec b = vector_load(sp, row, {w_m1}, 1);\n"
         '            vec c = vec_op_masked("+", a, b, all_mask);\n'
-        f"            vector_store(c, row, ncols, {w_m1}, 0);\n"
+        f"            vector_store(c, sp, row, {w_m1}, 0);\n"
         "            row = row + 1;\n"
         "        }\n"
         "\n"

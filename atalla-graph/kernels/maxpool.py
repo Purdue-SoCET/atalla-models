@@ -18,12 +18,12 @@ def maxpool_c(H: int, W: int, C: int, pool: int, stride: int) -> str:
     out_ch_bytes = H_out * W * 2
 
     vert = (
-        f"            vec best = vector_load(in_row, ncols, {w_m1}, 0);\n"
+        f"            vec best = vector_load(sp, in_row, {w_m1}, 0);\n"
     )
     for p in range(1, pool):
         vert += (
             f"            int r{p} = in_row + {p};\n"
-            f"            vec v{p} = vector_load(r{p}, ncols, {w_m1}, 0);\n"
+            f"            vec v{p} = vector_load(sp, r{p}, {w_m1}, 0);\n"
             f'            int gt{p} = make_mask(">", v{p}, best, all_mask);\n'
             f'            best = vec_op_masked("+", v{p}, zero_vec, gt{p});\n'
         )
@@ -42,7 +42,7 @@ def maxpool_c(H: int, W: int, C: int, pool: int, stride: int) -> str:
         f"{sdma_in}"
         f"{sdma_out}"
         "\n"
-        f"    vec zero_vec = vector_load(0, ncols, {w_m1}, 0);\n"
+        f"    vec zero_vec = vector_load(sp, 0, {w_m1}, 0);\n"
         '    zero_vec = vec_op_masked("*", zero_vec, 0.0, all_mask);\n'
         "\n"
         "    int ch = 0;\n"
@@ -55,7 +55,7 @@ def maxpool_c(H: int, W: int, C: int, pool: int, stride: int) -> str:
         f"        while (oh < {H_out}) {{\n"
         f"            int in_row = oh * {stride};\n"
         f"{vert}"
-        f"            vector_store(best, oh, ncols, {w_m1}, 0);\n"
+        f"            vector_store(best, sp, oh, {w_m1}, 0);\n"
         "            oh = oh + 1;\n"
         "        }\n"
         "\n"

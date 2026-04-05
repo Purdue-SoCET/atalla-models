@@ -33,7 +33,7 @@ sys.path.insert(0, str(_FUNC_SIM))
 
 from src.functional_sim import run as run_emulator
 from src.misc.memory import Memory
-from src.components.scalar_register_file import ScalarRegisterFile
+from src.components.scalar_register_file import ScalarRegisterFile, mask_register_file
 from src.components.vector_register_file import VectorRegisterFile
 from src.components.execute import ExecuteUnit
 from src.components.scpad import Scratchpad
@@ -55,7 +55,7 @@ def run_on_emulator(in_file: str, out_dir: str, tag: str):
     """Run the emulator and return (Memory, ExecuteUnit)."""
     mem = Memory(in_file)
     sregs = ScalarRegisterFile()
-    mregs = ScalarRegisterFile(num_regs=16)
+    mregs = mask_register_file()
     vregs = VectorRegisterFile()
     SP0 = Scratchpad(slots_per_bank=32)
     SP1 = Scratchpad(slots_per_bank=32)

@@ -54,7 +54,8 @@ def _get_module(gm: GraphModule, target: str):
 
 class LayerEmission:
     __slots__ = ("c_source", "instr_text", "dram", "output_addr", "output_shape",
-                 "output_elements", "skip_emulator", "numpy_result", "maxpool_post")
+                 "output_elements", "skip_emulator", "numpy_result", "maxpool_post",
+                 "conv_post")
 
     def __init__(self):
         self.c_source: str = ""
@@ -66,6 +67,7 @@ class LayerEmission:
         self.skip_emulator: bool = False
         self.numpy_result: Optional[np.ndarray] = None
         self.maxpool_post: Optional[dict] = None
+        self.conv_post: Optional[dict] = None
 
 
 def _align_data(nbytes: int) -> int:
@@ -108,11 +110,14 @@ def emit_conv(node: Node, gm: GraphModule,
               input_data: np.ndarray, tc: TileConfig) -> LayerEmission:
     p = tc.params
     M, N, K = p["M"], p["N"], p["K"]
+    R, S, C_in = p["R"], p["S"], p["C_in"]
 
     mod = _get_module(gm, node.target) if node.op == "call_module" else None
+    bias_np: Optional[np.ndarray] = None
     if mod is not None:
         weight_np = _to_bf16_array(mod.weight)
-        weight_flat = weight_np.reshape(N, K).T
+        if getattr(mod, "bias", None) is not None:
+            bias_np = _to_bf16_array(mod.bias).reshape(-1)
     else:
         weight_node = node.args[1]
         weight_tensor = None
@@ -124,9 +129,15 @@ def emit_conv(node: Node, gm: GraphModule,
                 attr = getattr(attr, part)
             weight_tensor = attr
         weight_np = _to_bf16_array(weight_tensor)
-        weight_flat = weight_np.reshape(N, K).T
+        if len(node.args) >= 3 and isinstance(node.args[2], Node):
+            bias_tensor = node.args[2].meta.get("val") if hasattr(node.args[2], "meta") else None
+            if bias_tensor is not None:
+                bias_np = _to_bf16_array(bias_tensor).reshape(-1)
+    # PyTorch conv weights are OIHW; im2col emits each patch in (r, s, c) order,
+    # so flatten weights in (r, s, c, out) to keep GEMM K aligned.
+    weight_flat = weight_np.reshape(N, C_in, R, S).transpose(2, 3, 1, 0).reshape(K, N)
 
-    H, W, C_in = p["H"], p["W"], p["C_in"]
+    H, W = p["H"], p["W"]
     total_expected = H * W * C_in
     flat = input_data.flatten()
     if len(flat) < total_expected:
@@ -151,7 +162,11 @@ def emit_conv(node: Node, gm: GraphModule,
     _write_gemm_params(img, A_GMEM, W_GMEM, C_GMEM, M, N, K)
     _write_matrix(img, A_GMEM, A_mat, M, K)
     _write_matrix(img, W_GMEM, weight_flat, K, N)
-    _write_zeros(img, C_GMEM, M * N)
+    if bias_np is not None and bias_np.size == N:
+        c_init = np.tile(bias_np.reshape(1, N), (M, 1))
+        _write_matrix(img, C_GMEM, c_init, M, N)
+    else:
+        _write_zeros(img, C_GMEM, M * N)
 
     out_shape = get_node_shape(node)
     em = LayerEmission()
@@ -160,6 +175,12 @@ def emit_conv(node: Node, gm: GraphModule,
     em.output_addr = C_GMEM
     em.output_shape = out_shape if out_shape else (1, N, p["Ho"], p["Wo"])
     em.output_elements = M * N
+    em.conv_post = {
+        "Ho": p["Ho"],
+        "Wo": p["Wo"],
+        "C": N,
+        "final_shape": em.output_shape,
+    }
     return em
 
 
@@ -270,6 +291,8 @@ def emit_matmul(node: Node, gm: GraphModule,
     if isinstance(rhs_node, Node) and rhs_node.name in activation_cache:
         W_mat = activation_cache[rhs_node.name]
     else:
+        # Direct matmul(x, W): W is (K, N) in memory (e.g. ParameterList).  Lowered
+        # Linear uses matmul(x, W.T) so rhs is a transpose node — use activation_cache.
         attr = gm
         for part in rhs_node.target.split("."):
             attr = getattr(attr, part)
