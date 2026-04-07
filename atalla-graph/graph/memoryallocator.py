@@ -1,6 +1,7 @@
 import math
 import operator
-from typing import Dict, Optional, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -17,6 +18,51 @@ VIEW_METHODS = {"reshape", "flatten", "permute", "transpose"}
 
 def align(value: int, multiple: int) -> int:
     return int(math.ceil(value / multiple) * multiple)
+
+
+@dataclass
+class _Block:
+    start: int # byte address
+    size: int # in bytes
+
+
+def _insert_free_block(free_blocks: List[_Block], block: _Block) -> None:
+    """Insert + merge adjacent free blocks."""
+    free_blocks.append(block)
+    free_blocks.sort(key=lambda b: b.start)
+    merged: List[_Block] = []
+    for cur in free_blocks:
+        if not merged:
+            merged.append(cur)
+            continue
+        prev = merged[-1]
+        if prev.start + prev.size == cur.start:
+            prev.size += cur.size
+        else:
+            merged.append(cur)
+    free_blocks[:] = merged
+
+
+def _alloc_from_free(free_blocks: List[_Block], size: int) -> Optional[int]:
+    """Best-fit free-list allocation."""
+    best_idx = -1
+    best_size = None
+    for idx, blk in enumerate(free_blocks):
+        if blk.size < size:
+            continue
+        if best_size is None or blk.size < best_size:
+            best_idx = idx
+            best_size = blk.size
+    if best_idx < 0:
+        return None
+    blk = free_blocks[best_idx]
+    start = blk.start
+    if blk.size == size:
+        free_blocks.pop(best_idx)
+    else:
+        blk.start += size
+        blk.size -= size
+    return start
 
 
 def _view_source(node: Node) -> Optional[Node]:
@@ -136,28 +182,95 @@ def assign_address(node: Node, next_addr: int) -> Tuple[int, int, int]:
 
 def allocate_memory(gm: GraphModule, bin_path: str, placeholder_data: Optional[Dict[str, torch.Tensor]] = None) -> GraphModule:
     placeholder_data = placeholder_data or {}
+
+    nodes = list(gm.graph.nodes)
+    node_index = {node: idx for idx, node in enumerate(nodes)}
+
+    #view ops (e.g: transposes) use their source allocation
+    owner_by_node: Dict[Node, Node] = {}
+    for node in nodes:
+        view_src = _view_source(node)
+        if view_src is not None and view_src in owner_by_node:
+            owner_by_node[node] = owner_by_node[view_src]
+        else:
+            owner_by_node[node] = node
+
+    # node index where value is used last
+    last_use: Dict[Node, int] = {}
+    for node in nodes:
+        owner = owner_by_node[node]
+        last_use.setdefault(owner, node_index[node])
+        for user in node.users.keys():
+            last_use[owner] = max(last_use[owner], node_index[user])
+
+    # Allocate with liveness-based reuse
+    free_blocks: List[_Block] = []
     next_addr = 0
-    written = 0
+    owner_addr: Dict[Node, int] = {}
+    owner_size: Dict[Node, int] = {}
+    peak_end = 0
+
+    for idx, node in enumerate(nodes):
+        if node.op == "output":
+            continue
+
+        # Reclaim blocks
+        for owner, dead_idx in last_use.items():
+            if dead_idx == idx - 1 and owner in owner_addr:
+                _insert_free_block(
+                    free_blocks,
+                    _Block(start=owner_addr[owner], size=owner_size[owner]),
+                )
+
+        tensor_meta = node.meta.get("tensor_meta")
+        if tensor_meta is None:
+            continue
+        if tensor_meta.dtype != torch.bfloat16:
+            # Treat non-bf16 tensors (e.g., attention bias indices) as compile-time constants.
+            continue
+
+        owner = owner_by_node[node]
+        if owner in owner_addr:
+            node.meta["dram_addr"] = f"0x{owner_addr[owner]:08x}"
+            node.meta["bytes"] = owner_size[owner]
+            continue
+
+        size = align(tensor_nbytes(owner), TILE_BYTES)
+        preinit = tensor_for_node(owner, gm, placeholder_data) is not None
+
+        # Preinitialized tensors = input arguments/get_attr
+        addr = None
+        if not preinit:
+            addr = _alloc_from_free(free_blocks, size)
+        if addr is None:
+            addr = align(next_addr, TILE_BYTES)
+            next_addr = addr + size
+
+        owner_addr[owner] = addr
+        owner_size[owner] = size
+        peak_end = max(peak_end, addr + size)
+
+        node.meta["dram_addr"] = f"0x{addr:08x}"
+        node.meta["bytes"] = size
+
+    # Build DRAM image
+    dram_image = bytearray(peak_end)
+    for node in nodes:
+        if node.op == "output":
+            continue
+        tensor_meta = node.meta.get("tensor_meta")
+        if tensor_meta is None or tensor_meta.dtype != torch.bfloat16:
+            continue
+        tensor_value = tensor_for_node(node, gm, placeholder_data)
+        if tensor_value is None:
+            continue
+        addr = int(str(node.meta["dram_addr"]), 16)
+        size = int(node.meta["bytes"])
+        payload = tensor_bytes(tensor_value, size)
+        dram_image[addr:addr + size] = payload
 
     with open(bin_path, "wb") as dram_file:
-        for node in gm.graph.nodes:
-            if node.op == "output":
-                continue
-            tensor_meta = node.meta.get("tensor_meta")
-            if tensor_meta is None:
-                continue
-            if tensor_meta.dtype != torch.bfloat16:
-                # Treat non-bf16 tensors (e.g., attention bias indices) as compile-time constants.
-                continue
-            view_src = _view_source(node)
-            if view_src is not None and "dram_addr" in view_src.meta:
-                node.meta["dram_addr"] = view_src.meta["dram_addr"]
-                node.meta["bytes"] = view_src.meta["bytes"]
-                continue
-            start, size, next_addr = assign_address(node, next_addr)
-            tensor_value = tensor_for_node(node, gm, placeholder_data)
-            payload = tensor_bytes(tensor_value, size) if tensor_value is not None else bytes(size)
-            written = _write_binary_payload(dram_file, written, start, payload)
+        dram_file.write(dram_image)
 
     gm.graph.lint()
     gm.recompile()
