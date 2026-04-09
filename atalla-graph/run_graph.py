@@ -12,6 +12,9 @@ Usage:
     python run_graph.py --model basic --mode both
     python run_graph.py --model alexnet_small --mode validate --scale 0.01
     python run_graph.py --model basic --mode validate --metrics-json poster_metrics.json
+    python run_graph.py --model alexnet_small --mode validate --validate-inputs oracle
+    python run_graph.py --model layernorm_smoke --mode validate --validate-inputs oracle
+    python run_graph.py --model vit_micro --mode validate --validate-inputs oracle
 """
 from __future__ import annotations
 
@@ -55,7 +58,12 @@ from codegen.dram_builder import extract_input_data
 
 
 DEFAULT_KERNEL_BUNDLE_OPS: FrozenSet[str] = frozenset(
-    {"conv", "relu", "maxpool", "matmul", "add"}
+    {"conv", "relu", "maxpool", "matmul", "add", "layernorm", "gelu"}
+)
+
+# Ops that run in the emulator; oracle mode refreshes activations from PyTorch refs before emit.
+_EMU_ATALLA_OPS: FrozenSet[str] = frozenset(
+    {"conv", "relu", "maxpool", "matmul", "add", "layernorm", "gelu"}
 )
 
 
@@ -94,10 +102,11 @@ def _run_emulator(in_file: str, out_dir: str, tag: str):
 
 
 def _read_bf16(mem: Memory, addr: int, count: int) -> np.ndarray:
+    """Read ``count`` BF16 values from byte ``addr`` (packed two per 32-bit word in .data)."""
     result = np.zeros(count, dtype=np.float32)
     for i in range(count):
-        word = mem.read_data(addr + i * 2)
-        result[i] = bf16_to_f32(word & 0xFFFF)
+        bits = mem.read_bf16_le(addr + i * 2)
+        result[i] = bf16_to_f32(bits)
     return result
 
 
@@ -113,6 +122,52 @@ def _nz_count(a: np.ndarray, eps: float = 1e-8) -> int:
     return int(np.count_nonzero(np.abs(a) > eps))
 
 
+def _apply_oracle_inputs(
+    activation_cache: Dict[str, np.ndarray],
+    ref_activations: Dict[str, np.ndarray],
+) -> None:
+    """Overwrite cache with PyTorch activations so each kernel sees matched inputs."""
+    for name, arr in ref_activations.items():
+        activation_cache[name] = np.asarray(arr, dtype=np.float32).copy()
+
+
+def _layer_compare_metrics(
+    ref: np.ndarray, result: np.ndarray, eps: float = 1e-12
+) -> Dict[str, float]:
+    """Compare ref vs result: cos (direction-only), abs errors, rel ℓ₂, rel max error."""
+    rf = np.asarray(ref, dtype=np.float64).flatten()
+    ef = np.asarray(result, dtype=np.float64).flatten()
+    n = min(len(rf), len(ef))
+    if n == 0:
+        return {
+            "cos_sim": 1.0,
+            "max_abs_error": 0.0,
+            "mean_abs_error": 0.0,
+            "rmse": 0.0,
+            "rel_l2_error": 0.0,
+            "ref_max_abs": 0.0,
+            "rel_max_abs_error": 0.0,
+        }
+    rf, ef = rf[:n], ef[:n]
+    diff = ef - rf
+    ref_norm = float(np.linalg.norm(rf))
+    err_norm = float(np.linalg.norm(diff))
+    ref_max_abs = float(np.max(np.abs(rf)))
+    max_abs = float(np.max(np.abs(diff)))
+    return {
+        "cos_sim": _cos_sim(
+            rf.astype(np.float32, copy=False),
+            ef.astype(np.float32, copy=False),
+        ),
+        "max_abs_error": max_abs,
+        "mean_abs_error": float(np.mean(np.abs(diff))),
+        "rmse": float(np.sqrt(np.mean(diff * diff))),
+        "rel_l2_error": float(err_norm / (ref_norm + eps)),
+        "ref_max_abs": ref_max_abs,
+        "rel_max_abs_error": float(max_abs / (ref_max_abs + eps)),
+    }
+
+
 def _aggregate_kernel_metrics(kernel_metrics: list) -> Dict:
     """Roll up poster / roofline metrics across all emulated layers."""
     emus = [k for k in kernel_metrics if k.get("backend") == "emulator"]
@@ -121,8 +176,18 @@ def _aggregate_kernel_metrics(kernel_metrics: list) -> Dict:
     tot_bl = sum(int(k.get("bytes_loaded", 0)) for k in emus)
     tot_bw = sum(int(k.get("bytes_written", 0)) for k in emus)
     tot_flops = sum(float(k.get("flops_total", 0.0)) for k in emus)
-    emu_pkts = sum(int(k.get("packets", 0)) for k in emus)
-    emu_ins = sum(int(k.get("instructions", 0)) for k in emus)
+    emu_pkts = sum(
+        int(
+            k.get("packets_executed", k.get("packets", 0)),
+        )
+        for k in emus
+    )
+    emu_ins = sum(
+        int(
+            k.get("instructions_executed", k.get("instructions", 0)),
+        )
+        for k in emus
+    )
     mem_b = tot_bl + tot_bw
     hist: Counter = Counter()
     for k in emus:
@@ -214,14 +279,29 @@ def run_validate(
     kernel_bundle_dir: Optional[str] = None,
     kernel_bundle_ops: Optional[FrozenSet[str]] = None,
     metrics_json_path: Optional[str] = None,
+    validate_inputs: str = "chained",
 ) -> Dict:
     """Per-node compile → emulate → compare vs PyTorch golden.
 
+    ``validate_inputs``:
+      * ``chained`` — each layer consumes the previous layer's emulator output
+        (end-to-end integration). Per-layer cos mixes accumulated drift with the
+        local kernel error; the meaningful end-to-end signal is the final output
+        metrics.
+      * ``oracle`` — before each emulated op, ``_apply_oracle_inputs`` copies
+        every tensor from ``ref_activations`` into the cache so that kernel
+        inputs match PyTorch. Per-layer output is still compared to ref for that
+        node; **final output cos can be perfect while matmul (etc.) layers still
+        show bad cos/rmse**, because later ops are fed ref activations again, not
+        the bad emulator outputs.
+
     If ``kernel_bundle_dir`` is set, the first emulated node for each op in
     ``kernel_bundle_ops`` (default: conv, relu, maxpool, matmul, add) copies
-    ``.c`` / ``.s`` / ``.in``, and ``verify.json`` (cosine / metrics)
+    ``.c`` / ``.s`` / ``.in``, and ``verify.json`` (metrics)
     into a subdirectory.
     """
+    if validate_inputs not in ("chained", "oracle"):
+        raise ValueError("validate_inputs must be 'chained' or 'oracle'")
     t0 = time.time()
     os.makedirs(out_dir, exist_ok=True)
     bundle_ops = kernel_bundle_ops or DEFAULT_KERNEL_BUNDLE_OPS
@@ -234,7 +314,21 @@ def run_validate(
     kernel_metrics = []
 
     if verbose:
-        print("\n--- Graph ---")
+        print(f"\n--- Graph (validate_inputs={validate_inputs}) ---")
+        print(
+            "  Note: cos similarity is direction-only (ignores scale). Prefer "
+            "rmse, rel_l2, rel_max_abs (max_abs / max|ref|) for element error."
+        )
+        if validate_inputs == "chained":
+            print(
+                "  chained: true pipeline — bad early layers corrupt later "
+                "per-layer cos."
+            )
+        else:
+            print(
+                "  oracle: ref activations reloaded before each emulated op — "
+                "good final output does NOT imply every kernel matched ref."
+            )
         for node in gm.graph.nodes:
             op = node.meta.get("atalla_op", "?")
             shape = get_node_shape(node)
@@ -302,6 +396,9 @@ def run_validate(
                     print(f"  [{node.name}] passthrough (ref)")
                 continue
 
+        if validate_inputs == "oracle" and atalla_op in _EMU_ATALLA_OPS:
+            _apply_oracle_inputs(activation_cache, ref_activations)
+
         emission = emit_node(node, gm, activation_cache)
 
         if emission is None:
@@ -324,10 +421,17 @@ def run_validate(
                   "shape": list(r.shape), "elems": int(r.size)}
             ref = ref_activations.get(node.name)
             if ref is not None:
-                km["cos_sim"] = _cos_sim(ref, r)
+                km.update(_layer_compare_metrics(ref, r))
             kernel_metrics.append(km)
             if verbose:
-                print(f"  [{node.name}] {atalla_op} -> NumPy {r.shape}")
+                extra = ""
+                if "cos_sim" in km:
+                    extra = (
+                        f" (cos={km['cos_sim']:.6f}, rmse={km['rmse']:.6f}, "
+                        f"rel_l2={km['rel_l2_error']:.6f}, "
+                        f"relmax={km['rel_max_abs_error']:.6f})"
+                    )
+                print(f"  [{node.name}] {atalla_op} -> NumPy {r.shape}{extra}")
             continue
 
         # Compile + emulate
@@ -375,14 +479,18 @@ def run_validate(
         eu.perf_metrics.update_derived_metrics()
         pm = eu.perf_metrics.metrics
         ref = ref_activations.get(node.name)
+        pk = int(pm.get("packets_executed", pm.get("packets", 0)))
+        ins = int(pm.get("instructions_executed", pm.get("instructions", 0)))
         km = {
             "name": node.name,
             "op": atalla_op,
             "backend": "emulator",
             "shape": list(result.shape),
             "elems": int(result.size),
-            "packets": int(pm.get("packets", 0)),
-            "instructions": int(pm.get("instructions", 0)),
+            "packets": pk,
+            "instructions": ins,
+            "packets_executed": pk,
+            "instructions_executed": ins,
             "sched_packets": int(emission.sched_packets),
             "sched_slots_filled": int(emission.sched_slots_filled),
             "sched_slot_efficiency": float(emission.sched_slot_efficiency),
@@ -394,9 +502,9 @@ def run_validate(
             "arithmetic_intensity_loads": float(pm.get("arithmetic_intensity_loads", 0.0)),
         }
         if ref is not None:
-            km["cos_sim"] = _cos_sim(ref, result)
-            km["max_diff"] = float(np.max(np.abs(
-                ref.flatten()[:result.size] - result.flatten()[:result.size])))
+            cmpm = _layer_compare_metrics(ref, result)
+            km.update(cmpm)
+            km["max_diff"] = cmpm["max_abs_error"]
             km["emu_norm"] = float(np.linalg.norm(result.flatten()))
             km["ref_norm"] = float(np.linalg.norm(ref.flatten()))
             km["emu_nz"] = _nz_count(result)
@@ -422,10 +530,12 @@ def run_validate(
             cos = km.get("cos_sim")
             if isinstance(cos, float):
                 extra = (
-                    f", max_diff={km['max_diff']:.6f}, "
+                    f", max_abs={km['max_abs_error']:.6f}, "
+                    f"relmax={km['rel_max_abs_error']:.6f}, "
+                    f"rmse={km['rmse']:.6f}, rel_l2={km['rel_l2_error']:.6f}, "
                     f"emu_norm={km['emu_norm']:.6f}, ref_norm={km['ref_norm']:.6f}, "
                     f"emu_nz={km['emu_nz']}, ref_nz={km['ref_nz']}"
-                    if "max_diff" in km else ""
+                    if "max_abs_error" in km else ""
                 )
                 se = km.get("sched_slot_efficiency", 0.0)
                 print(
@@ -459,18 +569,28 @@ def run_validate(
     aggregate_metrics = _aggregate_kernel_metrics(kernel_metrics)
 
     if emu_out is not None and ref_out is not None:
-        cos = _cos_sim(ref_out, emu_out)
-        ef, rf = emu_out.flatten(), ref_out.flatten()
-        n = min(len(ef), len(rf))
-        max_d = float(np.max(np.abs(ef[:n] - rf[:n])))
-        mean_d = float(np.mean(np.abs(ef[:n] - rf[:n])))
+        end_cmp = _layer_compare_metrics(ref_out, emu_out)
+        cos = end_cmp["cos_sim"]
         if verbose:
             print(f"  Output: emu={emu_out.shape} ref={ref_out.shape}")
-            print(f"  Cosine sim: {cos:.6f}")
-            print(f"  Max diff:   {max_d:.6f}")
-            print(f"  Mean diff:  {mean_d:.6f}")
-            if cos > 0.95:
-                print("  PASS")
+            print(
+                f"  cos={cos:.6f}  max_abs={end_cmp['max_abs_error']:.6f}  "
+                f"relmax={end_cmp['rel_max_abs_error']:.6f}  "
+                f"rmse={end_cmp['rmse']:.6f}  rel_l2={end_cmp['rel_l2_error']:.6f}"
+            )
+            if validate_inputs == "oracle" and cos > 0.95:
+                print(
+                    "  PASS (output cos threshold) — in oracle mode, scan "
+                    "per-layer relmax/rmse for kernels that still disagree."
+                )
+            elif cos > 0.95:
+                print("  PASS (cos threshold)")
+            if validate_inputs == "oracle":
+                print(
+                    "\n  Oracle caveat: inputs are reset from PyTorch before each "
+                    "emulated op, so the last add can be exact even when matmul "
+                    "outputs vs ref are poor."
+                )
 
     if verbose:
         am = aggregate_metrics
@@ -485,6 +605,7 @@ def run_validate(
     out = {
         "stats": stats,
         "elapsed_s": elapsed,
+        "validate_inputs": validate_inputs,
         "kernel_metrics": kernel_metrics,
         "aggregate_metrics": aggregate_metrics,
         "emulator_output": emu_out,
@@ -495,6 +616,7 @@ def run_validate(
         # JSON-serializable snapshot for posters / spreadsheets
         blob = {
             "model": getattr(model, "__class__", type(model)).__name__,
+            "validate_inputs": validate_inputs,
             "aggregate_metrics": aggregate_metrics,
             "kernel_metrics": kernel_metrics,
             "stats": stats,
@@ -530,6 +652,13 @@ def load_model(name: str, scale: float = 0.01):
     elif name == "alexnet_small":
         from model.alexnet_small import AlexNetSmall
         return AlexNetSmall(scale=scale, num_classes=10), torch.randn(1, 3, 32, 32)
+    elif name == "layernorm_smoke":
+        from model.layernorm_smoke import LayerNormSmoke
+        return LayerNormSmoke(dim=32), torch.randn(1, 32)
+    elif name == "vit_micro":
+        from model.vit_micro import ViTMicro
+        m = ViTMicro(dim=32, n_tokens=4)
+        return m, torch.randn(1, 4, 32)
     else:
         raise ValueError(f"Unknown model: {name}")
 
@@ -537,7 +666,7 @@ def load_model(name: str, scale: float = 0.01):
 def main():
     parser = argparse.ArgumentParser(description="Unified Atalla graph pipeline")
     parser.add_argument("--model", default="basic",
-                        choices=["basic", "alexnet_small"])
+                        choices=["basic", "alexnet_small", "layernorm_smoke", "vit_micro"])
     parser.add_argument("--mode", default="both",
                         choices=["schedule", "validate", "both"])
     parser.add_argument("--scale", type=float, default=0.01)
@@ -558,6 +687,16 @@ def main():
         default=None,
         help="After validate, write per-layer + aggregate poster metrics to PATH (JSON).",
     )
+    parser.add_argument(
+        "--validate-inputs",
+        choices=("chained", "oracle"),
+        default="chained",
+        help=(
+            "chained: prior emu output feeds the next op (end-to-end; per-layer cos is mixed). "
+            "oracle: copy all ref activations into cache before each emulated op — "
+            "per-layer output still vs ref, but final output can match even if matmuls do not."
+        ),
+    )
     args = parser.parse_args()
 
     torch.manual_seed(42)
@@ -577,6 +716,7 @@ def main():
             verbose=verbose,
             kernel_bundle_dir=args.export_kernel_bundle,
             metrics_json_path=args.metrics_json,
+            validate_inputs=args.validate_inputs,
         )
 
     if args.mode in ("schedule", "both"):

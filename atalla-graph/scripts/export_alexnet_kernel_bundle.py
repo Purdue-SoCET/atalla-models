@@ -61,6 +61,12 @@ def main() -> None:
     ap.add_argument("--out-bundle", default="out/alexnet_kernel_bundle", help="Bundle root directory")
     ap.add_argument("--work-dir", default="out/graph_bundle_work", help="Temp per-node .c/.s/.in")
     ap.add_argument("--scale", type=float, default=0.01)
+    ap.add_argument(
+        "--validate-inputs",
+        choices=("chained", "oracle"),
+        default="oracle",
+        help="oracle (default): verify.json compares each kernel vs PyTorch with matched inputs.",
+    )
     args = ap.parse_args()
 
     torch.manual_seed(42)
@@ -79,6 +85,7 @@ def main() -> None:
         args.work_dir,
         verbose=True,
         kernel_bundle_dir=str(bundle),
+        validate_inputs=args.validate_inputs,
     )
 
     (bundle / "README.txt").write_text(README)

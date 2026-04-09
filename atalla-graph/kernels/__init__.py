@@ -8,6 +8,7 @@ assembly and then encoded into .in files for the functional simulator.
 from kernels.common import ADDR_TABLE, TILE, sdma_ctl_val, sdma_ctl_expr
 from kernels.gemm import gemm_c
 from kernels.relu import relu_c
-from kernels.softmax import softmax_c
+from kernels.softmax import softmax_c, softmax_c_batched
 from kernels.maxpool import maxpool_c
 from kernels.add import add_c
+from kernels.layernorm import layernorm_c

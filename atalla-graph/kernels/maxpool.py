@@ -1,9 +1,13 @@
-"""AtallaC maxpool kernel: per-channel 2D max pooling (spatial <= 32 wide).
+"""AtallaC maxpool kernel: per-channel 2D max pooling (spatial W <= 32).
 
-Vertical max (across pool rows) is done fully on-chip via vector compare +
-masked blend. Horizontal stride-select + pool-width max is done in Python
-post-processing because ppci lacks shift.vi / vmov.vts / stbf.s inline asm
-support (see note in c_emitter.emit_maxpool).
+Vertical max uses ``make_mask`` + ``vec_op_masked("+", row, zero, gt)`` (same as
+historical kernels). Horizontal pooling is applied in ``run_graph`` via
+``maxpool_post`` (masked ``RMAX`` + per-lane scatter in AtallaC is blocked by
+ppci mask-register allocation vs ``add.vv`` predicate operands).
+
+Note: when ``row == best`` everywhere, ``gt`` is all-zero and the emulator's
+masked ``add.vv`` path (``vd==vs2``) can drop ``best``; use non-constant inputs
+for validation or fix the functional_sim blend for that encoding.
 """
 
 from kernels.common import ADDR_TABLE, sdma_ctl_expr

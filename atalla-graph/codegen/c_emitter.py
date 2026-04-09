@@ -37,8 +37,10 @@ from kernels import ADDR_TABLE, TILE, sdma_ctl_val, sdma_ctl_expr
 from kernels import gemm_c as _gemm_c
 from kernels import relu_c as _relu_c
 from kernels import softmax_c as _softmax_c
+from kernels.softmax import softmax_c_batched as _softmax_c_batched
 from kernels import maxpool_c as _maxpool_c
 from kernels.add import add_c as _add_c
+from kernels.layernorm import layernorm_c as _layernorm_c
 
 
 def _to_bf16_array(tensor: torch.Tensor) -> np.ndarray:
@@ -81,27 +83,59 @@ def _align_data(nbytes: int) -> int:
     return int(math.ceil(nbytes / 0x1000) * 0x1000) + 0x1000
 
 
+def _gemm_k_stride(K: int) -> int:
+    """Row stride for A and W' in DRAM (pad inner dim to a TILE multiple)."""
+    k = max(int(K), 1)
+    return int(math.ceil(k / TILE) * TILE)
+
+
+def _padded_gemm_a(A: np.ndarray, K: int) -> np.ndarray:
+    """Left-hand GEMM operand as ``(M, k_stride)`` with tail columns zero."""
+    A = np.asarray(A, dtype=np.float32)
+    M = int(A.shape[0])
+    ks = _gemm_k_stride(K)
+    buf = np.zeros((M, ks), dtype=np.float32)
+    buf[:, :K] = A[:, :K]
+    return buf
+
+
 def _write_gemm_params(img: DRAMWriter, A_GMEM: int, W_GMEM: int, C_GMEM: int,
-                       M: int, N: int, K: int):
+                       M: int, N: int, K: int, Z_GMEM: int):
     M_tiles = math.ceil(M / TILE)
     N_tiles = math.ceil(N / TILE)
     K_tiles = math.ceil(K / TILE)
+    k_stride = _gemm_k_stride(K)
     img.u32(ADDR_TABLE + 0, A_GMEM)
     img.u32(ADDR_TABLE + 4, W_GMEM)
     img.u32(ADDR_TABLE + 8, C_GMEM)
     img.u32(ADDR_TABLE + 12, M)
     img.u32(ADDR_TABLE + 16, N)
-    img.u32(ADDR_TABLE + 20, K)
+    img.u32(ADDR_TABLE + 20, k_stride)
     img.u32(ADDR_TABLE + 24, M_tiles)
     img.u32(ADDR_TABLE + 28, N_tiles)
     img.u32(ADDR_TABLE + 32, K_tiles)
     img.u32(ADDR_TABLE + 36, TILE)
+    img.u32(ADDR_TABLE + 40, Z_GMEM)
 
 
 def _write_matrix(img: DRAMWriter, base_addr: int, mat: np.ndarray, rows: int, cols: int):
     flat = mat.flatten()
     for i in range(min(rows * cols, len(flat))):
         img.bf16(base_addr + i * 2, float(flat[i]))
+
+
+def _write_gemm_rhs_weight(img: DRAMWriter, base_addr: int, w_kn: np.ndarray) -> None:
+    """Pack RHS for tiled GEMM: logical ``C = A @ W`` with ``W`` shape ``(K, N)``.
+
+    Stored as ``W.T`` row-major (``N`` × ``K``), each row zero-padded to
+    ``_gemm_k_stride(K)`` so SDMA can fetch ``tile_n`` lanes when ``K < TILE``.
+    """
+    w = np.asarray(w_kn, dtype=np.float32)
+    k, n = w.shape
+    ks = _gemm_k_stride(k)
+    buf = np.zeros((n, ks), dtype=np.float32)
+    buf[:, :k] = w.T
+    _write_matrix(img, base_addr, buf, n, ks)
 
 
 def _write_zeros(img: DRAMWriter, base_addr: int, count: int):
@@ -160,20 +194,24 @@ def emit_conv(node: Node, gm: GraphModule,
     else:
         input_nhwc = flat.reshape(1, C_in, H, W).transpose(0, 2, 3, 1)
     A_mat = im2col(input_nhwc, 1, H, W, C_in, p["R"], p["S"], p["stride"], p["pad"])
+    ks = _gemm_k_stride(K)
+    A_dram = _padded_gemm_a(A_mat, K)
 
     A_GMEM = 0x1000
-    W_GMEM = A_GMEM + _align_data(M * K * 2)
-    C_GMEM = W_GMEM + _align_data(K * N * 2)
+    W_GMEM = A_GMEM + _align_data(M * ks * 2)
+    C_GMEM = W_GMEM + _align_data(N * ks * 2)
+    Z_GMEM = C_GMEM + M * N * 2
 
     img = DRAMWriter()
-    _write_gemm_params(img, A_GMEM, W_GMEM, C_GMEM, M, N, K)
-    _write_matrix(img, A_GMEM, A_mat, M, K)
-    _write_matrix(img, W_GMEM, weight_flat, K, N)
+    _write_gemm_params(img, A_GMEM, W_GMEM, C_GMEM, M, N, K, Z_GMEM)
+    _write_matrix(img, A_GMEM, A_dram, M, ks)
+    _write_gemm_rhs_weight(img, W_GMEM, weight_flat)
     if bias_np is not None and bias_np.size == N:
         c_init = np.tile(bias_np.reshape(1, N), (M, 1))
         _write_matrix(img, C_GMEM, c_init, M, N)
     else:
         _write_zeros(img, C_GMEM, M * N)
+    _write_zeros(img, Z_GMEM, TILE)
 
     out_shape = get_node_shape(node)
     em = LayerEmission()
@@ -207,17 +245,21 @@ def emit_linear(node: Node, gm: GraphModule,
         weight_np = _to_bf16_array(attr)
         W_mat = weight_np.T if weight_np.shape[0] == N else weight_np
 
-    A = input_data.flatten().reshape(1, K)[:, :K]
+    A = np.asarray(input_data, dtype=np.float32).reshape(M, K)
+    ks = _gemm_k_stride(K)
+    A_dram = _padded_gemm_a(A, K)
 
     A_GMEM = 0x1000
-    W_GMEM = A_GMEM + _align_data(M * K * 2)
-    C_GMEM = W_GMEM + _align_data(K * N * 2)
+    W_GMEM = A_GMEM + _align_data(M * ks * 2)
+    C_GMEM = W_GMEM + _align_data(N * ks * 2)
+    Z_GMEM = C_GMEM + M * N * 2
 
     img = DRAMWriter()
-    _write_gemm_params(img, A_GMEM, W_GMEM, C_GMEM, M, N, K)
-    _write_matrix(img, A_GMEM, A, M, K)
-    _write_matrix(img, W_GMEM, W_mat, K, N)
+    _write_gemm_params(img, A_GMEM, W_GMEM, C_GMEM, M, N, K, Z_GMEM)
+    _write_matrix(img, A_GMEM, A_dram, M, ks)
+    _write_gemm_rhs_weight(img, W_GMEM, W_mat)
     _write_zeros(img, C_GMEM, M * N)
+    _write_zeros(img, Z_GMEM, TILE)
 
     out_shape = get_node_shape(node)
     em = LayerEmission()
@@ -260,30 +302,68 @@ def emit_relu(node: Node, input_data: np.ndarray, tc: TileConfig) -> LayerEmissi
     return em
 
 
-def emit_softmax(input_data: np.ndarray, tc: TileConfig) -> LayerEmission:
+def emit_softmax(node: Node, input_data: np.ndarray, tc: TileConfig) -> LayerEmission:
     p = tc.params
-    length = p["length"]
-    width = min(length, 32)
-    rows = math.ceil(length / 32)
+    if "num_rows" in p:
+        num_rows = int(p["num_rows"])
+        row_len = int(p["row_len"])
+        dim = int(p.get("softmax_dim", -1))
+    else:
+        num_rows, row_len, dim = 1, int(p.get("length", 1)), -1
 
-    flat = input_data.flatten()[:length]
+    out_shape = get_node_shape(node)
+    total = num_rows * row_len
+
+    x = np.asarray(input_data, dtype=np.float32)
+    if out_shape:
+        x = x.reshape(out_shape)
+        nd = x.ndim
+        if dim < 0:
+            dim += nd
+        if 0 <= dim < nd - 1:
+            perm = list(range(nd))
+            perm[dim], perm[-1] = perm[-1], perm[dim]
+            x = np.transpose(x, perm)
+        mat = x.reshape(num_rows, row_len)
+    else:
+        mat = x.reshape(num_rows, row_len)
+
+    flat_rows = mat.reshape(-1)
+    if flat_rows.size != total:
+        raise ValueError(
+            f"softmax layout mismatch: got {flat_rows.size} elems, expect {total}"
+        )
+
+    if row_len > 32:
+        em = LayerEmission()
+        em.skip_emulator = True
+        os = tuple(out_shape) if out_shape else (num_rows, row_len)
+        xt = torch.from_numpy(np.asarray(input_data, dtype=np.float32).reshape(os))
+        d = int(p.get("softmax_dim", -1))
+        y = torch.nn.functional.softmax(xt, dim=d).numpy()
+        em.numpy_result = y
+        em.output_shape = os
+        em.output_elements = int(y.size)
+        em.dram = DRAMWriter()
+        return em
+
     IN_GMEM = 0x1000
-
     img = DRAMWriter()
     img.u32(ADDR_TABLE + 0, IN_GMEM)
     img.u32(ADDR_TABLE + 4, 0)
 
-    padded = np.zeros(rows * width, dtype=np.float32)
-    padded[:len(flat)] = flat
-    for i in range(rows * width):
-        img.bf16(IN_GMEM + i * 2, float(padded[i]))
+    for i in range(total):
+        img.bf16(IN_GMEM + i * 2, float(flat_rows[i]))
 
     em = LayerEmission()
-    em.c_source = _softmax_c(length)
+    if num_rows == 1 and row_len > 32:
+        em.c_source = _softmax_c(row_len)
+    else:
+        em.c_source = _softmax_c_batched(num_rows, row_len)
     em.dram = img
     em.output_addr = IN_GMEM
-    em.output_shape = (length,)
-    em.output_elements = length
+    em.output_shape = tuple(out_shape) if out_shape else (num_rows, row_len)
+    em.output_elements = total
     return em
 
 
@@ -308,22 +388,27 @@ def emit_matmul(node: Node, gm: GraphModule,
     A = input_data.reshape(-1, K)[:M, :]
     if W_mat.shape != (K, N):
         W_mat = W_mat.reshape(K, N) if W_mat.size == K * N else W_mat.T
+    ks = _gemm_k_stride(K)
+    A_dram = _padded_gemm_a(A, K)
 
     A_GMEM = 0x1000
-    W_GMEM = A_GMEM + _align_data(M * K * 2)
-    C_GMEM = W_GMEM + _align_data(K * N * 2)
+    W_GMEM = A_GMEM + _align_data(M * ks * 2)
+    C_GMEM = W_GMEM + _align_data(N * ks * 2)
+    Z_GMEM = C_GMEM + M * N * 2
 
     img = DRAMWriter()
-    _write_gemm_params(img, A_GMEM, W_GMEM, C_GMEM, M, N, K)
-    _write_matrix(img, A_GMEM, A, M, K)
-    _write_matrix(img, W_GMEM, W_mat, K, N)
+    _write_gemm_params(img, A_GMEM, W_GMEM, C_GMEM, M, N, K, Z_GMEM)
+    _write_matrix(img, A_GMEM, A_dram, M, ks)
+    _write_gemm_rhs_weight(img, W_GMEM, W_mat)
     _write_zeros(img, C_GMEM, M * N)
+    _write_zeros(img, Z_GMEM, TILE)
 
+    out_shape = get_node_shape(node)
     em = LayerEmission()
     em.c_source = _gemm_c(M, N, K)
     em.dram = img
     em.output_addr = C_GMEM
-    em.output_shape = (M, N) if M > 1 else (N,)
+    em.output_shape = tuple(out_shape) if out_shape else ((M, N) if M > 1 else (N,))
     em.output_elements = M * N
     return em
 
@@ -363,8 +448,8 @@ def emit_maxpool(node: Node, input_data: np.ndarray, tc: TileConfig) -> LayerEmi
         em.output_elements = out_elems
         return em
 
-    # Kernel outputs full-width rows (vertical max only); horizontal
-    # stride-select + pool-width max done in post_process_maxpool.
+    # Kernel writes per-output-row vectors of width W (vertical max per column);
+    # horizontal max over the pool window is applied in run_graph (maxpool_post).
     IN_GMEM = 0x1000
     channel_in_bytes = H * W * 2
     raw_out_ch_bytes = H_out * W * 2
@@ -478,6 +563,116 @@ def emit_add(node: Node, activation_cache: Dict[str, np.ndarray],
     return em
 
 
+def emit_layernorm(
+    node: Node,
+    gm: GraphModule,
+    input_data: np.ndarray,
+    activation_cache: Dict[str, np.ndarray],
+    tc: TileConfig,
+) -> LayerEmission:
+    """LayerNorm: AtallaC when ``D % 32 == 0``, else PyTorch BF16 reference."""
+    p = tc.params
+    M, D = int(p["M"]), int(p["D"])
+    eps = float(p["eps"])
+    need = M * D
+    flat = np.asarray(input_data, dtype=np.float32).flatten()
+    if flat.size < need:
+        pad = np.zeros(need, dtype=np.float32)
+        pad[: flat.size] = flat
+        flat = pad
+    else:
+        flat = flat[:need].copy()
+
+    w_arr = np.ones(D, dtype=np.float32)
+    b_arr = np.zeros(D, dtype=np.float32)
+    if node.op == "call_module":
+        mod = _get_module(gm, node.target)
+        if getattr(mod, "elementwise_affine", True):
+            w_arr = mod.weight.detach().float().cpu().numpy().astype(np.float32).flatten()[:D]
+            if mod.bias is not None:
+                b_arr = mod.bias.detach().float().cpu().numpy().astype(np.float32).flatten()[:D]
+    else:
+        if len(node.args) > 2 and node.args[2] is not None:
+            wn = node.args[2]
+            if isinstance(wn, Node) and wn.name in activation_cache:
+                w_arr = np.asarray(activation_cache[wn.name], dtype=np.float32).flatten()[:D]
+        if len(node.args) > 3 and node.args[3] is not None:
+            bn = node.args[3]
+            if isinstance(bn, Node) and bn.name in activation_cache:
+                b_arr = np.asarray(activation_cache[bn.name], dtype=np.float32).flatten()[:D]
+
+    out_shape = get_node_shape(node)
+    os = tuple(out_shape) if out_shape else (M, D)
+
+    use_hw = (D % 32 == 0) and D >= 32
+    if use_hw:
+        IN0 = 0x1000
+        OUT0 = IN0 + _align_data(M * D * 2)
+        GM = OUT0 + _align_data(M * D * 2)
+        BM = GM + _align_data(D * 2)
+
+        img = DRAMWriter()
+        img.u32(ADDR_TABLE + 0, IN0)
+        img.u32(ADDR_TABLE + 4, OUT0)
+        img.u32(ADDR_TABLE + 8, GM)
+        img.u32(ADDR_TABLE + 12, BM)
+        img.u32(ADDR_TABLE + 16, M & 0xFFFFFFFF)
+
+        for i in range(M * D):
+            img.bf16(IN0 + i * 2, float(flat[i]))
+        for i in range(D):
+            img.bf16(GM + i * 2, float(w_arr[i]))
+            img.bf16(BM + i * 2, float(b_arr[i]))
+
+        em = LayerEmission()
+        em.c_source = _layernorm_c(M, D, eps)
+        em.dram = img
+        em.output_addr = OUT0
+        em.output_shape = os
+        em.output_elements = need
+        em.skip_emulator = False
+        return em
+
+    x = torch.from_numpy(flat.reshape(M, D)).to(torch.bfloat16)
+    wt = torch.from_numpy(w_arr.copy()).to(torch.bfloat16)
+    bi = torch.from_numpy(b_arr.copy()).to(torch.bfloat16)
+    y = torch.nn.functional.layer_norm(x, (D,), wt, bi, eps).float().numpy()
+
+    em = LayerEmission()
+    em.skip_emulator = True
+    em.numpy_result = y.reshape(os)
+    em.output_shape = os
+    em.output_elements = int(y.size)
+    em.dram = DRAMWriter()
+    return em
+
+
+def emit_gelu(node: Node, input_data: np.ndarray, tc: TileConfig) -> LayerEmission:
+    """GELU via PyTorch BF16 (ISA kernel TBD)."""
+    p = tc.params
+    total = int(p["total_elements"])
+    flat = np.asarray(input_data, dtype=np.float32).flatten()[:total]
+    if flat.size < total:
+        pad = np.zeros(total, dtype=np.float32)
+        pad[: flat.size] = flat
+        flat = pad
+    x = torch.from_numpy(flat).to(torch.bfloat16)
+    try:
+        y = torch.nn.functional.gelu(x, approximate="tanh")
+    except TypeError:
+        y = torch.nn.functional.gelu(x)
+    y = y.float().numpy()
+    out_shape = get_node_shape(node)
+    os = tuple(out_shape) if out_shape else (total,)
+    em = LayerEmission()
+    em.skip_emulator = True
+    em.numpy_result = y.reshape(os)
+    em.output_shape = os
+    em.output_elements = total
+    em.dram = DRAMWriter()
+    return em
+
+
 def emit_node(node: Node, gm: GraphModule,
               activation_cache: Dict[str, np.ndarray]) -> Optional[LayerEmission]:
     tc = node.meta.get("tile_config")
@@ -502,7 +697,7 @@ def emit_node(node: Node, gm: GraphModule,
     elif atalla_op == "relu":
         return emit_relu(node, input_data, tc)
     elif atalla_op == "softmax":
-        return emit_softmax(input_data, tc)
+        return emit_softmax(node, input_data, tc)
     elif atalla_op == "maxpool":
         return emit_maxpool(node, input_data, tc)
     elif atalla_op in ("flatten", "dropout"):
@@ -527,6 +722,10 @@ def emit_node(node: Node, gm: GraphModule,
         return emit_add(node, activation_cache, tc)
     elif atalla_op == "mul":
         return emit_mul(node, activation_cache)
+    elif atalla_op == "layernorm":
+        return emit_layernorm(node, gm, input_data, activation_cache, tc)
+    elif atalla_op == "gelu":
+        return emit_gelu(node, input_data, tc)
 
     return None
 

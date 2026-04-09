@@ -5,23 +5,48 @@ from kernels.common import ADDR_TABLE, TILE, sdma_ctl_expr
 
 
 def gemm_c(M: int, N: int, K: int) -> str:
-    """Generate AtallaC for tiled GEMM reading config from ADDR_TABLE."""
+    """Generate AtallaC for tiled GEMM reading config from ADDR_TABLE.
+
+    RHS DRAM matches ``_write_gemm_rhs_weight``: logical ``(K,N)`` weights are
+    stored as ``(N,K)`` row-major with each row padded to ``k_stride`` columns
+    (multiple of ``TILE``).  ``A`` uses the same inner stride.  SDMA
+    ``full_cols`` must match that stride so row-to-row steps in GMEM are correct
+    when ``K < TILE``.
+    """
     tm1 = min(TILE, M) - 1
     tn1 = min(TILE, N) - 1
     tk1 = min(TILE, K) - 1
     tile_m = min(TILE, M)
     tile_n = min(TILE, N)
     tile_k = min(TILE, K)
-    sdma_a_s = sdma_ctl_expr("sdma_ctl_a", 0, tile_m, tile_k, K)
-    sdma_w_s = sdma_ctl_expr("sdma_ctl_w", 1, tile_k, tile_n, N)
+    k_stride = int(math.ceil(max(K, 1) / TILE) * TILE)
+    sdma_a_s = sdma_ctl_expr("sdma_ctl_a", 0, tile_m, tile_k, k_stride)
+    # W' is (N, k_stride) row-major: each GMEM row is one output channel; tile is
+    # tile_n channels × tile_k K coefficients (not tile_k × tile_n).
+    sdma_w_s = sdma_ctl_expr("sdma_ctl_w", 1, tile_n, tile_k, k_stride)
     sdma_c_s = sdma_ctl_expr("sdma_ctl_c", 1, tile_m, tile_n, N)
+    # SP0: one row of TILE zeros for padding partial-N tails in weight SP1.
+    sdma_z_s = sdma_ctl_expr("sdma_ctl_z", 0, 1, TILE, TILE)
 
     return (
         "void load_weight_tile(int sp_w, int w_addr, int sdma_ctl_w) {\n"
+        f"    int cfg_tbl = {ADDR_TABLE};\n"
+        "    int z_addr;\n"
+        '    asm("lw_s %0, 40(%1)" : "=r"(z_addr) : "r"(cfg_tbl));\n'
+        "    int tile_sz;\n"
+        '    asm("lw_s %0, 36(%1)" : "=r"(tile_sz) : "r"(cfg_tbl));\n'
+        f"{sdma_z_s}"
+        "    scpad_load(0, z_addr, sdma_ctl_z);\n"
+        f"    vec zrow = vector_load(0, 0, {TILE - 1}, 0);\n"
         "    scpad_load(sp_w, w_addr, sdma_ctl_w);\n"
+        f"    int wn = {tile_n};\n"
+        "    while (wn < tile_sz) {\n"
+        f"        vector_store(zrow, sp_w, wn, {tk1}, 1);\n"
+        "        wn = wn + 1;\n"
+        "    }\n"
         "    int wi = 0;\n"
-        f"    while (wi < {tile_k}) {{\n"
-        f"        vec wvec = vector_load(sp_w, wi, {tn1}, 1);\n"
+        "    while (wi < tile_sz) {\n"
+        f"        vec wvec = vector_load(sp_w, wi, {tk1}, 1);\n"
         "        load_weights(wvec);\n"
         "        wi = wi + 1;\n"
         "    }\n"
@@ -62,7 +87,7 @@ def gemm_c(M: int, N: int, K: int) -> str:
         "                int a_byte = a_off * 2;\n"
         "                int a_addr = A_GMEM + a_byte;\n"
         "\n"
-        "                int w_off = ki * tile_sz * gN + ni * tile_sz;\n"
+        "                int w_off = ni * tile_sz * gK + ki * tile_sz;\n"
         "                int w_byte = w_off * 2;\n"
         "                int w_addr = W_GMEM + w_byte;\n"
         "\n"
