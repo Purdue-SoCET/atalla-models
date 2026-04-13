@@ -1,5 +1,28 @@
 #include "kernels.h"
 
+int matmul_tile_kernel(
+    int a_scpad_addr,
+    int b_scpad_addr,
+    int c_scpad_addr,
+    int a_sid,
+    int b_sid,
+    int c_sid,
+    int m_rows,
+    int n_cols,
+    int k_cols
+) {
+    (void)a_scpad_addr;
+    (void)b_scpad_addr;
+    (void)c_scpad_addr;
+    (void)a_sid;
+    (void)b_sid;
+    (void)c_sid;
+    (void)m_rows;
+    (void)n_cols;
+    (void)k_cols;
+    return 0;
+}
+
 int relu_kernel(const GlobalTile *input, GlobalTile *output, const void *vector_reg_base) {
     (void)input;
     (void)output;

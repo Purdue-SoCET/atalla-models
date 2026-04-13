@@ -18,6 +18,11 @@ typedef struct {
     const TileDesc32 *tiles;
 } GlobalTile;
 
+/*
+ * Tile-level compute kernel stubs
+ */
+int matmul_tile_kernel(int a_scpad_addr, int b_scpad_addr, int c_scpad_addr, int a_sid, int b_sid, int c_sid, int m_rows, int n_cols, int k_cols);
+
 int relu_kernel(const GlobalTile *input, GlobalTile *output, const void *vector_reg_base);
 int softmax_kernel(const GlobalTile *input, GlobalTile *output);
 int matmul_kernel(const GlobalTile *A, const GlobalTile *B, GlobalTile *C);
