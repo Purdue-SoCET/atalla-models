@@ -591,7 +591,8 @@ def emit(gm: GraphModule) -> str:
     calls = _render_kernel_calls(gm, specs_by_node, scaled_mul, attr_nodes)
 
     pieces: List[str] = [
-        "#include \"kernels/kernels.h\"\n\n"
+        "#include \"kernels/kernels.h\"\n\n",
+        "#include \"kernels/sdma.h\"\n\n",
     ]
     for spec in tensor_specs:
         pieces.append(_render_tensor(spec))
