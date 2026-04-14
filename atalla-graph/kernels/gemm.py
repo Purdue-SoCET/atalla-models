@@ -1,7 +1,7 @@
 """AtallaC tiled GEMM kernel: C += A × B with 32×32 tiles."""
 
 import math
-from kernels.common import ADDR_TABLE, TILE, sdma_ctl_expr
+from .common import ADDR_TABLE, TILE, sdma_ctl_expr
 
 
 def gemm_c(M: int, N: int, K: int) -> str:

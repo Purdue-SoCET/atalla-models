@@ -6,7 +6,7 @@ for normalize + gamma + beta. Config table at ADDR_TABLE (see emit_layernorm).
 
 from __future__ import annotations
 
-from kernels.common import ADDR_TABLE, sdma_ctl_expr
+from .common import ADDR_TABLE, sdma_ctl_expr
 
 
 def layernorm_c(M: int, D: int, eps: float) -> str:

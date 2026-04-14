@@ -1,7 +1,7 @@
 """AtallaC ReLU kernel: element-wise max(x, 0) via masked zero."""
 
 import math
-from kernels.common import ADDR_TABLE, TILE, sdma_ctl_expr
+from .common import ADDR_TABLE, TILE, sdma_ctl_expr
 
 
 def relu_c(total: int, width: int) -> str:

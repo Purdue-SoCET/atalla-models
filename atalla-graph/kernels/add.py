@@ -1,7 +1,7 @@
 """AtallaC add kernel: element-wise C = A + B on tiled data."""
 
 import math
-from kernels.common import ADDR_TABLE, TILE, sdma_ctl_expr, sdma_ctl_val
+from .common import ADDR_TABLE, TILE, sdma_ctl_expr, sdma_ctl_val
 
 
 def add_c(total: int, width: int = 32) -> str:

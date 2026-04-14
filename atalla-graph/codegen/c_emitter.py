@@ -8,6 +8,7 @@ Pipeline: .c -> ppci atalla_cc -> .s -> build_compiler.compile_asm -> .in
 """
 from __future__ import annotations
 
+import importlib.util
 import math
 import os
 from collections import Counter
@@ -24,23 +25,45 @@ _FUNC_SIM = Path(__file__).resolve().parent.parent.parent / "functional_sim"
 if str(_FUNC_SIM) not in sys.path:
     sys.path.insert(0, str(_FUNC_SIM))
 
+
+def _load_emit_kernels():
+    """Graph AtallaC kernels; must not use top-level name `kernels` (functional_sim has its own)."""
+    name = "_atalla_emit_kernels"
+    if name in sys.modules:
+        return sys.modules[name]
+    root = Path(__file__).resolve().parent.parent / "kernels"
+    spec = importlib.util.spec_from_file_location(
+        name, root / "__init__.py", submodule_search_locations=[str(root)]
+    )
+    mod = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_ek = _load_emit_kernels()
+ADDR_TABLE = _ek.ADDR_TABLE
+TILE = _ek.TILE
+sdma_ctl_val = _ek.sdma_ctl_val
+sdma_ctl_expr = _ek.sdma_ctl_expr
+_gemm_c = _ek.gemm_c
+_relu_c = _ek.relu_c
+_softmax_c = _ek.softmax_c
+_softmax_c_batched = _ek.softmax_c_batched
+_maxpool_c = _ek.maxpool_c
+_add_c = _ek.add_c
+_layernorm_c = _ek.layernorm_c
+
 _default_compiler = Path(__file__).resolve().parent.parent.parent / "aihw-ppci-compiler"
 _COMPILER = Path(os.environ.get("ATALLA_COMPILER_PATH", str(_default_compiler)))
 
 from build import DRAMWriter, render_testfile
-from build_alexnet_layer import im2col, TILE
+from build_conv_tiled import im2col
 import build_compiler as _bc
 
 from graph.tile_planner import TileConfig
 from graph.fx_capture import get_node_shape
-from kernels import ADDR_TABLE, TILE, sdma_ctl_val, sdma_ctl_expr
-from kernels import gemm_c as _gemm_c
-from kernels import relu_c as _relu_c
-from kernels import softmax_c as _softmax_c
-from kernels.softmax import softmax_c_batched as _softmax_c_batched
-from kernels import maxpool_c as _maxpool_c
-from kernels.add import add_c as _add_c
-from kernels.layernorm import layernorm_c as _layernorm_c
 
 
 def _to_bf16_array(tensor: torch.Tensor) -> np.ndarray:

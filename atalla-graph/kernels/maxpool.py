@@ -12,7 +12,7 @@ generated sequence still disagrees with the reference in emulation; keep post
 until that is debugged.
 """
 
-from kernels.common import ADDR_TABLE, sdma_ctl_expr
+from .common import ADDR_TABLE, sdma_ctl_expr
 
 
 def maxpool_c(H: int, W: int, C: int, pool: int, stride: int) -> str:

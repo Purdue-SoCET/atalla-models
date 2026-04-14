@@ -1,7 +1,7 @@
 """AtallaC softmax: exp(x - max) / sum(exp(x - max)) via 1.0/sum."""
 
 import math
-from kernels.common import ADDR_TABLE, sdma_ctl_expr
+from .common import ADDR_TABLE, sdma_ctl_expr
 
 
 def softmax_c_batched(num_rows: int, row_len: int) -> str:
