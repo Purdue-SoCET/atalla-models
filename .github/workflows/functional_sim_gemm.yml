@@ -7,6 +7,8 @@ on:
   push:
     paths:
       - "functional_sim/gemm_tiled_gemm_trace_c_vs_gen.py"
+      - "functional_sim/ta_gemm_emit.py"
+      - "functional_sim/scripts/run_gemm_tiled_regressions.sh"
       - "functional_sim/matched_kernel_suite.py"
       - "functional_sim/build_gemm_tiled.py"
       - "functional_sim/src/**"
@@ -14,6 +16,8 @@ on:
   pull_request:
     paths:
       - "functional_sim/gemm_tiled_gemm_trace_c_vs_gen.py"
+      - "functional_sim/ta_gemm_emit.py"
+      - "functional_sim/scripts/run_gemm_tiled_regressions.sh"
       - "functional_sim/matched_kernel_suite.py"
       - "functional_sim/build_gemm_tiled.py"
       - "functional_sim/src/**"
@@ -34,10 +38,6 @@ jobs:
           pip install numpy
           pip install -e ./aihw-ppci-compiler
 
-      - name: GEMM trace (C vs generator)
+      - name: GEMM regressions (trace + matched 4×4×16 + TILE=16 medium)
         working-directory: functional_sim
-        run: python gemm_tiled_gemm_trace_c_vs_gen.py
-
-      - name: Matched suite (baseline + pipelined 4×4×16)
-        working-directory: functional_sim
-        run: python matched_kernel_suite.py --spec gemm_tiled_4x4x16,gemm_tiled_pipelined_4x4x16
+        run: bash scripts/run_gemm_tiled_regressions.sh
