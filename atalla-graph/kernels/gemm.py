@@ -30,11 +30,9 @@ def gemm_c(M: int, N: int, K: int) -> str:
 
     return (
         "void load_weight_tile(int sp_w, int w_addr, int sdma_ctl_w) {\n"
-        f"    int cfg_tbl = {ADDR_TABLE};\n"
-        "    int z_addr;\n"
-        '    asm("lw_s %0, 40(%1)" : "=r"(z_addr) : "r"(cfg_tbl));\n'
-        "    int tile_sz;\n"
-        '    asm("lw_s %0, 36(%1)" : "=r"(tile_sz) : "r"(cfg_tbl));\n'
+        f"    int* cfg_tbl = (int*){ADDR_TABLE};\n"
+        "    int z_addr = *(cfg_tbl + 10);\n"
+        "    int tile_sz = *(cfg_tbl + 9);\n"
         f"{sdma_z_s}"
         "    scpad_load(0, z_addr, sdma_ctl_z);\n"
         f"    vec zrow = vector_load(0, 0, {TILE - 1}, 0);\n"
@@ -53,21 +51,17 @@ def gemm_c(M: int, N: int, K: int) -> str:
         "}\n"
         "\n"
         "int main() {\n"
-        f"    int cfg = {ADDR_TABLE};\n"
-        "    int A_GMEM; int W_GMEM; int C_GMEM;\n"
-        "    int gM; int gN; int gK;\n"
-        "    int M_tiles; int N_tiles; int K_tiles; int tile_sz;\n"
-        "\n"
-        '    asm("lw_s %0, 0(%1)"  : "=r"(A_GMEM)  : "r"(cfg));\n'
-        '    asm("lw_s %0, 4(%1)"  : "=r"(W_GMEM)  : "r"(cfg));\n'
-        '    asm("lw_s %0, 8(%1)"  : "=r"(C_GMEM)  : "r"(cfg));\n'
-        '    asm("lw_s %0, 12(%1)" : "=r"(gM)      : "r"(cfg));\n'
-        '    asm("lw_s %0, 16(%1)" : "=r"(gN)      : "r"(cfg));\n'
-        '    asm("lw_s %0, 20(%1)" : "=r"(gK)      : "r"(cfg));\n'
-        '    asm("lw_s %0, 24(%1)" : "=r"(M_tiles) : "r"(cfg));\n'
-        '    asm("lw_s %0, 28(%1)" : "=r"(N_tiles) : "r"(cfg));\n'
-        '    asm("lw_s %0, 32(%1)" : "=r"(K_tiles) : "r"(cfg));\n'
-        '    asm("lw_s %0, 36(%1)" : "=r"(tile_sz) : "r"(cfg));\n'
+        f"    int* cfg = (int*){ADDR_TABLE};\n"
+        "    int A_GMEM = *(cfg + 0);\n"
+        "    int W_GMEM = *(cfg + 1);\n"
+        "    int C_GMEM = *(cfg + 2);\n"
+        "    int gM = *(cfg + 3);\n"
+        "    int gN = *(cfg + 4);\n"
+        "    int gK = *(cfg + 5);\n"
+        "    int M_tiles = *(cfg + 6);\n"
+        "    int N_tiles = *(cfg + 7);\n"
+        "    int K_tiles = *(cfg + 8);\n"
+        "    int tile_sz = *(cfg + 9);\n"
         "\n"
         "    int all_mask = -1;\n"
         "    int sp_a = 0;\n"
@@ -120,7 +114,7 @@ def gemm_c(M: int, N: int, K: int) -> str:
         "        mi = mi + 1;\n"
         "    }\n"
         "\n"
-        '    asm("halt");\n'
+        "    atalla_halt();\n"
         "    return 0;\n"
         "}\n"
     )

@@ -48,7 +48,7 @@ def relu_c(total: int, width: int) -> str:
         "        tile = tile + 1;\n"
         "    }\n"
         "\n"
-        '    asm("halt");\n'
+        "    atalla_halt();\n"
         "    return 0;\n"
         "}\n"
     )
