@@ -5,4 +5,4 @@
 [submodule "functional_sim"]
 	path = functional_sim
 	url = https://github.com/Purdue-SoCET/atalla-functional-sim.git
-	branch = main
+	branch = inference_dev
