@@ -50,6 +50,7 @@ from src.components.execute import ExecuteUnit
 from src.components.scpad import Scratchpad
 
 from graph.lower_modules import lower_linear_modules
+from graph.backward import capture_backward
 from graph.memoryallocator import allocate_memory
 from graph.fx_capture import normalize_ops, get_node_shape
 from graph.tile_planner import plan_tiles
@@ -258,8 +259,19 @@ def _aggregate_kernel_metrics(kernel_metrics: list) -> Dict:
 # ── Front-end: shared across modes ──────────────────────────────────────────
 
 def build_graph(model: nn.Module, example_input: torch.Tensor,
-                verbose: bool = True):
-    """Trace → lower → shape prop → normalize → plan tiles."""
+                verbose: bool = True, *, include_backward: bool = False,
+                example_target: Optional[torch.Tensor] = None,
+                loss_fn=None):
+    """Trace → lower → optional loss/backward → shapes → normalize → tiles.
+
+    Forward-only calls are unchanged. With include_backward=True, provide a
+    target tensor and a scalar loss_fn(prediction, target). The returned graph
+    takes (x, target) and returns (prediction, FP32 loss, named BF16 gradients).
+    Weights remain graph attributes. Model mode stays eval, as in inference.
+    New operators are retained for future kernel implementation.
+    """
+    if include_backward and (example_target is None or loss_fn is None):
+        raise ValueError("include_backward requires example_target and loss_fn")
     model = model.bfloat16().eval()
     example_bf16 = example_input.bfloat16()
 
@@ -273,9 +285,17 @@ def build_graph(model: nn.Module, example_input: torch.Tensor,
         gm = symbolic_trace(model)
     gm = lower_linear_modules(gm)
 
+    if include_backward:
+        if verbose:
+            print("Capture forward + loss + backward...")
+        gm = capture_backward(gm, model, example_bf16, example_target, loss_fn)
+
     if verbose:
         print("Shape propagation...")
-    ShapeProp(gm).propagate(example_bf16)
+    if include_backward:
+        ShapeProp(gm).propagate(example_bf16, example_target)
+    else:
+        ShapeProp(gm).propagate(example_bf16)
 
     if verbose:
         print("Normalize ops + plan tiles...")
@@ -289,6 +309,11 @@ def build_graph(model: nn.Module, example_input: torch.Tensor,
 def run_schedule(gm, example_input: torch.Tensor, out_dir: str,
                  verbose: bool = True) -> str:
     """Emit graph_schedule.c using Vihaan's generate_schedule."""
+    if gm.meta.get("include_backward"):
+        raise NotImplementedError(
+            "Backward graphs can be inspected and run in PyTorch, but schedule "
+            "emission needs target inputs, backward kernels, and mixed-dtype memory support."
+        )
     os.makedirs(out_dir, exist_ok=True)
     placeholder_data = {"x": example_input.bfloat16().clone()}
     gm_alloc = allocate_memory(gm, f"{out_dir}/dram.bin", placeholder_data)
@@ -359,6 +384,11 @@ def run_validate(
     *strict_min_cos* / *strict_max_rel_l2* / *strict_max_relmax* (defaults for
     a meaningful E2E error bar, not direction-only cos).
     """
+    if gm.meta.get("include_backward"):
+        raise NotImplementedError(
+            "Backward graphs require target inputs and gradient validation support; "
+            "run gm(x.bfloat16(), target) for the PyTorch reference."
+        )
     if validate_inputs not in ("chained", "oracle"):
         raise ValueError("validate_inputs must be 'chained' or 'oracle'")
     t0 = time.time()

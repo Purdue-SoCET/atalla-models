@@ -353,14 +353,29 @@ def _plan_layernorm(node: Node, gm: GraphModule) -> TileConfig:
     )
 
 
+def _tensor_outputs(meta, path=()):
+    """Yield tensor metadata leaves, including tuple-valued backward outputs."""
+    if hasattr(meta, "shape") and hasattr(meta, "dtype"):
+        yield path, meta
+    elif isinstance(meta, (tuple, list)):
+        for index, child in enumerate(meta):
+            yield from _tensor_outputs(child, path + (index,))
+    elif isinstance(meta, dict):
+        for key, child in meta.items():
+            yield from _tensor_outputs(child, path + (key,))
+
+
+def _tensor_output_bytes(meta) -> int:
+    count = math.prod(int(d) for d in meta.shape)
+    element_bytes = torch.empty((), dtype=meta.dtype).element_size()
+    return max(TILE_BYTES, _align(count * element_bytes, TILE_BYTES))
+
+
 def _output_bytes(node: Node) -> int:
-    shape = get_node_shape(node)
-    if shape is None:
-        return TILE_BYTES
-    total = 1
-    for d in shape:
-        total *= d
-    return _align(total * 2, TILE_BYTES)  # bf16
+    outputs = list(_tensor_outputs(node.meta.get("tensor_meta")))
+    if outputs:
+        return sum(_tensor_output_bytes(meta) for _, meta in outputs)
+    return TILE_BYTES
 
 
 def plan_tiles(gm: GraphModule) -> GraphModule:
@@ -402,6 +417,16 @@ def plan_tiles(gm: GraphModule) -> GraphModule:
         if tc is not None:
             node.meta["tile_config"] = tc
             node.meta["kernel_type"] = tc.kernel_type
+        elif gm.meta.get("include_backward") and node.op in (
+            "call_function", "call_method", "call_module"
+        ):
+            # Capture and allocate new operations without pretending a kernel
+            # implementation or hardware tiling strategy already exists.
+            node.meta["tile_config"] = TileConfig(
+                kernel_type=atalla_op, params={"pending": True}
+            )
+            node.meta["kernel_type"] = atalla_op
+            node.meta["requires_kernel"] = True
 
         if node.op == "output":
             continue
@@ -410,7 +435,24 @@ def plan_tiles(gm: GraphModule) -> GraphModule:
         aligned = _align(next_addr, TILE_BYTES)
         node.meta["dram_addr"] = aligned
         node.meta["dram_bytes"] = nbytes
+        if gm.meta.get("include_backward"):
+            offset = aligned
+            outputs = []
+            for path, meta in _tensor_outputs(node.meta.get("tensor_meta")):
+                size = _tensor_output_bytes(meta)
+                outputs.append(dict(
+                    path=path, shape=tuple(meta.shape), dtype=str(meta.dtype),
+                    dram_addr=offset, dram_bytes=size,
+                ))
+                offset += size
+            node.meta["dram_outputs"] = outputs
         next_addr = aligned + nbytes
+
+    if gm.meta.get("include_backward"):
+        gm.meta["pending_kernel_ops"] = sorted({
+            n.meta["atalla_op"] for n in gm.graph.nodes
+            if n.meta.get("requires_kernel")
+        })
 
     gm.graph.lint()
     gm.recompile()
