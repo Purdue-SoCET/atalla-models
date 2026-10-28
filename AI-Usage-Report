@@ -1,0 +1,301 @@
+Date: October 28, 2026
+AI Usage Report
+
+CONTEXT AND SCOPE DISCLOSURE
+
+I reviewed the visible conversation from the student's first question about backward-graph command-line support through the request for this report. All substantive conversational turns in that interval were available; I am not relying on a compacted summary of an unavailable earlier portion. Some long individual command outputs were truncated, and interrupted commands did not always return completion results. Those limitations are identified where relevant below.
+
+The first question referred to my "most recent change," but the work that produced the pre-existing backward-capture implementation occurred before the visible conversation. I cannot establish its authorship from this session. In particular, capture_backward(), the original build_graph(include_backward=...) path, and the original backward-capture tests were already present when I first inspected the repository. This report does not count them as code I wrote in this session.
+
+1. SESSION OVERVIEW
+
+Tool/model: OpenAI Codex coding agent, identified in the session instructions as GPT-6-based. The exact deployed model/version was not independently verified. I used local PowerShell commands, file reads and edits, Python, unittest, PyTorch/FX, NumPy, and the project's compiler/emulator pipeline; I did not use web research or delegate to subagents.
+
+Approximate session dates: October 27-28, 2026, using the student's America/Indianapolis date context. The session began as an explanation and review of backward-graph capture and evolved into AI-written validation/reporting changes, student revisions to input handling, and diagnosis and correction of a transpose bug affecting gradient validation.
+
+2. CONTRIBUTION LOG
+
+The entries are chronological. Related follow-up explanations are grouped when they concern the same distinct contribution; those follow-ups are described explicitly.
+
+1) Investigated backward-graph CLI support.
+   Student request: Asked whether run_graph had an argument for backward graphs after a recent change.
+   Classification: Review/feedback; Explanation/concept.
+   Specifics: Inspected atalla-graph/run_graph.py, graph/backward.py, and tests/test_backward_graph.py. Reported that the CLI initially had no backward flag, while build_graph() accepted include_backward, example_target, and loss_fn. Supplied an executable-style Python example using an MSE target and gm(x.bfloat16(), target). Identified the then-present schedule and validation rejection guards.
+   Extent: Original local-code investigation and example; no code modification at this stage. The underlying capture API already existed.
+
+2) Explained argparse flag construction.
+   Student request: Asked what parser.add_argument("--strict-end", action="store_true", help=...) does.
+   Classification: Explanation/concept.
+   Specifics: Explained Boolean defaults, args.strict_end, hyphen-to-underscore conversion, adjacent help strings, --help output, and that help text itself does not implement numerical thresholds.
+   Extent: Explanation and command examples written from scratch; no repository edit.
+
+3) Explained placeholder renaming and parameter/buffer metadata.
+   Student request: Asked about the code that renames placeholders and annotates get_attr nodes.
+   Classification: Explanation/concept.
+   Specifics: Explained node.name versus node.target, the ordered x/target renaming, id()-to-name dictionaries from model.named_parameters()/named_buffers(), nested getattr resolution, and node.meta["parameter_name"] / ["buffer_name"]. Clarified that these annotations label tensors rather than change computations.
+   Extent: Original explanatory text based on the supplied code.
+
+4) Explained graph attribute names versus original model parameter names.
+   Student request: Asked whether generated FX names are disconnected from model.named_parameters() names.
+   Classification: Explanation/concept.
+   Specifics: Used an illustrative generated name such as _param_constant0 versus a model name such as layers.0.weight. Explained why the identity-based lookup can bridge the names and why it would fail if tracing copied the object.
+   Extent: Explanation and illustrative examples; not a claim that those example names were the exact names of every node.
+
+5) Audited consumers of parameter_name and buffer_name.
+   Student request: Asked whether later processing actually needs those fields.
+   Classification: Review/feedback.
+   Specifics: Searched the graph repository and found writes, documentation, and tests checking presence, but no downstream processing consumer. Explained that returned gradient dictionary keys came directly from named_params and did not depend on those fields.
+   Extent: Original code search and conclusion; no removal of the metadata code.
+
+6) Explained graph output extraction.
+   Student request: Asked about finding the output node and unpacking output.args[0].
+   Classification: Explanation/concept.
+   Specifics: Explained next(...), the FX output node, the captured return structure (prediction, loss, gradients), and the conventional use of _ for an unused value.
+   Extent: Explanation written from scratch.
+
+7) Explained ancestor traversal and stage labeling.
+   Student request: Asked what the nearby function does, without initially naming it.
+   Classification: Explanation/concept.
+   Specifics: Explicitly qualified that I was assuming the question meant ancestors(root). Explained pending as a traversal stack, found as a visited set, all_input_nodes, inclusion of the root itself, and how dependencies identify forward nodes.
+   Extent: Original explanation and a small dependency example; no implementation change.
+
+8) Reviewed the student's new --training run and rejected the inference that training was proven.
+   Student request: Reported cosine 1 and no missing-kernel errors after running --training, and asked whether existing kernels were sufficient.
+   Classification: Review/feedback; Explanation/concept.
+   Specifics: Inspected the student's additions to run_graph.py. Identified reference-result fallbacks after emit_node() returned None, the prediction-only final comparison, reuse of example_input for both placeholders, and absence of an optimizer update. Explained that matrix multiplication kernels can be reusable in backward graphs without establishing complete backward coverage.
+   Extent: Substantial original diagnosis; no training CLI implementation by me at this point.
+
+9) Explained the activation cache.
+   Student request: Asked what activation_cache is.
+   Classification: Explanation/concept.
+   Specifics: Explained the node-name-to-NumPy-array dictionary in run_validate(), how separately executed kernels exchange values through it, its inclusion of inputs and weights as well as activations, and how copying a reference result can mask an unsupported operation. Distinguished it from hardware cache or scratchpad memory.
+   Extent: Original explanatory text and a small dataflow example.
+
+10) Reviewed exception-based missing-kernel handling.
+    Student request: Asked whether making emit_node() raise instead of return None would fix silent fallback.
+    Classification: Review/feedback; Design/architecture decision.
+    Specifics: Inspected emit_node() and run_validate(). Suggested raising NotImplementedError in the validator's emission-is-None branch, and identified separate pre-emitter unknown-operation passthroughs and skip_emulator host paths that would remain.
+    Extent: Suggested code and design guidance. I did not implement comprehensive fallback rejection in this session.
+
+11) Explained and located the target-input and gradient-comparison gaps.
+    Student request: Asked what the two remaining validation problems meant, then asked where the target assignment occurred.
+    Classification: Explanation/concept; Review/feedback.
+    Specifics: Explained that a backward graph takes x and target but the original validator supplied only example_input. Located the actual placeholder loops in run_graph.py and codegen/dram_builder.py, including env[node.name] = example_input. Clarified that my earlier x = ... / target = ... snippet was illustrative, not literal source. Explained why comparing only prediction does not validate gradients.
+    Extent: Original diagnosis, exact code references, and clarification; no edit yet.
+
+12) Confirmed the current graph input contract.
+    Student request: Asked whether placeholders supply user-provided values and whether the only two values are the example input and expected output.
+    Classification: Explanation/concept.
+    Specifics: Explained caller-supplied x/target arguments, get_attr-stored weights and buffers, and the captured loss function. Distinguished the current two-input design from FX's general ability to have other signatures.
+    Extent: Original explanation.
+
+13) Implemented the first fix for distinct placeholder values.
+    Student request: Asked how to distinguish the example-input placeholder from the expected-output placeholder.
+    Classification: Code written; Code modified/debugged; Design/architecture decision.
+    Specifics: Modified run_graph.py to build named input bindings, populate activation_cache from node.target, preserve target dtype, and pass expected_output from main(). Modified codegen/dram_builder.py so extract_input_data() could accept either its old single tensor or a named input dictionary, with missing-input checking. Added tests/test_placeholder_inputs.py with four tests. Checked a captured BasicModule graph's reference loss and gradients against direct PyTorch execution.
+    Extent: Substantial AI-authored implementation and tests. The student had already added training and expected_output parameters to run_validate(); I connected and extended them rather than originating all of that interface. The dictionary-based extract_input_data() interface was later replaced by the student.
+
+14) Explained defensive input checks and the compatibility branch.
+    Student request: Questioned whether the single-placeholder check was necessary and what the tensor-versus-dictionary branch checked.
+    Classification: Explanation/concept; Review/feedback.
+    Specifics: Explained the current forward-only one-input assumption, missing-input detection, the zero-placeholder IndexError case, and that the compatibility branch existed for older single-tensor callers. Acknowledged that requiring explicit inputs could remove the generality.
+    Extent: Explanation of my own implementation; no additional implementation in these answers.
+
+15) Clarified extract_input_data()'s actual purpose.
+    Student request: Asked whether it initialized RAM, then asked what it did, then checked the placeholder dictionary lookup interpretation.
+    Classification: Explanation/concept.
+    Specifics: Explained that the function executes PyTorch graph operations in env and collects per-node NumPy reference answers in activations. It does not initialize emulator RAM. Confirmed that placeholders retrieve supplied values instead of executing a computation. Suggested collect_reference_activations() as a clearer name, but did not rename the function.
+    Extent: Repeated, progressively more concrete explanations; no file changes for the proposed function rename.
+
+16) Discussed misleading argument naming and an explicit two-input API.
+    Student request: Objected to example_input as the name of an argument that could also hold a dictionary and emphasized the current graph has only two external inputs.
+    Classification: Review/feedback; Design/architecture decision.
+    Specifics: Agreed that inputs would describe the general interface more accurately, but also agreed that explicit example_input/expected_output parameters were sufficient for the student's current design. Explained direct node.target == "x" versus == "target" selection and supplied an if/elif example.
+    Extent: Suggestions and example code. The student made the subsequent explicit-parameter rewrite.
+
+17) Reviewed the student's explicit-parameter rewrite.
+    Student request: Pasted the revised extract_input_data(gm, example_input, expected_output) and asked whether it worked.
+    Classification: Review/feedback; Explanation/concept.
+    Specifics: Read the modified file, verified a direct call using different input and target values, and demonstrated that run_validate's old dictionary call no longer matched the signature. Supplied the corrected call, explained Optional[T] versus a default of None, suggested a missing-target guard, and noted stale documentation/tests.
+    Extent: Concrete debugging and suggestions; the x/target branches in the student's pasted implementation were the student's code, informed by the prior discussion.
+
+18) Corrected reversed training branches and explained BF16 input requirements.
+    Student request: Proposed an if(training) call without a target and an else call with the target, then asked whether the target problem was finished and why BF16 was needed.
+    Classification: Review/feedback; Explanation/concept.
+    Specifics: Pointed out that the branches were reversed, supplied both the corrected conditional and the simpler unconditional three-argument call, and inspected the current code. Identified the need to convert example_input to BF16 because build_graph converts weights to BF16. Explained why the target can remain FP32 for the captured loss path.
+    Extent: Code suggestions and verification; the student performed visible edits between these exchanges. My assurances that the target fix was complete referred to the normal --training CLI path, not proof that all possible direct API calls worked.
+
+19) Explained dictionary metric access and the per-kernel print block.
+    Student request: Asked what km.get and the verbose reporting block do.
+    Classification: Explanation/concept.
+    Specifics: Explained dictionary get defaults versus KeyError, conditional formatting, the optional error string, slot efficiency, bytes loaded/stored, decimal formatting, and reporting versus pass/fail logic.
+    Extent: Original explanation; no edits.
+
+20) Explained _layer_compare_metrics() and epsilon.
+    Student request: Asked whether it compared PyTorch with simulation and what eps meant.
+    Classification: Explanation/concept; Review/feedback.
+    Specifics: Explained cosine, absolute errors, RMSE, relative L2, reference maximum, relative maximum, and division-by-zero avoidance. Identified that the then-current function flattened and truncated to the shorter array, potentially hiding shape or length mistakes.
+    Extent: Original explanation and identification of a weakness in existing code.
+
+21) Explained the three comparison call sites.
+    Student request: Asked why _layer_compare_metrics() was called in three places.
+    Classification: Review/feedback; Explanation/concept.
+    Specifics: Located the host-result branch, emulator-result branch, and final prediction comparison in run_graph.py. Explained that the first two are alternative per-node paths and that the third provides final prediction metrics and strict checks.
+    Extent: Original code inspection and explanation.
+
+22) Implemented the first loss-and-gradient final summary.
+    Student request: Suggested comparing prediction, loss, and every weight gradient while printing only the gradient with the worst cosine.
+    Classification: Code written; Code modified/debugged; Design/architecture decision; Writing edited.
+    Specifics: Added _compare_training_outputs() and _training_fail_reasons() in run_graph.py; compared every returned named gradient, retained metrics in JSON, printed scalar loss values and one worst-gradient row, and extended --strict-end to loss and all gradients. Added missing/shape/non-finite handling, special zero/tiny-gradient cosine handling, and unused-gradient reporting. Added tests/test_training_metrics.py, updated the earlier placeholder tests for the student's explicit API, added a missing-target guard and corrected the extractor docstring, and updated README.md and CLI help.
+    Extent: Substantial AI-authored implementation, tests, and documentation, including extra strict-validation behavior beyond the student's proposed console summary. Ten focused tests and a direct captured-graph check passed at that stage. The student subsequently rejected the helper organization as too complicated.
+
+23) Explained the first training-summary control flow.
+    Student request: Asked what initialization, backward-graph detection, training comparison, failure collection, and extend() did.
+    Classification: Explanation/concept.
+    Specifics: Explained the code I had just introduced, including chained strict checking, numerical thresholds, and collection of descriptive failure messages.
+    Extent: Explanation of AI-authored code.
+
+24) Refactored reporting according to the student's simpler design.
+    Student request: Called the code spaghetti, explicitly rejected _compare_training_outputs(), and requested _compare_gradients() reusing _layer_compare_metrics() for every comparison.
+    Classification: Code modified/debugged; Design/architecture decision.
+    Specifics: Removed _compare_training_outputs() and _training_fail_reasons(). Added the small _compare_gradients() loop returning all metrics and the lowest-cosine row. Used direct _layer_compare_metrics() calls for final prediction and loss, consolidated strict threshold checking into one comparisons loop, and removed redundant training-failure/status structures. Moved zero/tiny-vector cosine behavior and shape/non-finite checks into shared metric code. Updated tests to cover the simpler interface, all-unused gradients, and independent loss/gradient failures.
+    Extent: Substantial AI-written refactor implementing the student's architecture decision. Eleven focused tests passed. I also corrected a target-passing branch during this refactor; versions of that branch differed again in subsequent file reads.
+
+25) Explained the cosine change and shared strict-check loop.
+    Student request: Asked why _cos_sim() changed and what the comparisons loop did.
+    Classification: Explanation/concept.
+    Specifics: Explained epsilon distortion for tiny gradients, the reporting convention for zero vectors, normalization before dot product, clipping to [-1, 1], removal of silent truncation, and strict checks for output/loss/gradients. Explained why scalar-loss cosine is skipped in strict checking.
+    Extent: Original explanation of implementation decisions I had made.
+
+26) Explained the printed loss fields and an exact loss match.
+    Student request: Asked whether the result was raw PyTorch MSE, what every field meant, and whether identical displayed losses meant equality.
+    Classification: Explanation/concept.
+    Specifics: Distinguished the cache's computed loss from the PyTorch reference, defined every printed error metric, explained redundancy for scalar loss and significant-digit formatting, and warned that reference fallback could make equality automatic.
+    Extent: Original explanation and numerical example; no edit.
+
+27) Interpreted the inaccurate gradient and misleading relaxed pass.
+    Student request: Asked whether cosine 0.009388 and relative L2 1.40756 meant at least one gradient was inaccurate.
+    Classification: Review/feedback; Explanation/concept.
+    Specifics: Explained the near-perpendicular direction, approximately 141% relative L2 error and 144% relative maximum error, and that RELAXED PASS used prediction cosine rather than a training verdict. Recommended --strict-end without claiming the failing kernel was already identified.
+    Extent: Original interpretation of the student's output.
+
+28) Added --all-gradient-losses.
+    Student request: Requested a flag to print metrics for every calculated gradient.
+    Classification: Code written; Code modified/debugged; Writing edited.
+    Specifics: Added the Boolean CLI flag, all_gradient_losses argument to run_validate(), main() forwarding, shared printing for either all gradients or only the worst, and explicit unused rows. Updated README.md and extended reporting tests for flag-on/flag-off scenarios. Verified --help and seven focused tests.
+    Extent: AI-authored feature and test/documentation updates. At this point I set training=True in the synthetic integration test to match the CLI path instead of repairing the student's restored training-flag-only reference branch as part of this flag change.
+
+29) Explained output.weight and the model architecture.
+    Student request: Asked what output.weight's gradient was, whether it was a scalar multiplier, and why the presumed residual MLP had another linear layer.
+    Classification: Explanation/concept; Review/feedback.
+    Specifics: Inspected model/basic.py. Explained that output.weight is a 32-by-32 final-layer matrix, its gradient is another matrix, and cosine is a scalar summary. Wrote the exact depth=2 computation with two ReLU blocks, a 0.5*h1 residual addition on the second block, and a final nn.Linear matrix multiply plus bias. Explained that nn.Linear packages the same affine operation as the manually implemented earlier layers and does not make the whole network linear.
+    Extent: Original explanation and equations based on pre-existing student/project model code; I did not add that final layer or author BasicModule in this session.
+
+30) Mapped the reported parameter names to layers.
+    Student request: Asked whether weights.0/biases.0, weights.1/biases.1, and output.weight/output.bias corresponded to the first, second, and final layers.
+    Classification: Explanation/concept.
+    Specifics: Confirmed the mapping in a table and emphasized that rows compare parameter gradients, not the parameter values. Repeated that exact rows could still involve reference fallbacks.
+    Extent: Explanation written from scratch.
+
+31) Diagnosed the specific output.weight failure from the attached log.
+    Student request: Supplied a complete run log in an attached Pasted text.txt and asked why output.weight failed specifically.
+    Classification: Code modified/debugged (diagnosis only); Review/feedback.
+    Specifics: Read the attachment and inspected transpose handling, emit_matmul(), lowering, and graph dependencies. Recreated the seeded basic graph and showed that comparing the correct gradient against its transpose reproduced the exact reported cosine, maximum absolute error, and relative L2 error. Traced mm_3 -> t_1 -> transpose_1 and showed that one transpose was incorrectly treated as reshape because aten.t has one argument. Identified the same issue at t_2/t_4 feeding mm_4/mm_6 and explained why later reference fallbacks masked errors in other parameter gradients.
+    Extent: Substantial original debugging with numerical reproduction; no edit in that answer.
+
+32) Applied an initial evaluator-side transpose fix.
+    Student request: Explicitly asked me to fix the bug.
+    Classification: Code modified/debugged; Code written.
+    Specifics: Modified run_validate() to handle one-argument transpose nodes using data.T and explicit-dimension nodes through the existing resolver. Added tests/test_transpose_validation.py covering scalars, vectors, square/rectangular matrices, a row vector, and a higher-rank explicit axis swap. The focused transpose test passed. Started the full basic training validation.
+    Extent: AI-authored targeted fix and regression test. The student interrupted while I was collecting the full run's remaining output. I did not claim that interrupted run had completed successfully.
+
+33) Paused and explained normalization metadata and transpose semantics.
+    Student request: Asked to wait before fixing and questioned atalla_op's meaning, the original transpose branch, and dimension arguments.
+    Classification: Explanation/concept; Other (pause/status disclosure).
+    Specifics: Explained that normalize_ops() labels operations without necessarily rewriting their original target/arguments, that aten.t and aten.transpose.int both mapped to "transpose," and that dim0/dim1 identify axes rather than sizes. Explained reshape versus element rearrangement with matrix and rank-three examples. Disclosed that the small edit had already been applied before interruption and paused further work. The old evaluator branch was present again when later inspected; I cannot establish from the conversation alone exactly how it was restored.
+    Extent: Explanation and transparent status reporting; no additional change while answering these questions.
+
+34) Implemented the student's normalization-stage solution and verified it.
+    Student request: Proposed normalizing aten.t into a three-argument transpose in normalize_ops(), rather than special-casing it downstream.
+    Classification: Code modified/debugged; Design/architecture decision.
+    Specifics: Agreed with the student's placement decision. Modified graph/fx_capture.py so aten.t.default becomes aten.transpose.int with explicit axes: (input, 0, 1) for matrices and (input, 0, 0) for vectors/scalars. Added shape/rank checks, preserved graph execution semantics, and added scalar handling to _resolve_transpose() in run_graph.py. Updated the regression test to normalize first and check the rewritten target, three arguments, metadata, PyTorch behavior, and validator behavior.
+    Extent: AI-authored implementation of the student's design, replacing the need for the earlier one-argument evaluator special case. Transpose tests and seven training-metric tests passed. A full seeded basic CLI run printed zero errors for all six gradients and corrected mm_4/mm_6 results, but hit an existing Windows encoding error while printing the strict PASS symbol. A quiet rerun completed with exit code 0, wrote metrics JSON, and was checked programmatically for strict_pass=True and zero maximum absolute error for all six gradients. This did not remove reference fallbacks or prove full training-kernel coverage.
+
+35) Wrote this usage report.
+    Student request: Requested a dated AI-Usage-Report file in atalla-models with a full, candid contribution accounting in the specified structure.
+    Classification: Writing/text drafted; Other (local artifact creation).
+    Specifics: Created atalla-models/AI-Usage-Report with the date, visible-context disclosure, chronological contributions, student authorship, adoption limits, errors, and an estimated division of authorship.
+    Extent: Report prose drafted entirely by AI. The student supplied the reporting prompt, required structure, and accuracy rules; the student did not write the report prose in the visible conversation.
+
+3. STUDENT CONTRIBUTIONS VISIBLE IN THIS SESSION
+
+- Added the initial --training CLI flag, arranged the basic model loader to return a random expected output as well as the input, and connected include_backward=True with nn.MSELoss() in main(). Repository diffs visible before my implementation showed these changes, plus removal of run_validate's backward-graph rejection guard. The student also added training and expected_output parameters to run_validate() before I connected my first input-binding fix. These changes are not attributed to me.
+- Ran the training validation repeatedly and supplied console results, including the initially perfect prediction cosine, the inaccurate output.weight gradient, the all-gradient printout, and the full attached log used to isolate the transpose failure.
+- Challenged the complexity of the dictionary-compatible input interface, asked why its defensive checks were needed, and chose an explicit extract_input_data(gm, example_input, expected_output) interface for the current two-input design.
+- Personally edited and pasted the explicit x/target placeholder branches, then revised callers and the optional target default during discussion. My examples and review informed these changes, so this was assisted student implementation rather than wholly independent authorship.
+- Caught the misleading example_input argument name when my version could accept an input dictionary, and questioned whether parameter/buffer metadata had actual downstream consumers.
+- Correctly insisted that final prediction accuracy alone did not supply the desired training report and proposed reporting the worst gradient to avoid an overly long summary.
+- Explicitly rejected my _compare_training_outputs() organization as spaghetti and specified the replacement architecture: _compare_gradients() plus reuse of _layer_compare_metrics() for output, loss, and every gradient.
+- Requested the --all-gradient-losses feature and identified that the displayed output.weight metrics indicated a serious problem despite RELAXED PASS.
+- Paused the first transpose patch to understand the mapping and proposed the final architecture of canonicalizing aten.t in normalize_ops(). This placement decision was the student's, and I implemented it.
+- Supplied the course-report instructions and required that my role not be minimized. The many questions about FX, gradients, linear layers, metrics, and transpose axes were the student's learning and review activity, not evidence that they independently authored all the associated implementation.
+
+The student's pre-existing repository work is substantial but outside the authorship evidence of this conversation. BasicModule, the compiler/emulator, existing kernels, and backward capture were already present. I do not assign their creation to either party based only on this session.
+
+4. ADOPTION UNCERTAINTY
+
+Observed or apparently adopted:
+- The student reported running their --training path, and I saw the corresponding source changes.
+- I directly wrote the target-binding, reporting, testing, documentation, and normalization changes described above into the shared workspace. Those edits were observable, but an edit existing locally is not evidence that it was committed, submitted, or retained permanently.
+- The student quoted and questioned my reporting code, then supplied outputs from --all-gradient-losses, showing use of the AI-added reporting feature.
+- The final normalization implementation was present and exercised in my local verification. The resulting JSON showed all six basic-model gradients matching the reference and strict_pass=True for that test input.
+
+Rejected, modified, interrupted, or superseded:
+- The student replaced my dictionary-compatible extract_input_data() API with explicit input and target arguments.
+- The student rejected my original training comparison/failure helper organization, and I replaced it with the requested simpler gradient loop and shared metrics.
+- The first evaluator-side transpose fix was interrupted for discussion and superseded by the student's normalization-stage design. The original evaluator branch reappeared in later reads; I cannot infer the exact editing action that restored it.
+- Some suggested cleanups, such as renaming extract_input_data() to collect_reference_activations(), were discussed but not implemented.
+
+Unknown or incomplete outcomes:
+- I cannot see what the student does with this output after the session, including final code edits, commits, sprint submission, grading, or report adoption.
+- Comprehensive rejection of missing kernels/reference fallbacks was suggested but not implemented by me. The last inspected validator still allowed fallback values. Matching final metrics therefore do not establish complete accelerator execution.
+- No optimizer update or real training loop was implemented here; the visible work concerns capture, single-run execution, and validation/reporting.
+- The latest inspected reference-extraction branch depended on training=True, whereas some earlier logic also recognized gm.meta['include_backward']. The normal CLI supplies training=True, and that was the tested path. General direct run_validate() calls with only backward metadata were not established as correct in the final version.
+- The entire old backward-capture test suite was not certified as passing. The student's loader changes and disabled model choices made some old assumptions stale. I ran focused tests appropriate to my changes and the described basic CLI validation.
+
+5. ERRORS AND CORRECTIONS
+
+1) Unnecessary complexity introduced by me.
+   My first input API supported both a tensor and a dictionary; my first training summary introduced nested comparison/status logic and separate failure helpers. Those were design choices I made, not requirements the student imposed. The student challenged the input generality and explicitly called the reporting structure spaghetti. The student simplified the input interface, and I refactored the reporting architecture as requested.
+
+2) Illustrative code initially mistaken for literal code.
+   I described the target bug with x = example_input and target = example_input. The source actually implemented this effect through placeholder loops. When the student could not find the quoted assignments, I explicitly clarified that the earlier snippet was illustrative and pointed to the real lines. My initial presentation could have been clearer.
+
+3) Compatibility work required after the student's API rewrite.
+   Once the student switched extract_input_data() to explicit arguments, existing dictionary-based callers and my earlier tests were incompatible. I demonstrated the missing-argument error, supplied the corrected caller, later updated the tests, corrected the stale docstring, and added a missing-target guard. The original dictionary implementation itself had passed its focused tests; the incompatibility followed the changed contract.
+
+4) Input dtype and branch inconsistencies.
+   I identified FP32 inputs being passed to a BF16 graph and explained the required conversion. The student's proposed reversed training branch was caught by me before endorsement. During later testing, a training-flag-only reference branch failed when a synthetic backward graph used metadata but training defaulted to False; I temporarily replaced it with an unconditional target-passing call. That branch was later visible again, and during the all-gradient flag work I made the integration test use training=True to match the CLI rather than claim the more general direct API case was fixed. My earlier statements that the target fix was complete should be read as limited to the normal CLI path.
+
+5) Reporting could still imply a broader pass than was justified.
+   The existing RELAXED PASS message checks prediction cosine only. I retained that message while adding gradient summaries, so the output could show a badly wrong gradient followed by PASS. I explained this limitation when the student raised it, and --strict-end checks were extended to all gradients and loss. I did not rename the relaxed message or make it an overall training verdict.
+
+6) Initial scope of the transpose fix was revised by the student.
+   My first fix handled aten.t inside the validator. It passed the focused transpose test, but it put knowledge of multiple PyTorch forms downstream. The student interrupted and proposed normalization earlier in the pipeline. I adopted that placement. I do not describe the first patch as a proven numerical failure; it was a superseded design choice.
+
+7) Local investigation and command mistakes.
+   An initial broad file search encountered access-denied errors for restricted workspace directories; their contents were not read. Some diagnostic reads used an incorrect working directory and failed to find files. A regex quoting attempt missed intended matches, and two Python smoke-test command strings failed with SyntaxError because of shell quoting. I corrected these by using more precise searches/paths and PowerShell here-string input. These were my tooling errors, not student errors; the failed commands did not establish validation success.
+
+8) Failed/interrupted full-run output.
+   The first evaluator-fix validation was interrupted before I received completion. In the later normalization verification, all reported gradients matched but the command exited with a UnicodeEncodeError when the existing strict PASS text containing a comparison symbol was written through Windows cp1252 output. I disclosed the failure and reran with --quiet. The quiet run exited successfully and its JSON was checked. I did not fix the console-encoding issue in this session.
+
+9) Remaining validation limitations.
+   Several seemingly perfect gradients and the loss were fed by reference fallbacks. I repeatedly disclosed that fact, including after successful strict checking. Neither the initial cosine-1 result nor the final matching basic-model run was claimed as proof of complete training support. The final normalization fix demonstrably corrected the identified transpose error, but fallback removal, full mixed-dtype backward kernels, general model coverage, and optimizer updates remain outside completed work.
+
+6. SUMMARY
+
+The AI was an active coding and debugging contributor, not merely a proofreading or syntax-help tool: it wrote substantial input-validation, metric-reporting, testing, and documentation code, added the all-gradient CLI option, and numerically isolated the transpose bug. The student added the initial training CLI plumbing, rewrote the input API, ran experiments, challenged and simplified AI-generated designs, and proposed the final normalization-stage solution. As a rough estimate by volume of new or changed code, tests, and documentation produced during the visible session, about 85% originated as AI-written text/code and about 15% as student-written changes; this is a judgment rather than measured line attribution, and it excludes the pre-existing project. The student's design and review contributions were more significant than that volume estimate alone conveys, while this report's prose was entirely AI-drafted. The final basic-model check passed with all six gradients matching, but remaining reference fallbacks mean the session did not establish complete emulator training support.
+
+POST-REPORT ALTERATION REQUESTS
+
+None at the time this report was created. If the student later requests that this report be altered, shortened, or have material omitted, that request should be recorded here rather than silently removed from the accounting.

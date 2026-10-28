@@ -135,10 +135,10 @@ def _read_bf16(mem: Memory, addr: int, count: int) -> np.ndarray:
 
 def _cos_sim(a: np.ndarray, b: np.ndarray) -> float:
     af, bf = a.flatten(), b.flatten()
-    n = min(len(af), len(bf))
-    af, bf = af[:n], bf[:n]
-    d = np.dot(af, bf)
-    return float(d / (np.linalg.norm(af) * np.linalg.norm(bf) + 1e-12))
+    an, bn = np.linalg.norm(af), np.linalg.norm(bf)
+    if an == 0 or bn == 0:
+        return 1.0 if an == bn == 0 else 0.0
+    return float(np.clip(np.dot(af / an, bf / bn), -1.0, 1.0))
 
 
 def _nz_count(a: np.ndarray, eps: float = 1e-8) -> int:
@@ -158,9 +158,14 @@ def _layer_compare_metrics(
     ref: np.ndarray, result: np.ndarray, eps: float = 1e-12
 ) -> Dict[str, float]:
     """Compare ref vs result: cos (direction-only), abs errors, rel ℓ₂, rel max error."""
-    rf = np.asarray(ref, dtype=np.float64).flatten()
-    ef = np.asarray(result, dtype=np.float64).flatten()
-    n = min(len(rf), len(ef))
+    rf = np.asarray(ref, dtype=np.float64)
+    ef = np.asarray(result, dtype=np.float64)
+    if rf.shape != ef.shape:
+        raise ValueError(f"Comparison shape mismatch: ref={rf.shape}, result={ef.shape}")
+    if not np.all(np.isfinite(rf)) or not np.all(np.isfinite(ef)):
+        raise ValueError("Cannot compare non-finite reference or computed values")
+    rf, ef = rf.flatten(), ef.flatten()
+    n = len(rf)
     if n == 0:
         return {
             "cos_sim": 1.0,
@@ -171,17 +176,13 @@ def _layer_compare_metrics(
             "ref_max_abs": 0.0,
             "rel_max_abs_error": 0.0,
         }
-    rf, ef = rf[:n], ef[:n]
     diff = ef - rf
     ref_norm = float(np.linalg.norm(rf))
     err_norm = float(np.linalg.norm(diff))
     ref_max_abs = float(np.max(np.abs(rf)))
     max_abs = float(np.max(np.abs(diff)))
     return {
-        "cos_sim": _cos_sim(
-            rf.astype(np.float32, copy=False),
-            ef.astype(np.float32, copy=False),
-        ),
+        "cos_sim": _cos_sim(rf, ef),
         "max_abs_error": max_abs,
         "mean_abs_error": float(np.mean(np.abs(diff))),
         "rmse": float(np.sqrt(np.mean(diff * diff))),
@@ -189,6 +190,21 @@ def _layer_compare_metrics(
         "ref_max_abs": ref_max_abs,
         "rel_max_abs_error": float(max_abs / (ref_max_abs + eps)),
     }
+
+
+def _compare_gradients(gradient_nodes: Dict, references: Dict, results: Dict) -> tuple:
+    """Compare each used gradient and return all metrics plus the worst cosine."""
+    gradient_metrics = {}
+    worst = None
+    for name, node in gradient_nodes.items():
+        if node is None:  # Unused trainable parameter.
+            gradient_metrics[name] = None
+            continue
+        metrics = _layer_compare_metrics(references[node.name], results[node.name])
+        gradient_metrics[name] = metrics
+        if worst is None or metrics["cos_sim"] < worst["cos_sim"]:
+            worst = {"name": name, **metrics}
+    return gradient_metrics, worst
 
 
 def _aggregate_kernel_metrics(kernel_metrics: list) -> Dict:
@@ -350,6 +366,9 @@ def run_validate(
     out_dir: str,
     verbose: bool = True,
     *,
+    training: bool = False,
+    expected_output: Optional[torch.Tensor] = None,
+    all_gradient_losses: bool = False,
     kernel_bundle_dir: Optional[str] = None,
     kernel_bundle_ops: Optional[FrozenSet[str]] = None,
     metrics_json_path: Optional[str] = None,
@@ -361,6 +380,10 @@ def run_validate(
     strict_max_relmax: float = 0.05,
 ) -> Dict:
     """Per-node compile → emulate → compare vs PyTorch golden.
+
+    ``expected_output`` supplies the ``target`` placeholder for backward graphs;
+    its dtype is preserved. The model input is converted to BF16 as before.
+    ``all_gradient_losses`` prints every gradient's metrics instead of only the worst.
 
     ``validate_inputs``:
       * ``chained`` — each layer consumes the previous layer's emulator output
@@ -380,23 +403,34 @@ def run_validate(
     into a subdirectory.
 
     If *strict_end_to_end* is true and *validate_inputs* is *chained*, the
-    result includes *strict_fail_reasons* when the final output violates
+    result includes *strict_fail_reasons* when the prediction, loss, or a gradient violates
     *strict_min_cos* / *strict_max_rel_l2* / *strict_max_relmax* (defaults for
     a meaningful E2E error bar, not direction-only cos).
     """
-    if gm.meta.get("include_backward"):
-        raise NotImplementedError(
-            "Backward graphs require target inputs and gradient validation support; "
-            "run gm(x.bfloat16(), target) for the PyTorch reference."
-        )
     if validate_inputs not in ("chained", "oracle"):
         raise ValueError("validate_inputs must be 'chained' or 'oracle'")
+    if training or gm.meta.get("include_backward"):
+        if expected_output is None:
+            raise ValueError("Backward validation requires expected_output for target")
+        placeholder_inputs = {
+            "x": example_input.bfloat16(),
+            "target": expected_output,
+        }
+    else:
+        placeholders = [n for n in gm.graph.nodes if n.op == "placeholder"]
+        if len(placeholders) != 1:
+            raise ValueError("Forward validation requires exactly one input placeholder")
+        placeholder_inputs = {placeholders[0].target: example_input.bfloat16()}
     t0 = time.time()
     os.makedirs(out_dir, exist_ok=True)
     bundle_ops = kernel_bundle_ops or DEFAULT_KERNEL_BUNDLE_OPS
     bundle_exported: Optional[Set[str]] = set() if kernel_bundle_dir else None
 
-    ref_activations = extract_input_data(gm, example_input.bfloat16())
+    if (training):
+        ref_activations = extract_input_data(gm, example_input.bfloat16(), expected_output)
+    else:
+        ref_activations = extract_input_data(gm, example_input.bfloat16())
+
     activation_cache: Dict[str, np.ndarray] = {}
 
     stats = {"total": 0, "emulated": 0, "numpy": 0, "passthrough": 0}
@@ -435,9 +469,10 @@ def run_validate(
         stats["total"] += 1
 
         if node.op == "placeholder":
-            activation_cache[node.name] = (
-                example_input.detach().bfloat16().float().cpu().numpy()
-            )
+            value = placeholder_inputs[node.target].detach().cpu()
+            if value.dtype == torch.bfloat16:
+                value = value.float()  # NumPy cannot represent BF16 directly.
+            activation_cache[node.name] = value.numpy().copy()
             if verbose:
                 print(f"  [{node.name}] placeholder")
             continue
@@ -672,26 +707,13 @@ def run_validate(
     aggregate_metrics = _aggregate_kernel_metrics(kernel_metrics)
 
     end_to_end: Optional[Dict] = None
-    strict_fail_reasons: list = []
+    training_metrics = None
+    comparisons = {}
     if emu_out is not None and ref_out is not None:
         end_cmp = _layer_compare_metrics(ref_out, emu_out)
         end_to_end = end_cmp
+        comparisons["Output"] = end_cmp
         cos = end_cmp["cos_sim"]
-        rl2 = end_cmp["rel_l2_error"]
-        rmx = end_cmp["rel_max_abs_error"]
-        if strict_end_to_end and validate_inputs == "chained":
-            if cos < strict_min_cos:
-                strict_fail_reasons.append(
-                    f"cos {cos:.6f} < {strict_min_cos} (min)"
-                )
-            if rl2 > strict_max_rel_l2:
-                strict_fail_reasons.append(
-                    f"rel_l2 {rl2:.6f} > {strict_max_rel_l2} (max)"
-                )
-            if rmx > strict_max_relmax:
-                strict_fail_reasons.append(
-                    f"relmax {rmx:.6f} > {strict_max_relmax} (max)"
-                )
         if verbose:
             print(f"  Output: emu={emu_out.shape} ref={ref_out.shape}")
             print(
@@ -699,6 +721,66 @@ def run_validate(
                 f"relmax={end_cmp['rel_max_abs_error']:.6f}  "
                 f"rmse={end_cmp['rmse']:.6f}  rel_l2={end_cmp['rel_l2_error']:.6f}"
             )
+
+    if gm.meta.get("include_backward"):
+        _, loss_node, gradient_nodes = output_node.args[0]
+        ref_loss = ref_activations[loss_node.name]
+        result_loss = activation_cache[loss_node.name]
+        loss_metrics = _layer_compare_metrics(ref_loss, result_loss)
+        gradients, worst = _compare_gradients(
+            gradient_nodes, ref_activations, activation_cache
+        )
+        comparisons["Loss"] = loss_metrics
+        comparisons.update({f"Gradient {name}": metrics
+                            for name, metrics in gradients.items() if metrics is not None})
+        training_metrics = {
+            "loss": {"reference": float(np.asarray(ref_loss).item()),
+                     "result": float(np.asarray(result_loss).item()), **loss_metrics},
+            "gradients": gradients,
+            "worst_gradient": worst,
+        }
+        if verbose:
+            print(
+                f"  Loss: result={training_metrics['loss']['result']:.8g} "
+                f"ref={training_metrics['loss']['reference']:.8g}, "
+                f"abs_error={loss_metrics['max_abs_error']:.6g}, "
+                f"rmse={loss_metrics['rmse']:.6g}, rel_l2={loss_metrics['rel_l2_error']:.6g}, "
+                f"relmax={loss_metrics['rel_max_abs_error']:.6g}"
+            )
+            unused = sum(metrics is None for metrics in gradients.values())
+            print(f"  Gradients: {len(gradients) - unused} compared, {unused} unused")
+            reported_gradients = {}
+            if all_gradient_losses:
+                reported_gradients = gradients
+            elif worst is not None:
+                reported_gradients = {worst["name"]: worst}
+            for name, metrics in reported_gradients.items():
+                if metrics is None:
+                    print(f"  Gradient: {name}, unused")
+                    continue
+                label = "Gradient" if all_gradient_losses else "Worst gradient (lowest cosine)"
+                print(
+                    f"  {label}: {name}, "
+                    f"cos={metrics['cos_sim']:.6f}, max_abs={metrics['max_abs_error']:.6g}, "
+                    f"rmse={metrics['rmse']:.6g}, rel_l2={metrics['rel_l2_error']:.6g}, "
+                    f"relmax={metrics['rel_max_abs_error']:.6g}"
+                )
+
+    strict_fail_reasons = []
+    if strict_end_to_end and validate_inputs == "chained":
+        if end_to_end is None:
+            strict_fail_reasons.append("missing reference or emulator output for strict check")
+        for label, metrics in comparisons.items():
+            # Scalar-loss cosine says little; check its magnitude errors instead.
+            if label != "Loss" and metrics["cos_sim"] < strict_min_cos:
+                strict_fail_reasons.append(f"{label}: cos {metrics['cos_sim']:.6f} < {strict_min_cos}")
+            if metrics["rel_l2_error"] > strict_max_rel_l2:
+                strict_fail_reasons.append(f"{label}: rel_l2 {metrics['rel_l2_error']:.6f} > {strict_max_rel_l2}")
+            if metrics["rel_max_abs_error"] > strict_max_relmax:
+                strict_fail_reasons.append(f"{label}: relmax {metrics['rel_max_abs_error']:.6f} > {strict_max_relmax}")
+
+    if verbose:
+        if end_to_end is not None:
             if strict_end_to_end and validate_inputs == "chained":
                 if strict_fail_reasons:
                     print(
@@ -727,8 +809,6 @@ def run_validate(
                     "emulated op, so the last add can be exact even when matmul "
                     "outputs vs ref are poor."
                 )
-    elif strict_end_to_end and validate_inputs == "chained":
-        strict_fail_reasons.append("missing reference or emulator output for strict check")
 
     if verbose:
         am = aggregate_metrics
@@ -749,6 +829,7 @@ def run_validate(
         "emulator_output": emu_out,
         "reference_output": ref_out,
         "end_to_end": end_to_end,
+        "training_metrics": training_metrics,
         "strict_end_to_end": bool(strict_end_to_end),
         "strict_pass": (
             (not strict_fail_reasons) if (strict_end_to_end and validate_inputs == "chained")
@@ -766,6 +847,10 @@ def run_validate(
             "kernel_metrics": kernel_metrics,
             "stats": stats,
             "elapsed_s": elapsed,
+            "end_to_end": end_to_end,
+            "training_metrics": training_metrics,
+            "strict_pass": out["strict_pass"],
+            "strict_fail_reasons": strict_fail_reasons,
         }
         Path(metrics_json_path).write_text(json.dumps(blob, indent=2) + "\n")
         if verbose:
@@ -785,6 +870,8 @@ def run_validate(
 
 def _resolve_transpose(ndim: int, args) -> tuple:
     """Convert transpose method args (dim0, dim1) to numpy axes tuple."""
+    if ndim == 0:
+        return ()  # A scalar transpose has no axes to permute.
     if len(args) >= 2:
         d0, d1 = int(args[0]), int(args[1])
         if d0 < 0:
@@ -802,18 +889,18 @@ def _resolve_transpose(ndim: int, args) -> tuple:
 def load_model(name: str, scale: float = 0.01):
     if name == "basic":
         from model.basic import BasicModule
-        return BasicModule(dim=32, depth=2), torch.randn(1, 32)
-    elif name == "alexnet_small":
-        from model.alexnet_small import AlexNetSmall
-        return AlexNetSmall(scale=scale, num_classes=10), torch.randn(1, 3, 32, 32)
-    elif name == "layernorm_smoke":
-        from model.layernorm_smoke import LayerNormSmoke
-        return LayerNormSmoke(dim=32), torch.randn(1, 32)
-    elif name == "vit_micro":
-        from model.vit_micro import ViTMicro
-        # n_tokens=dim=32 matches kernels/flash_sdpa_n32d32.c (fused attention on emulator).
-        m = ViTMicro(dim=32, n_tokens=32)
-        return m, torch.randn(1, 32, 32)
+        return BasicModule(dim=32, depth=2), torch.randn(1, 32), torch.randn(1,32)  # For now, we are only returning expected output for basic module
+    # elif name == "alexnet_small":
+    #     from model.alexnet_small import AlexNetSmall
+    #     return AlexNetSmall(scale=scale, num_classes=10), torch.randn(1, 3, 32, 32)
+    # elif name == "layernorm_smoke":
+    #     from model.layernorm_smoke import LayerNormSmoke
+    #     return LayerNormSmoke(dim=32), torch.randn(1, 32)
+    # elif name == "vit_micro":
+    #     from model.vit_micro import ViTMicro
+    #     # n_tokens=dim=32 matches kernels/flash_sdpa_n32d32.c (fused attention on emulator).
+    #     m = ViTMicro(dim=32, n_tokens=32)
+    #     return m, torch.randn(1, 32, 32)
     else:
         raise ValueError(f"Unknown model: {name}")
 
@@ -866,19 +953,38 @@ def main():
         "--strict-end",
         action="store_true",
         help=(
-            "Chained-validate: exit non-zero if final cos < 0.999, rel_l2 > 0.02, "
-            "or relmax > 0.05. Use for paper-style E2E; relaxed PASS only without this."
+            "Chained-validate: require prediction/gradient cos >= 0.999 and "
+            "prediction/loss/gradient rel_l2 <= 0.02, relmax <= 0.05. "
+            "Missing or invalid training outputs also fail."
         ),
+    )
+    parser.add_argument(
+            "--training",
+            action="store_true",
+            help=(
+                "Generates backpropagation graph/code"
+            ),
+        )
+    parser.add_argument(
+        "--all-gradient-losses",
+        action="store_true",
+        help="During training validation, print metrics for every parameter gradient instead of only the worst.",
     )
     args = parser.parse_args()
 
     torch.manual_seed(42)
     np.random.seed(42)
 
-    model, example_input = load_model(args.model, args.scale)
+    # Right now, example_input and expected_output are just pytorch random tensors. However, eventually we want to have a real expected input
+    # and expected output function so we can do real training
+    model, example_input, expected_output = load_model(args.model, args.scale)
     verbose = not args.quiet
 
-    gm = build_graph(model, example_input, verbose=verbose)
+    if (args.training):
+        gm = build_graph(model, example_input, verbose=verbose,
+            include_backward=args.training, example_target=expected_output, loss_fn=nn.MSELoss())
+    else:
+        gm = build_graph(model, example_input, verbose=verbose)
 
     vout: Optional[Dict] = None
     if args.mode in ("validate", "both"):
@@ -893,6 +999,9 @@ def main():
             layer_metrics_csv_path=args.layer_metrics_csv,
             validate_inputs=args.validate_inputs,
             strict_end_to_end=bool(args.strict_end),
+            training=args.training,
+            expected_output=expected_output if args.training else None,
+            all_gradient_losses=args.all_gradient_losses,
         )
     if vout and vout.get("strict_pass") is False:
         sys.exit(1)

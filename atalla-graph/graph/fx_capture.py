@@ -108,11 +108,20 @@ def _get_module(gm: GraphModule, target: str) -> nn.Module:
 
 
 def normalize_ops(gm: GraphModule) -> GraphModule:
-    """Tag every node with node.meta['atalla_op'] identifying the Atalla primitive."""
+    """Canonicalize operations and tag each node with its Atalla primitive."""
     for node in gm.graph.nodes:
         op_name = None
 
         if node.op == "call_function":
+            if node.target == torch.ops.aten.t.default:
+                shape = get_node_shape(node.args[0])
+                if shape is None:
+                    raise ValueError("aten.t normalization requires shape propagation first")
+                if len(shape) > 2:
+                    raise ValueError("aten.t only supports tensors with at most two dimensions")
+                # t() swaps matrix axes, but is an identity for vectors/scalars.
+                node.target = torch.ops.aten.transpose.int
+                node.args = (node.args[0], 0, 1 if len(shape) == 2 else 0)
             op_name = _OP_MAP.get(node.target)
             if op_name is None and isinstance(node.target, torch._ops.OpOverload):
                 # Preserve the exact operator/overload for kernels not implemented

@@ -7,7 +7,7 @@ by the Atalla emulator.
 from __future__ import annotations
 
 import struct
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 import numpy as np
 import torch
@@ -60,15 +60,22 @@ def extract_weights(gm: GraphModule) -> Dict[str, torch.Tensor]:
 def extract_input_data(
     gm: GraphModule,
     example_input: torch.Tensor,
+    expected_output: Optional[torch.Tensor] = None
 ) -> Dict[str, np.ndarray]:
-    """Run the real PyTorch model to get intermediate activations for validation."""
+    """Run PyTorch references with x=example_input and target=expected_output."""
     activations: Dict[str, np.ndarray] = {}
 
     env: Dict[str, torch.Tensor] = {}
     for node in gm.graph.nodes:
         if node.op == "placeholder":
-            env[node.name] = example_input
-            activations[node.name] = example_input.detach().float().cpu().numpy()
+            if (node.target == "x"):
+                env[node.name] = example_input
+            elif (node.target == "target"):
+                if expected_output is None:
+                    raise ValueError("The target placeholder requires expected_output")
+                env[node.name] = expected_output
+            else:
+                raise ValueError(f"Unknown input: {node.target}")
         elif node.op == "get_attr":
             attr = gm
             for part in node.target.split("."):
