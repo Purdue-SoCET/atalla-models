@@ -15,11 +15,9 @@ def relu_c(total: int, width: int) -> str:
 
     return (
         "int main() {\n"
-        f"    int cfg = {ADDR_TABLE};\n"
-        "    int IN_GMEM;\n"
-        "    int OUT_GMEM;\n"
-        '    asm("lw_s %0, 0(%1)" : "=r"(IN_GMEM)  : "r"(cfg));\n'
-        '    asm("lw_s %0, 4(%1)" : "=r"(OUT_GMEM) : "r"(cfg));\n'
+        f"   int* cfg_ptr = (int*){ADDR_TABLE};\n"
+        "    int IN_GMEM = *(cfg_ptr + 0);\n"
+        "    int OUT_GMEM = *(cfg_ptr + 1);\n"
         "\n"
         "    int sp = 0;\n"
         "    int all_mask = -1;\n"
@@ -50,7 +48,7 @@ def relu_c(total: int, width: int) -> str:
         "        tile = tile + 1;\n"
         "    }\n"
         "\n"
-        '    asm("halt");\n'
+        "    atalla_halt();\n"
         "    return 0;\n"
         "}\n"
     )
