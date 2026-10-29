@@ -17,13 +17,10 @@ def add_c(total: int, width: int = 32) -> str:
 
     return (
         "int main() {\n"
-        f"    int cfg = {ADDR_TABLE};\n"
-        "    int A_GMEM;\n"
-        "    int B_GMEM;\n"
-        "    int C_GMEM;\n"
-        '    asm("lw_s %0, 0(%1)" : "=r"(A_GMEM)  : "r"(cfg));\n'
-        '    asm("lw_s %0, 4(%1)" : "=r"(B_GMEM)  : "r"(cfg));\n'
-        '    asm("lw_s %0, 8(%1)" : "=r"(C_GMEM)  : "r"(cfg));\n'
+        f"    int* cfg_ptr = (int*){ADDR_TABLE};\n"
+        "    int A_GMEM = *(cfg_ptr + 0);\n"
+        "    int B_GMEM = *(cfg_ptr + 1);\n"
+        "    int C_GMEM = *(cfg_ptr + 2);\n"
         "\n"
         "    int all_mask = -1;\n"
         "    int ncols = 1;\n"
@@ -52,7 +49,7 @@ def add_c(total: int, width: int = 32) -> str:
         "        tile = tile + 1;\n"
         "    }\n"
         "\n"
-        '    asm("halt");\n'
+        "    atalla_halt();\n"
         "    return 0;\n"
         "}\n"
     )

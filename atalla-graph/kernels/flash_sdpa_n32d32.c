@@ -86,6 +86,6 @@ int main() {
     }
 
     /* Explicit simulator termination (outside hot loops). */
-    asm("halt");
+    atalla_halt();
     return 0;
 }
