@@ -13,3 +13,11 @@ from .maxpool import maxpool_c
 from .add import add_c
 from .mul import mul_c
 from .layernorm import layernorm_c
+from .threshold_backward import threshold_backward_c
+from .sum_dim import sum_dim_c
+from .mse_loss import mse_loss_c
+from .mse_loss_backward import mse_loss_backward_c
+from .avgpool import avgpool_c
+from .gelu import gelu_c
+from .batchnorm import batchnorm_c
+from .upsample import upsample_c

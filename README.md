@@ -148,6 +148,8 @@ Each emulated layer gets a row in `kernel_metrics`; the file also contains `aggr
 
 ## Design notes
 
+- **Decoupled Architecture (Operation Without Kernels):** `atalla-models` operates independently of custom kernel compilation. Any op without a custom AtallaC kernel or marked `skip_emulator = True` automatically falls back to PyTorch/NumPy reference passthrough, allowing models to validate end-to-end without custom kernels.
+- **Standalone C Goldens:** Kernels are developed as standalone `.c` files with vector intrinsics and 0 stack spills, verified independently against NumPy goldens on `atalla-functional-sim`, and designed to be ported directly to the native C++ MLIR compiler (`atalla-graph`).
 - **Compiler path for compute ops.** Conv, Linear, Matmul, ReLU, Softmax, MaxPool, Add go through AtallaC → ppci → `build_compiler` → emulator. **`mul`** on the basic module may still use a NumPy fallback unless a kernel is added.
 - **Passthrough ops** (flatten, transpose, dropout at inference): reshapes only — no `.in` file.
 - **Graph owns `.data`.** `DRAMWriter` (ADDR_TABLE at `0x3C`) + `render_testfile()`; see `pipeline_reference.md` §6.2.

@@ -37,7 +37,14 @@ import torch.nn as nn
 from torch.fx import GraphModule, Tracer, symbolic_trace
 from torch.fx.passes.shape_prop import ShapeProp
 
-_FUNC_SIM = Path(__file__).resolve().parent.parent / "functional_sim"
+_FUNC_SIM = Path(os.environ.get("ATALLA_SIM_PATH", ""))
+if not (_FUNC_SIM / "src").exists():
+    _models_dir = Path(__file__).resolve().parents[1]
+    _ws_dir = Path(__file__).resolve().parents[2]
+    for cand in (_models_dir / "functional_sim", _ws_dir / "atalla-functional-sim", _ws_dir / "functional_sim"):
+        if (cand / "src").exists():
+            _FUNC_SIM = cand
+            break
 if str(_FUNC_SIM) not in sys.path:
     sys.path.insert(0, str(_FUNC_SIM))
 
@@ -572,7 +579,7 @@ def run_validate(
         mem, eu = _run_emulator(in_file, out_dir, node.name)
         result = _read_bf16(mem, emission.output_addr, emission.output_elements)
 
-        if emission.output_shape:
+        if emission.output_shape is not None:
             try:
                 result = result.reshape(emission.output_shape)
             except ValueError:
