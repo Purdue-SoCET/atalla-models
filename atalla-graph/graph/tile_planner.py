@@ -153,6 +153,60 @@ def _plan_gelu(node: Node) -> TileConfig:
     )
 
 
+def _plan_threshold_backward(node: Node) -> TileConfig:
+    shape = get_node_shape(node)
+    total = _prod(shape) if shape else 32
+    return TileConfig(kernel_type="threshold_backward", params=dict(total_elements=total))
+
+
+def _plan_sum_dim(node: Node) -> TileConfig:
+    inp_shape = get_node_shape(node.args[0]) if node.args else None
+    if inp_shape and len(inp_shape) >= 2:
+        rows = int(inp_shape[0])
+        cols = _prod(inp_shape[1:])
+    else:
+        rows = 1
+        cols = _prod(inp_shape) if inp_shape else 32
+    return TileConfig(kernel_type="sum_dim", params=dict(num_rows=rows, num_cols=cols))
+
+
+def _plan_mse_loss(node: Node) -> TileConfig:
+    inp_shape = get_node_shape(node.args[0]) if node.args else None
+    total = _prod(inp_shape) if inp_shape else 32
+    return TileConfig(kernel_type="mse_loss", params=dict(total_elements=total))
+
+
+def _plan_mse_loss_backward(node: Node) -> TileConfig:
+    inp_shape = get_node_shape(node.args[0]) if node.args else None
+    total = _prod(inp_shape) if inp_shape else 32
+    return TileConfig(kernel_type="mse_loss_backward", params=dict(total_elements=total))
+
+
+def _plan_batchnorm(node: Node) -> TileConfig:
+    inp_shape = get_node_shape(node.args[0]) if node.args else None
+    if inp_shape and len(inp_shape) >= 3:
+        C = int(inp_shape[-3])
+        spatial = _prod(inp_shape[-2:])
+    elif inp_shape and len(inp_shape) == 2:
+        C = int(inp_shape[0])
+        spatial = int(inp_shape[1])
+    else:
+        C = 1
+        spatial = _prod(inp_shape) if inp_shape else 32
+    return TileConfig(kernel_type="batchnorm", params=dict(channels=C, spatial_elements=spatial))
+
+
+def _plan_upsample(node: Node) -> TileConfig:
+    inp_shape = get_node_shape(node.args[0]) if node.args else None
+    if inp_shape and len(inp_shape) >= 3:
+        C = int(inp_shape[-3])
+        H = int(inp_shape[-2])
+        W = int(inp_shape[-1])
+    else:
+        C, H, W = 1, 4, 8
+    return TileConfig(kernel_type="upsample", params=dict(channels=C, H_in=H, W_in=W))
+
+
 def _plan_maxpool(node: Node, gm: GraphModule) -> TileConfig:
     mod = _get_module(gm, node.target) if node.op == "call_module" else None
     input_shape = get_node_shape(node.args[0])
@@ -413,6 +467,18 @@ def plan_tiles(gm: GraphModule) -> GraphModule:
             tc = _plan_layernorm(node, gm)
         elif atalla_op == "gelu":
             tc = _plan_gelu(node)
+        elif atalla_op in ("threshold_backward", "aten.threshold_backward.default"):
+            tc = _plan_threshold_backward(node)
+        elif atalla_op in ("sum_dim", "aten.sum.dim_IntList"):
+            tc = _plan_sum_dim(node)
+        elif atalla_op in ("mse_loss", "aten.mse_loss.default"):
+            tc = _plan_mse_loss(node)
+        elif atalla_op in ("mse_loss_backward", "aten.mse_loss_backward.default"):
+            tc = _plan_mse_loss_backward(node)
+        elif atalla_op == "batchnorm":
+            tc = _plan_batchnorm(node)
+        elif atalla_op == "upsample":
+            tc = _plan_upsample(node)
 
         if tc is not None:
             node.meta["tile_config"] = tc
