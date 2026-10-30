@@ -43,7 +43,7 @@ for p in (_ROOT, _FUNC_SIM):
     if p.is_dir() and str(p) not in sys.path:
         sys.path.insert(0, str(p))
 
-from build import DRAMWriter  # noqa: E402
+from codegen.c_emitter import DRAMWriter  # noqa: E402
 from codegen.c_emitter import (  # noqa: E402
     LayerEmission,
     _align_data,
@@ -51,8 +51,8 @@ from codegen.c_emitter import (  # noqa: E402
     compile_and_assemble,
     render_in_file,
 )
-from kernels import ADDR_TABLE  # noqa: E402
-from kernels.maxpool import maxpool_c as _maxpool_c  # noqa: E402
+from codegen.c_emitter import ADDR_TABLE  # noqa: E402
+from codegen.c_emitter import _maxpool_c, _write_runtime_params, kernel_config  # noqa: E402
 from run_graph import _layer_compare_metrics, _nz_count, _read_bf16, _run_emulator  # noqa: E402
 
 
@@ -171,6 +171,7 @@ def _build_dram_and_emit(
     img = DRAMWriter()
     img.u32(ADDR_TABLE + 0, IN_GMEM)
     img.u32(ADDR_TABLE + 4, OUT_GMEM)
+    _write_runtime_params(img, kernel_config.maxpool_params(H, W, C, pool, stride))
     for c in range(C):
         base = IN_GMEM + c * channel_in_bytes
         for r in range(H):

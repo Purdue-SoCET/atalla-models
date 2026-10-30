@@ -37,8 +37,8 @@ for p in (_ROOT, _FUNC_SIM):
     if p.is_dir() and str(p) not in sys.path:
         sys.path.insert(0, str(p))
 
-from build import DRAMWriter  # noqa: E402
-from build_alexnet_layer import im2col  # noqa: E402
+from codegen.c_emitter import DRAMWriter  # noqa: E402
+from codegen.c_emitter import im2col  # noqa: E402
 from codegen.c_emitter import (  # noqa: E402
     _align_data,
     _gemm_k_stride,
@@ -54,8 +54,8 @@ from codegen.c_emitter import (  # noqa: E402
 )
 from codegen.dram_builder import extract_input_data  # noqa: E402
 from graph.fx_capture import get_node_shape  # noqa: E402
-from kernels.common import TILE  # noqa: E402
-from kernels.gemm import gemm_c as _gemm_c  # noqa: E402
+from codegen.c_emitter import TILE  # noqa: E402
+from codegen.c_emitter import _gemm_c  # noqa: E402
 from run_graph import (  # noqa: E402
     _layer_compare_metrics,
     _read_bf16,

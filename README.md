@@ -148,6 +148,8 @@ Each emulated layer gets a row in `kernel_metrics`; the file also contains `aggr
 
 ## Design notes
 
+- **Decoupled Architecture (Operation Without Kernels):** `atalla-models` operates independently of custom kernel compilation. Any op without a custom AtallaC kernel or marked `skip_emulator = True` automatically falls back to PyTorch/NumPy reference passthrough, allowing models to validate end-to-end without custom kernels.
+- **Standalone C Goldens:** Kernels are developed as standalone `.c` files with vector intrinsics and 0 stack spills, verified independently against NumPy goldens on `atalla-functional-sim`, and designed to be ported directly to the native C++ MLIR compiler (`atalla-graph`).
 - **Compiler path for compute ops.** Conv, Linear, Matmul, ReLU, Softmax, MaxPool, Add go through AtallaC → ppci → `build_compiler` → emulator. **`mul`** on the basic module may still use a NumPy fallback unless a kernel is added.
 - **Passthrough ops** (flatten, transpose, dropout at inference): reshapes only — no `.in` file.
 - **Graph owns `.data`.** `DRAMWriter` (ADDR_TABLE at `0x3C`) + `render_testfile()`; see `pipeline_reference.md` §6.2.
@@ -155,3 +157,83 @@ Each emulated layer gets a row in `kernel_metrics`; the file also contains `aggr
 - **Stack / DRAM.** Scalar `x2` placed above tensor data to avoid overlap with spills and globals.
 
 See **`CONTRIBUTING.md`** to add a new op end-to-end.
+
+## Kernel source files
+
+Accelerator kernel bodies live in `atalla-graph/kernels/` as ordinary `.c`
+files. Python wrappers read those files without substituting source text.
+The graph emitter writes dimensions, strides, masks, and DMA control words
+into configuration memory at address 60. Each C kernel reads its runtime
+parameters from there. `kernels/common.py` defines the configuration layouts;
+`codegen/c_emitter.py` writes integer and FP32 words with the correct types.
+
+Vector load/store widths and scratchpad IDs are ISA immediates. Kernels use
+fixed 32-lane instructions, runtime DMA dimensions, and masks where needed.
+GEMM explicitly zeroes inactive weight lanes. Elementwise buffers are padded
+to complete DMA tiles. MaxPool iterates its window in C; its existing
+horizontal postprocessing remains in the graph runner. Existing unsupported
+shape fallbacks (such as wide Softmax) are unchanged.
+
+Run the source and numerical regression checks separately from the legacy
+standalone-kernel suite, which uses a conflicting top-level `kernels` package:
+
+```bash
+../.venv/bin/python3 -m pytest tests -q
+../.venv/bin/python3 -m pytest atalla-graph/tests/test_runtime_kernels.py atalla-graph/tests/test_chained_host_ops.py -q
+```
+
+## Analytical pipelining estimate
+
+`atalla-graph/scripts/pipelining_latency_model.py` estimates ideal input
+prefetch overlap for **uniform tiles**. Results are unvalidated estimates,
+not hardware cycle measurements. The default 520 cycles per 64-byte line is
+a heuristic. Compute cycles and tile count must be supplied explicitly;
+simulator retired packets can instead be selected as an explicit proxy.
+
+From this repository, using the workspace Python environment:
+
+```bash
+../.venv/bin/python3 atalla-graph/scripts/pipelining_latency_model.py \
+  --name example --tiles 2 --bytes-loaded 128 --bytes-written 128 \
+  --compute-cycles 20 --lat-scpad 10 --assume-packed-transfers
+
+../.venv/bin/python3 atalla-graph/scripts/pipelining_latency_model.py \
+  --perf out/graph/add_perf.out --tiles 1 \
+  --use-packets-as-compute-proxy --assume-packed-transfers
+```
+
+Use `--dir out/graph` instead of `--perf` to analyze multiple files. All
+files use the supplied uniform tile count and assumptions; this does not
+infer geometry from a graph. CLI byte/cycle overrides apply to each file.
+
+Byte and compute inputs are **totals over all tiles**. Packed mode assumes
+one contiguous, aligned transfer in each direction per tile and rounds each
+tile separately. Alternatively, repeat `--load-transfer-bytes N` and
+`--store-transfer-bytes N` for independent aligned transfers **within each
+tile**. Their sums times the tile count must match byte totals, if supplied.
+For strided rows, specify each row separately. Unaligned transfers require
+an external transaction model; useful-byte counters alone cannot recover
+physical DRAM traffic.
+
+For per-tile load cost L, compute budget C, store cost S, tile count K, and
+extra total pipeline overhead H, the assumed schedule is:
+
+```text
+serial    = K * (L + C + S)
+pipelined = L + C + (K - 1) * max(L, C) + K * S + H
+```
+
+Set `--pipeline-overhead-cycles H` to explore additional setup/control
+costs. Stores are charged serially outside the overlap phase. The model
+assumes sufficient buffers and independent load/compute resources; it does
+not prove that the hardware or generated code supports this schedule.
+Packet proxies include DMA/control/scalar work and are not isolated compute
+measurements. Contention, bandwidth, dependencies, uneven tiles, and actual
+buffer lifetimes are not modeled. Calibrate against timed RTL or hardware
+before using these estimates as performance claims.
+
+Run analytical/CLI regression tests with:
+
+```bash
+../.venv/bin/python3 -m pytest tests/test_pipelining_latency_model.py -q
+```

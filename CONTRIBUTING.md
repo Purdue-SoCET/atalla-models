@@ -76,7 +76,7 @@ Use intrinsics consistent with **`atalla-graph/kernels/*.py`** and the compiler 
 
 **ADDR_TABLE** base is **`0x3C` (decimal 60)** — same constant as `ADDR_TABLE` in `atalla-graph/kernels/common.py`.
 
-**Packed SDMA control:** use `sdma_ctl_val` / `sdma_ctl_expr` from **`atalla-graph/kernels/common.py`** (or mirror the integer in `asm("li_s …")` in standalone C).
+**Packed SDMA control:** compute `sdma_ctl_val` in **`atalla-graph/kernels/common.py`**, write it into configuration memory, and load it in C. Do not generate C statements in Python.
 
 Compile:
 
@@ -97,62 +97,28 @@ print(text[:800])
 "
 ```
 
-## Step 3: Generator (`atalla-graph/kernels/<op>.py`)
+## Step 3: Source wrapper (`atalla-graph/kernels/<op>.py`)
 
-Return AtallaC source as a string. Match **argument order** used in **`gemm.py` / `relu.py`** for `vector_load` / `vector_store` / `scpad_load`.
-
-Example shape (adjust ops and SDMA vars):
+Keep the complete algorithm in `kernels/<op>.c`. Python reads it unchanged:
 
 ```python
-# atalla-graph/kernels/myop.py
-import math
-from kernels.common import ADDR_TABLE, TILE, sdma_ctl_expr
+from .source import read_kernel
+
 
 def myop_c(total: int, width: int = 32) -> str:
-    rows = math.ceil(total / width)
-    w_m1 = width - 1
-    sp_rows = min(rows, TILE)
-    tile_count = math.ceil(rows / sp_rows)
-    tile_bytes = sp_rows * width * 2
-    sdma_s = sdma_ctl_expr("sdma_ctl", 0, sp_rows, width, width)
-
-    return (
-        "int main() {\n"
-        f"    int cfg = {ADDR_TABLE};\n"
-        "    int IN_GMEM;\n"
-        "    int OUT_GMEM;\n"
-        '    asm("lw_s %0, 0(%1)" : "=r"(IN_GMEM)  : "r"(cfg));\n'
-        '    asm("lw_s %0, 4(%1)" : "=r"(OUT_GMEM) : "r"(cfg));\n'
-        "\n"
-        "    int sp = 0;\n"
-        "    int ncols = 1;\n"
-        f"{sdma_s}"
-        "\n"
-        "    int tile = 0;\n"
-        f"    while (tile < {tile_count}) {{\n"
-        "        scpad_load(sp, IN_GMEM, sdma_ctl);\n"
-        "\n"
-        "        int row = 0;\n"
-        f"        while (row < {sp_rows}) {{\n"
-        f"            vec v = vector_load(sp, row, {w_m1}, 0);\n"
-        "\n"
-        "            /* --- your op on v --- */\n"
-        "\n"
-        f"            vector_store(v, sp, row, {w_m1}, 0);\n"
-        "            row = row + 1;\n"
-        "        }\n"
-        "\n"
-        "        scpad_store(sp, OUT_GMEM, sdma_ctl);\n"
-        f"        IN_GMEM = IN_GMEM + {tile_bytes};\n"
-        f"        OUT_GMEM = OUT_GMEM + {tile_bytes};\n"
-        "        tile = tile + 1;\n"
-        "    }\n"
-        "\n"
-        '    asm("halt");\n'
-        "    return 0;\n"
-        "}\n"
-    )
+    return read_kernel("myop.c")
 ```
+
+Define runtime configuration offsets in `kernels/common.py`, then write the
+values in the emitter using `_write_runtime_params`. Use integer words for
+counts, addresses, masks, strides, and SDMA control; use FP32 words for float
+parameters. C reads the same offsets relative to address 60. Existing wrapper
+arguments can remain for API compatibility; they do not specialize source.
+
+Vector load/store `num_cols_m1` and scratchpad IDs must be compile-time
+constants. Prefer fixed 32-lane instructions plus runtime DMA geometry and
+lane masks. Ensure inactive lanes are initialized before a reduction or GEMM
+can consume them. Pad the final DMA tile and allocate buffers accordingly.
 
 Register in **`atalla-graph/kernels/__init__.py`** if you use a central export.
 
@@ -178,7 +144,7 @@ Expect **`emulator`** (not `NumPy`) for your op; check per-node cosine / `max_di
 | Problem | What to check |
 |---------|----------------|
 | `Unknown mnemonic for scheduling` | `build_compiler.py` aliases / spelling vs `ASSEMBLY_SYNTAX.md` |
-| Immediate / offset overflow | `asm("li_s %0, VAL")` or `sdma_ctl_expr` pattern |
+| Immediate / offset overflow | Load the parameter from a u32 configuration word |
 | `Tree … not covered` / stack errors | Reduce live `vec` variables; compiler frame limits |
 | `cos` ≈ 0 or garbage | BF16 layout, ADDR_TABLE, SDMA metadata, GEMM mask (`mv.stm`), spill vs GMEM in emulator |
 | Op stuck as NumPy | `skip_emulator` / missing `emit_*` dispatch / unsupported `atalla_op` |
