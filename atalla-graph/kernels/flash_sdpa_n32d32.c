@@ -7,13 +7,14 @@
 /*
  * Flash-attention matched contract (N=32, D=32, non-causal):
  *   Q @ K^T -> row softmax -> (softmax probs) @ V
- * DRAM layout matches functional_sim/kernels/build_flash_attention.py:
+ * DRAM addresses:
  *   scale (f32) @ 0x0C00, Q @ 0x1000, K @ 0x3000, V @ 0x5000, O @ 0x7000
  * Scratchpad:
  *   sid0 row 0 used for single-row DMA / vector loads.
  *
  * Keep Unix (LF) line endings — CRLF breaks atalla_cc / ppci and yields wrong code.
- * Canonical source: aihw-ppci-compiler/atalla_tests/kernels/flash_attention_n32_d32.c
+ * The emitter packs Q/K row-major and V transposed. Reverse row loads into
+ * the warmed weight FIFO produce K^T for scores and V for the output.
  */
 int main() {
     const int SCALE_ADDR = 0x0C00;
@@ -48,7 +49,8 @@ int main() {
         int col = 0;
         while (col < N) {
             int idx = (N - 1) - col;
-            vec k_row = vector_load(sp, idx, N_M1, 1);
+            /* The final argument selects SID0, where K was DMA-loaded. */
+            vec k_row = vector_load(sp, idx, N_M1, 0);
             load_weights(k_row);
             col = col + 1;
         }

@@ -1135,14 +1135,14 @@ def emit_sdpa(
     q_addr, k_addr, v_addr, o_addr = 0x1000, 0x3000, 0x5000, 0x7000
     img = DRAMWriter()
     img.f32(scale_addr, inv)
-    # K scratchpad in flash kernel is consumed column-wise; layout matches
-    # functional_sim contract_flash: row-major of K with matmul (Q @ K^T) — same
-    # storage as aihw-ppci flash test (K at 0x3000 as (N,D) in row order).
+    # Each load_weights inserts a vector as a stationary weight column.
+    # The warmed FIFO and reverse row loads therefore transpose a DRAM tile:
+    # row-major K supplies K^T for Q @ K^T; transposed V supplies V for P @ V.
     for i, val in enumerate(qf[0].reshape(-1)):
         img.bf16(q_addr + i * 2, float(val))
     for i, val in enumerate(kf[0].reshape(-1)):
         img.bf16(k_addr + i * 2, float(val))
-    for i, val in enumerate(vf[0].reshape(-1)):
+    for i, val in enumerate(vf[0].T.reshape(-1)):
         img.bf16(v_addr + i * 2, float(val))
     for i in range(n * d):
         img.bf16(o_addr + i * 2, 0.0)
