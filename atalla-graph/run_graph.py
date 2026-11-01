@@ -552,6 +552,10 @@ def run_validate(
             except ValueError:
                 pass
 
+        if emission.softmax_post is not None:
+            sp = emission.softmax_post
+            result = result.reshape(sp["packed_shape"]).transpose(sp["inverse_axes"])
+
         if emission.conv_post is not None:
             cp = emission.conv_post
             raw = result.reshape(cp["Ho"], cp["Wo"], cp["C"])
