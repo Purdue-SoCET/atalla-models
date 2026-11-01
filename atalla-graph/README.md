@@ -79,3 +79,66 @@ and reads actual simulator memory. The reported backend is `emulator`, with no
 host/reference fallback. This correctness path is not a vector/DMA optimization
 or hardware timing claim. The canonical simulator must include the signed-branch
 comparison correction required by reverse-axis loops.
+
+## Standalone pooling family
+
+`PoolingOp` and `execute_pooling` provide a standalone compiled kernel boundary.
+They do not add FX or textual-MLIR dispatch. Each of the 17 pooling names in the
+pinned Linalg inventory has its own ordinary C source, such as
+`kernels/pooling_nhwc_min.c`. The supported layouts are: NCW/NWC 1D,
+NCHW/NHWC 2D, and NDHWC 3D min/max/sum where those named variants exist, plus
+NWC/NHWC unsigned min/max. Each kernel fixes its reduction, physical layout and
+spatial rank in C, with explicit spatial loops. Python selects that source and
+supplies shapes, physical byte strides, window sizes, spatial strides, dilations
+and dtype through runtime configuration. Rank and reduction are not runtime
+selectors. No PPCI source changes are required.
+
+```python
+import numpy as np
+from graph.layout import TensorView
+from graph.pooling import PoolingOp
+from pooling_runtime import execute_pooling
+
+x = np.array([[[[3.], [-2.]]]], dtype='<f4')  # NHWC
+initial = np.array([[[[10.]]]], dtype='<f4')
+operation = PoolingOp(
+    'linalg.pooling_nhwc_min',
+    TensorView('input', x.shape, 'f32'),
+    TensorView('output', initial.shape, 'f32'),
+    kernel_shape=(1, 2),
+)
+result = execute_pooling(operation, {
+    'input': x.tobytes(), 'output': initial.tobytes(),
+}, 'out/pooling')
+assert np.frombuffer(result.buffers['output'], dtype='<f4')[0] == -2.
+```
+
+The **existing output values participate** in reduction. To perform ordinary min
+pooling, initialize output to positive infinity; max uses negative infinity and
+sum uses zero. Smaller/larger explicit initial values are also respected.
+The output view determines iteration extents, which must fit valid windows of
+the input. There is no implicit padding. Window operand values do not contribute;
+its spatial shape defines the reduction. Empty windows preserve output bits;
+empty outputs perform no output writes. Batch and channel dimensions must match.
+
+| Operation subset | Supported same input/output storage |
+|---|---|
+| Ordinary min/max | BF16, f16, f32, i32 |
+| Unsigned min/max | u32 |
+| Sum | BF16, i32, u32 |
+
+Float extrema propagate NaNs and distinguish signed-zero ties (min selects -0,
+max selects +0). BF16 sum rounds to nearest-even after **each** addition in
+lexicographic window order. Integer sums wrap modulo 2^32. Mixed input/output
+casts, f16/f32 sums, other widths, vectors and complex values are explicitly
+unsupported. This is bounded standalone coverage, not full Linalg type support.
+
+The API uses the existing `TensorView` byte-stride/bounds contract, including
+negative/zero input strides and provably nonoverlapping strided output. When
+input/output share an allocation name, C snapshots the input allocation before
+writing output. Unaddressed bytes are preserved. The returned buffers contain
+actual simulator values and may feed another kernel invocation.
+
+This is a correctness-first **scalar** kernel. Float extrema use exact storage-bit
+ordering; BF16 sums use existing scalar arithmetic and explicit storage rounding.
+It makes no vectorization, zero-spill, DMA-overlap or hardware-cycle claim.
