@@ -85,6 +85,10 @@ _EMU_ATALLA_OPS: FrozenSet[str] = frozenset(
         "layernorm",
         "gelu",
         "atalla_sdpa",
+        "softmax", "maxpool", "sum_dim", "threshold_backward",
+        "mse_loss", "mse_loss_backward", "aten.sum.dim_IntList",
+        "aten.threshold_backward.default", "aten.mse_loss.default",
+        "aten.mse_loss_backward.default",
     }
 )
 
@@ -158,6 +162,28 @@ def _apply_oracle_inputs(
     """Overwrite cache with PyTorch activations so each kernel sees matched inputs."""
     for name, arr in ref_activations.items():
         activation_cache[name] = np.asarray(arr, dtype=np.float32).copy()
+
+
+def _execute_host_tensor_op(node, activation_cache):
+    """Execute supported bookkeeping on actual values, without golden inputs.
+
+    NumPy stores BF16 values as FP32; PyTorch performs the requested dtype
+    conversion (including BF16 rounding) before converting back for storage.
+    """
+    first = node.args[0]
+    data = activation_cache[first.name]
+    if node.target == torch.ops.aten.alias.default:
+        return data
+    tensor = torch.from_numpy(np.asarray(data))
+    metadata = first.meta.get("tensor_meta")
+    if metadata is not None:
+        tensor = tensor.to(dtype=metadata.dtype)
+    result = node.target(tensor, *node.args[1:], **node.kwargs)
+    if result.device.type != "cpu":
+        raise NotImplementedError(f"Host operation {node.name} requires CPU storage")
+    if result.dtype == torch.bfloat16:
+        result = result.float()
+    return result.detach().numpy().copy()
 
 
 def _layer_compare_metrics(
@@ -348,13 +374,15 @@ def run_validate(
       * ``chained`` — each layer consumes the previous layer's emulator output
         (end-to-end integration). Per-layer cos mixes accumulated drift with the
         local kernel error; the meaningful end-to-end signal is the final output
-        metrics.
+        metrics. Bookkeeping operations run on actual cached values on the host;
+        nodes without a kernel or explicit host implementation raise an error.
       * ``oracle`` — before each emulated op, ``_apply_oracle_inputs`` copies
         every tensor from ``ref_activations`` into the cache so that kernel
         inputs match PyTorch. Per-layer output is still compared to ref for that
         node; **final output cos can be perfect while matmul (etc.) layers still
         show bad cos/rmse**, because later ops are fed ref activations again, not
-        the bad emulator outputs.
+        the bad emulator outputs. Unsupported nodes may also use reference
+        fallback in this mode, reported separately in the statistics.
 
     If ``kernel_bundle_dir`` is set, the first emulated node for each op in
     ``kernel_bundle_ops`` (default: conv, relu, maxpool, matmul, add) copies
@@ -376,7 +404,8 @@ def run_validate(
     ref_activations = extract_input_data(gm, example_input.bfloat16())
     activation_cache: Dict[str, np.ndarray] = {}
 
-    stats = {"total": 0, "emulated": 0, "numpy": 0, "passthrough": 0}
+    stats = {"total": 0, "emulated": 0, "numpy": 0, "passthrough": 0,
+             "host": 0, "reference_fallback": 0}
     kernel_metrics = []
 
     if verbose:
@@ -431,8 +460,18 @@ def run_validate(
                 print(f"  [{node.name}] get_attr")
             continue
 
-        # Passthrough: flatten, dropout, transpose, unknown
-        if atalla_op in ("flatten", "dropout", "transpose", None):
+        if node.op == "call_function" and node.target in (
+            torch.ops.aten.alias.default, torch.ops.aten._to_copy.default,
+            torch.ops.aten.ones_like.default,
+        ):
+            activation_cache[node.name] = _execute_host_tensor_op(node, activation_cache)
+            stats["host"] += 1
+            if verbose:
+                print(f"  [{node.name}] {atalla_op} -> host (actual inputs)")
+            continue
+
+        # Shape operations use cached execution values, not reference activations.
+        if atalla_op in ("flatten", "dropout", "transpose"):
             if node.args and isinstance(node.args[0], torch.fx.Node):
                 prev = node.args[0]
                 if prev.name in activation_cache:
@@ -456,28 +495,21 @@ def run_validate(
                         print(f"  [{node.name}] {atalla_op or 'passthrough'} -> {data.shape}")
                     continue
 
-            if node.name in ref_activations:
-                activation_cache[node.name] = ref_activations[node.name]
-                stats["passthrough"] += 1
-                if verbose:
-                    print(f"  [{node.name}] passthrough (ref)")
-                continue
-
         if validate_inputs == "oracle" and atalla_op in _EMU_ATALLA_OPS:
             _apply_oracle_inputs(activation_cache, ref_activations)
 
         emission = emit_node(node, gm, activation_cache)
 
         if emission is None:
-            if node.name in ref_activations:
-                activation_cache[node.name] = ref_activations[node.name]
-            elif node.args and isinstance(node.args[0], torch.fx.Node):
-                prev_name = node.args[0].name
-                if prev_name in activation_cache:
-                    activation_cache[node.name] = activation_cache[prev_name]
-            stats["passthrough"] += 1
+            if validate_inputs == "chained" or node.name not in ref_activations:
+                raise NotImplementedError(
+                    f"Unsupported node {node.name} ({node.target}): no kernel or "
+                    "host implementation; chained validation cannot use reference values"
+                )
+            activation_cache[node.name] = ref_activations[node.name].copy()
+            stats["reference_fallback"] += 1
             if verbose:
-                print(f"  [{node.name}] {atalla_op} -> passthrough")
+                print(f"  [{node.name}] {atalla_op} -> reference fallback (oracle only)")
             continue
 
         if emission.skip_emulator:
@@ -644,7 +676,8 @@ def run_validate(
     if verbose:
         print(f"\n--- Results ({elapsed:.2f}s) ---")
         print(f"  Nodes: {stats['total']} total, {stats['emulated']} emulated, "
-              f"{stats['numpy']} numpy, {stats['passthrough']} passthrough")
+              f"{stats['numpy']} numpy, {stats['passthrough']} passthrough, "
+              f"{stats['host']} host, {stats['reference_fallback']} reference fallback")
 
     aggregate_metrics = _aggregate_kernel_metrics(kernel_metrics)
 
@@ -777,6 +810,7 @@ def _resolve_transpose(ndim: int, args) -> tuple:
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def load_model(name: str, scale: float = 0.01):
+    """Return a model and example input for graph capture and regression tools."""
     if name == "basic":
         from model.basic import BasicModule
         return BasicModule(dim=32, depth=2), torch.randn(1, 32)
@@ -788,11 +822,9 @@ def load_model(name: str, scale: float = 0.01):
         return LayerNormSmoke(dim=32), torch.randn(1, 32)
     elif name == "vit_micro":
         from model.vit_micro import ViTMicro
-        # n_tokens=dim=32 matches kernels/flash_sdpa_n32d32.c (fused attention on emulator).
-        m = ViTMicro(dim=32, n_tokens=32)
-        return m, torch.randn(1, 32, 32)
-    else:
-        raise ValueError(f"Unknown model: {name}")
+        # This geometry matches the fused attention emulator kernel.
+        return ViTMicro(dim=32, n_tokens=32), torch.randn(1, 32, 32)
+    raise ValueError(f"Unknown model: {name}")
 
 
 def main():
