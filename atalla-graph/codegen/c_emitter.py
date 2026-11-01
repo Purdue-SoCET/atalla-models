@@ -155,7 +155,7 @@ def _emit_addr_debug(phase: str, node: Node, **kwargs: object) -> None:
 class LayerEmission:
     __slots__ = ("c_source", "instr_text", "dram", "output_addr", "output_shape",
                  "output_elements", "skip_emulator", "numpy_result", "maxpool_post",
-                 "conv_post", "sched_packets", "sched_slots_filled", "sched_slot_efficiency",
+                 "conv_post", "softmax_post", "sched_packets", "sched_slots_filled", "sched_slot_efficiency",
                  "sched_slot_histogram", "layer_metrics")
 
     def __init__(self):
@@ -169,6 +169,7 @@ class LayerEmission:
         self.numpy_result: Optional[np.ndarray] = None
         self.maxpool_post: Optional[dict] = None
         self.conv_post: Optional[dict] = None
+        self.softmax_post: Optional[dict] = None
         # Filled by compile_and_assemble() from build_compiler VLIW schedule (static program).
         self.sched_packets: int = 0
         self.sched_slots_filled: int = 0
@@ -785,6 +786,7 @@ def emit_softmax(node: Node, input_data: np.ndarray, tc: TileConfig) -> LayerEmi
     total = num_rows * row_len
 
     x = np.asarray(input_data, dtype=np.float32)
+    perm = None
     if out_shape:
         x = x.reshape(out_shape)
         nd = x.ndim
@@ -835,6 +837,11 @@ def emit_softmax(node: Node, input_data: np.ndarray, tc: TileConfig) -> LayerEmi
     em.output_addr = IN_GMEM
     em.output_shape = tuple(out_shape) if out_shape else (num_rows, row_len)
     em.output_elements = total
+    if perm is not None:
+        em.softmax_post = {
+            "packed_shape": tuple(x.shape),
+            "inverse_axes": tuple(int(i) for i in np.argsort(perm)),
+        }
     em.layer_metrics = {
         "map_kind": "softmax",
         "map_num_rows": int(num_rows),
