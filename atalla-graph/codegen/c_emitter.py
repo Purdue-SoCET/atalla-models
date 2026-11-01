@@ -167,6 +167,7 @@ class LayerEmission:
         self.output_elements: int = 0
         self.skip_emulator: bool = False
         self.numpy_result: Optional[np.ndarray] = None
+        # Retained for the legacy maxpool diagnostic; active graph pooling is complete.
         self.maxpool_post: Optional[dict] = None
         self.conv_post: Optional[dict] = None
         self.softmax_post: Optional[dict] = None
@@ -917,80 +918,54 @@ def emit_matmul(node: Node, gm: GraphModule,
 
 
 def emit_maxpool(node: Node, input_data: np.ndarray, tc: TileConfig) -> LayerEmission:
+    # Import lazily: the standalone emitter shares LayerEmission/DRAMWriter here.
+    from codegen.pooling import emit_pooling
+    from graph.layout import TensorView
+    from graph.pooling import PoolingOp
+    from graph.tile_planner import _pool_pair
+
     p = tc.params
     H, W, C = p["H"], p["W"], p["channels"]
-    pool, stride = p["pool"], p["stride"]
+    kernel, steps = _pool_pair(p["pool"]), _pool_pair(p["stride"])
+    padding = _pool_pair(p.get("padding", 0))
+    dilation = _pool_pair(p.get("dilation", 1))
     H_out, W_out = p["H_out"], p["W_out"]
+    out_shape = get_node_shape(node)
+    N = p.get("batch", out_shape[0] if out_shape and len(out_shape) == 4 else 1)
+    shape = (N, C, H, W)
+    final_shape = (N, C, H_out, W_out)
+    if out_shape is not None:
+        normalized = (1, *out_shape) if len(out_shape) == 3 else tuple(out_shape)
+        if normalized != final_shape:
+            raise ValueError("MaxPool2d planned output disagrees with graph shape")
+    data = np.asarray(input_data, dtype=np.float32)
+    if data.size != N * C * H * W:
+        raise ValueError("MaxPool2d execution input disagrees with planned shape")
+    data = data.reshape(shape)
 
-    total = H * W * C
-    flat = input_data.flatten()
-    if len(flat) < total:
-        padded = np.zeros(total, dtype=np.float32)
-        padded[:len(flat)] = flat
-        flat = padded
-
-    out_shape = get_node_shape(node) or (1, C, H_out, W_out)
-    out_elems = C * H_out * W_out
-
-    if W > 32:
-        em = LayerEmission()
-        em.skip_emulator = True
-        data_nchw = flat[:total].reshape(1, C, H, W)
-        out = np.full((1, C, H_out, W_out), -np.inf, dtype=np.float32)
-        for c in range(C):
-            for oh in range(H_out):
-                for ow in range(W_out):
-                    for pr in range(pool):
-                        for pc_i in range(pool):
-                            ih, iw = oh * stride + pr, ow * stride + pc_i
-                            if ih < H and iw < W:
-                                out[0, c, oh, ow] = max(out[0, c, oh, ow],
-                                                         float(data_nchw[0, c, ih, iw]))
-        em.numpy_result = out.reshape(out_shape)
-        em.output_shape = out_shape
-        em.output_elements = out_elems
-        return em
-
-    # Kernel writes per-output-row vectors of width W (vertical max per column);
-    # horizontal max over the pool window is applied in run_graph (maxpool_post).
-    IN_GMEM = 0x1000
-    channel_in_bytes = H * W * 2
-    total_in_bytes = C * channel_in_bytes
-    total_raw_out = C * H_out * W
-    OUT_GMEM = IN_GMEM + _align_data(total_in_bytes)
-
-    img = DRAMWriter()
-    img.u32(ADDR_TABLE + 0, IN_GMEM)
-    img.u32(ADDR_TABLE + 4, OUT_GMEM)
-    _write_runtime_params(img, kernel_config.maxpool_params(H, W, C, pool, stride))
-
-    data_nchw = flat[:total].reshape(C, H, W) if C > 0 else flat[:total].reshape(1, H, W)
-    for c in range(C):
-        base = IN_GMEM + c * channel_in_bytes
-        for r in range(H):
-            for col in range(W):
-                img.bf16(base + (r * W + col) * 2, float(data_nchw[c, r, col]))
-
-    _write_zeros(img, OUT_GMEM, total_raw_out)
-
-    em = LayerEmission()
-    em.c_source = _maxpool_c(H, W, C, pool, stride)
-    em.dram = img
-    em.output_addr = OUT_GMEM
-    em.output_elements = total_raw_out
-    em.output_shape = (C, H_out, W)
-    em.maxpool_post = dict(C=C, H_out=H_out, W=W, W_out=W_out,
-                           pool=pool, stride=stride, final_shape=out_shape)
-    em.layer_metrics = {
-        "map_kind": "maxpool",
-        "map_C": int(C),
-        "map_H": int(H),
-        "map_W": int(W),
-        "map_pool": int(pool),
-        "map_stride": int(stride),
-        "bytes_est_in": int(C * H * W * 2),
-        "bytes_est_out_raw": int(C * H_out * W * 2),
-    }
+    # Packing/fill only: all window comparisons execute in pooling_nchw_max.c.
+    # Ceil mode may need additional trailing padding beyond symmetric PyTorch pad.
+    padded_shape = tuple(max(size + 2 * pad, (out - 1) * step + (k - 1) * dil + 1)
+                         for size, pad, out, step, k, dil in zip(
+                             (H, W), padding, (H_out, W_out), steps, kernel, dilation))
+    padded = np.pad(data, ((0, 0), (0, 0),
+                          (padding[0], padded_shape[0] - H - padding[0]),
+                          (padding[1], padded_shape[1] - W - padding[1])),
+                    mode="constant", constant_values=-np.inf)
+    source = (torch.from_numpy(padded.copy()).bfloat16().view(torch.int16)
+              .numpy().astype('<i2').tobytes())
+    elements = N * C * H_out * W_out
+    op = PoolingOp('pooling_nchw_max', TensorView('input', padded.shape, 'bf16'),
+                   TensorView('output', final_shape, 'bf16'), kernel,
+                   strides=steps, dilations=dilation)
+    em = emit_pooling(op, {'input': source, 'output': b'\x80\xff' * elements}).emission
+    em.output_shape = tuple(out_shape) if out_shape is not None else final_shape
+    em.layer_metrics.update({
+        "map_kind": "maxpool", "map_N": N, "map_C": C, "map_H": H, "map_W": W,
+        "map_pool": kernel, "map_stride": steps, "map_padding": padding,
+        "map_dilation": dilation, "map_ceil_mode": p.get("ceil_mode", False),
+        "bytes_est_in": len(source), "bytes_est_out_raw": elements * 2,
+    })
     return em
 
 

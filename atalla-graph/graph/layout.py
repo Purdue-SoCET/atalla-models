@@ -120,6 +120,17 @@ def _check_output_overlap(view):
         span += (size - 1) * stride
 
 
+def validate_view(view: TensorView, buffers: Mapping[str, bytes], *, writable=False):
+    """Check storage bounds and, for outputs, prove element nonoverlap."""
+    if view.buffer not in buffers:
+        raise ValueError(f'missing buffer: {view.buffer}')
+    if not isinstance(buffers[view.buffer], (bytes, bytearray)):
+        raise TypeError('buffer allocations must contain bytes or bytearray')
+    _check_bounds(view, len(buffers[view.buffer]))
+    if writable:
+        _check_output_overlap(view)
+
+
 def lower_layout(op: LayoutOp, buffers: Mapping[str, bytes]) -> LayoutPlan:
     """Validate one operation and map source byte strides to output axes.
 
@@ -130,15 +141,10 @@ def lower_layout(op: LayoutOp, buffers: Mapping[str, bytes]) -> LayoutPlan:
     if name not in ('copy', 'fill', 'broadcast', 'transpose'):
         raise ValueError(f'unsupported layout operation: {op.name}')
     src, dst = op.source, op.destination
-    for view in (src, dst):
-        if view.buffer not in buffers:
-            raise ValueError(f'missing buffer: {view.buffer}')
-        if not isinstance(buffers[view.buffer], (bytes, bytearray)):
-            raise TypeError('buffer allocations must contain bytes or bytearray')
-        _check_bounds(view, len(buffers[view.buffer]))
+    validate_view(src, buffers)
+    validate_view(dst, buffers, writable=True)
     if src.dtype != dst.dtype:
         raise NotImplementedError('cross-dtype layout operations require numerical cast lowering')
-    _check_output_overlap(dst)
     rank = len(dst.shape)
     if name in ('copy', 'fill'):
         if op.dimensions or op.permutation:

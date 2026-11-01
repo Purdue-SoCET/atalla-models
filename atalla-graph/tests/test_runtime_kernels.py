@@ -75,7 +75,7 @@ def test_softmax_runtime_shapes(rows, width, tmp_path):
                                expected, atol=.005, rtol=.03)
 
 
-@pytest.mark.parametrize('width,pool', [(8,2),(8,3),(32,2)])
+@pytest.mark.parametrize('width,pool', [(8,2),(8,3),(32,2),(35,2)])
 def test_maxpool_runtime_window(width, pool, tmp_path):
     channels, height, stride = 2, 5, 1
     h_out, w_out = height-pool+1, width-pool+1
@@ -83,9 +83,12 @@ def test_maxpool_runtime_window(width, pool, tmp_path):
     node, _ = node_for((1,channels,h_out,w_out))
     emission = emit.emit_maxpool(node, x, TileConfig('maxpool',dict(H=height,W=width,channels=channels,
                                     pool=pool,stride=stride,H_out=h_out,W_out=w_out)))
-    raw = execute(emission,tmp_path).reshape(channels,h_out,width)
-    expected = np.stack([x[:,r:r+pool,:].max(axis=1) for r in range(h_out)],axis=1)
-    np.testing.assert_array_equal(raw,expected)
+    assert not emission.skip_emulator
+    assert emission.maxpool_post is None
+    assert emission.output_elements == channels * h_out * w_out
+    actual = execute(emission, tmp_path).reshape(1, channels, h_out, w_out)
+    expected = torch.nn.functional.max_pool2d(torch.tensor(x).unsqueeze(0), pool, stride).numpy()
+    np.testing.assert_array_equal(actual, expected)
 
 
 @pytest.mark.parametrize('groups,features,eps', [(1,32,1e-5),(2,64,.25)])

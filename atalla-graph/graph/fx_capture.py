@@ -33,6 +33,7 @@ _OP_MAP: Dict[object, str] = {
     torch.ops.aten.relu.default: "relu",
     F.softmax: "softmax",
     F.max_pool2d: "maxpool",
+    F.max_pool2d_with_indices: "maxpool",
     F.conv2d: "conv",
     F.linear: "linear",
     F.adaptive_avg_pool2d: "adaptive_avg_pool",
