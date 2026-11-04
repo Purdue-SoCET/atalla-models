@@ -108,7 +108,9 @@ async function call(fn, ...args) {
 const state = {
   models: [], model: null, seed: 42, scale: null, options: {}, strict: false, tag: '',
   overrides: { global: {}, nodes: {} },
-  graph: null, graphLoading: false, selected: null, cy: null,
+  graph: null, graphLoading: false, selected: null,
+  // mermaid call graph: diagram text, sanitized-id maps, rendered node elements, viewport transform, parameter toggle
+  mermaidText: '', graphIds: null, graphEls: null, gz: null, showParams: false,
   runs: [], runsSort: { key: 'started', dir: -1 }, runsFilter: '', compare: [],
   run: null, // { id, status, events, summary, config, start, unsubscribe, charts, selected, export }
   kernels: [], kernel: null, kernelSrc: null,
@@ -134,7 +136,7 @@ function refreshChartTheme() {
   // Recolour live charts: datasets were built from the previous theme's tokens.
   Object.values(Chart.instances || {}).forEach((ch) => { recolourChart(ch, c); ch.update('none'); });
   // Graph colours are read from the CSS variables at draw time, so rebuild it on a theme change.
-  if (state.cy && state.view === 'workbench' && state.graph) drawGraph();
+  if (state.view === 'workbench' && state.graph && $('#graphCanvas')) drawGraph();
 }
 
 // Datasets tag themselves with the token they were built from (`tok`) so a theme switch can re-read it.
@@ -263,21 +265,30 @@ function controlsCard() {
 }
 
 function graphCard() {
-  const card = el(`<div class="card" id="graphCard"><div class="card-head"><h2>Call graph <span class="count" id="graphCount"></span></h2><span class="spacer"></span><button class="btn sm" id="applyOv" disabled>Apply overrides</button></div>
+  const card = el(`<div class="card" id="graphCard"><div class="card-head"><h2>Call graph <span class="count" id="graphCount"></span></h2><span class="spacer"></span>
+      <button class="btn sm ghost" id="copyMm" title="Copy the Mermaid flowchart source to the clipboard">${icon('i-copy')}Copy Mermaid</button>
+      <button class="btn sm ghost" id="srcMm" title="View the Mermaid flowchart source">${icon('i-code')}View source</button>
+      <button class="btn sm" id="applyOv" disabled>Apply overrides</button></div>
     <div class="chip-list mb8" id="ovChips"></div>
     <div class="counts" id="counts"></div>
-    <div class="graph-wrap"><div id="cy"></div><div class="graph-tools">
+    <div class="graph-wrap"><div id="graphView" aria-label="Call graph: drag to pan, wheel to zoom, click a node to select it"><div id="graphCanvas"></div></div><div class="graph-tools">
       <button class="btn icon" data-g="in" aria-label="Zoom in" title="Zoom in">${icon('i-plus')}</button>
       <button class="btn icon" data-g="out" aria-label="Zoom out" title="Zoom out">${icon('i-minus')}</button>
       <button class="btn icon" data-g="fit" aria-label="Fit" title="Fit to view">${icon('i-fit')}</button></div>
       <div id="graphOverlay" class="hidden" style="position:absolute;inset:0;display:grid;place-items:center;background:color-mix(in srgb, var(--bg) 70%, transparent);z-index:4"></div>
     </div>
-    <div class="legend">${['emulator', 'numpy', 'passthrough', 'skip', 'graph'].map((b) => `<span><i class="sw" style="background:${b === 'graph' ? 'var(--fill)' : `var(${BACKEND_VAR[b]})`};border-color:${b === 'graph' ? 'var(--text-3)' : `var(${BACKEND_VAR[b]})`};${b === 'graph' ? 'border-style:dashed' : ''}"></i>${BACKEND_LABEL[b]}</span>`).join('')}</div></div>`);
+    <div class="legend"><span class="legend-items">${['emulator', 'numpy', 'passthrough', 'skip', 'graph'].map((b) => `<span><i class="sw" style="background:${b === 'graph' ? 'var(--fill)' : `var(${BACKEND_VAR[b]})`};border-color:${b === 'graph' ? 'var(--text-3)' : `var(${BACKEND_VAR[b]})`};${b === 'graph' ? 'border-style:dashed' : ''}"></i>${BACKEND_LABEL[b]}</span>`).join('')}<span><i class="sw param"></i>Parameter</span></span>
+      <span class="spacer"></span><label class="switch small" title="Show weights, biases and mask buffers (get_attr nodes) as dashed nodes beside the op that consumes them"><input type="checkbox" id="showParams" ${state.showParams ? 'checked' : ''}> Show parameters</label></div></div>`);
   card.querySelector('.graph-tools').addEventListener('click', (e) => {
-    const b = e.target.closest('button'); if (!b || !state.cy) return;
-    if (b.dataset.g === 'fit') state.cy.fit(undefined, 24); else state.cy.zoom({ level: state.cy.zoom() * (b.dataset.g === 'in' ? 1.25 : 0.8), renderedPosition: { x: state.cy.width() / 2, y: state.cy.height() / 2 } });
+    const b = e.target.closest('button'); if (!b || !$('#graphCanvas svg')) return;
+    if (b.dataset.g === 'fit') fitGraph('all');
+    else { const v = $('#graphView'); zoomGraphAt(b.dataset.g === 'in' ? 1.25 : 0.8, v.clientWidth / 2, v.clientHeight / 2); }
   });
   card.querySelector('#applyOv').addEventListener('click', () => inspectGraph());
+  card.querySelector('#copyMm').addEventListener('click', () => copyMermaid());
+  card.querySelector('#srcMm').addEventListener('click', () => openMermaidSource());
+  card.querySelector('#showParams').addEventListener('change', (e) => { state.showParams = e.target.checked; if (state.graph) drawGraph(); });
+  initGraphViewport(card.querySelector('#graphView'), card.querySelector('#graphCanvas'));
   return card;
 }
 
@@ -297,51 +308,216 @@ async function inspectGraph() {
 
 function markOverridesDirty(dirty) { const b = $('#applyOv'); if (b) b.disabled = !dirty; }
 
-function drawGraph() {
-  const g = state.graph; if (!g || !$('#cy')) return;
-  const c = g.counts || {};
-  $('#graphCount').textContent = `${g.model_class || g.model} · ${c.total ?? g.nodes.length} nodes · input ${fmtShape(g.input_shape)}`;
-  $('#counts').innerHTML = [['emulated', 'Emulated', 'emulator'], ['numpy', 'NumPy', 'numpy'], ['passthrough', 'Passthrough', 'passthrough'], ['skip', 'Skip', 'skip']].map(([k, l, b]) => `<span class="stat"><i class="sw" style="background:var(${BACKEND_VAR[b]})"></i>${l} <b>${c[k] ?? 0}</b></span>`).join('') + `<span class="stat">Graph nodes <b>${(c.total ?? g.nodes.length) - ((c.emulated || 0) + (c.numpy || 0) + (c.passthrough || 0) + (c.skip || 0))}</b></span>`;
-  renderOverrideChips();
+/* ---------------------------------------------------------------- call graph (mermaid flowchart) */
+// Ids that would collide with flowchart keywords or edge syntax (`x`/`o` next to `--` draw cross/circle edge ends).
+const MERMAID_RESERVED = new Set(['end', 'graph', 'flowchart', 'subgraph', 'style', 'class', 'classdef', 'click', 'linkstyle', 'direction', 'default', 'o', 'x']);
+const isParamNode = (n) => n.op === 'get_attr';
+const isBoundaryNode = (n) => n.op === 'placeholder' || n.op === 'output';
+const mmText = (s) => String(s ?? '').replace(/"/g, '#quot;').replace(/</g, '#lt;').replace(/>/g, '#gt;');
+
+// Resolve a CSS colour expression to an opaque hex string (mermaid's classDef parser splits on commas, so rgba()/rgb() cannot be passed through).
+function parseCssRgb(str) {
+  // Chrome reports rgb()/rgba() with 0-255 channels, but color-mix() results as `color(srgb r g b / a)` with 0-1 floats.
+  const m = (str.match(/-?[\d.]+(?:e-?\d+)?/g) || ['0', '0', '0']).map(Number);
+  const srgb = /^color\(srgb/.test(str);
+  const [r, g, b] = m.slice(0, 3).map((v) => (srgb ? v * 255 : v)); const a = m.length > 3 ? m[3] : 1;
+  return [Math.max(0, Math.min(255, r)), Math.max(0, Math.min(255, g)), Math.max(0, Math.min(255, b)), a];
+}
+function cssHex(expr, bgRgb) {
+  const d = document.createElement('span'); d.style.color = expr; document.body.appendChild(d);
+  const m = parseCssRgb(getComputedStyle(d).color); d.remove();
+  let [r, g, b] = m; const a = m[3];
+  if (a < 1 && bgRgb) { r = a * r + (1 - a) * bgRgb[0]; g = a * g + (1 - a) * bgRgb[1]; b = a * b + (1 - a) * bgRgb[2]; }
+  return '#' + [r, g, b].map((v) => Math.round(v).toString(16).padStart(2, '0')).join('');
+}
+
+// Theme + per-backend colours for one render, read from the CSS tokens (DESIGN_NOTES.md mapping) so a theme switch recolours the chart.
+function graphPalette() {
   const cs = getComputedStyle(document.documentElement);
-  const text = cssVar('--text', cs), muted = cssVar('--text-2', cs), border = cssVar('--line', cs), surface = cssVar('--fill', cs), onPrimary = cssVar('--on-primary', cs), bg = cssVar('--bg', cs);
-  // cytoscape cannot parse rgba() with a fractional alpha in every path, so pre-blend hairline/edge tokens onto the background.
-  const blend = (fg, pct) => { const d = document.createElement('div'); d.style.color = `color-mix(in srgb, ${fg} ${pct}%, ${bg})`; document.body.appendChild(d); const v = getComputedStyle(d).color; d.remove(); return v; };
-  const edgeCol = blend(text, 28), graphLine = blend(text, 22), ptCol = blend(text, 42);
+  const bgD = document.createElement('span'); bgD.style.color = cssVar('--bg', cs); document.body.appendChild(bgD);
+  const bg = parseCssRgb(getComputedStyle(bgD).color).slice(0, 3); bgD.remove();
+  const hx = (name) => cssHex(cssVar(name, cs), bg);
+  const blend = (name, pct) => cssHex(`color-mix(in srgb, ${cssVar(name, cs)} ${pct}%, ${cssVar('--bg', cs)})`, bg);
   const dark = effectiveTheme() === 'dark';
-  const nodeFill = (b) => (b === 'graph' ? surface : b === 'passthrough' ? ptCol : backendColor(b, cs));
-  const nodeText = (b) => (b === 'graph' ? muted : b === 'passthrough' ? text : b === 'numpy' && dark ? onPrimary : '#fff');
-  const elements = [
-    ...g.nodes.map((n) => ({ data: { id: n.id, label: n.backend === 'graph' ? n.name : `${n.name}\n${n.op}`, backend: n.backend } })),
-    ...g.edges.filter((e) => g.nodes.find((n) => n.id === e.source) && g.nodes.find((n) => n.id === e.target)).map((e) => ({ data: { id: `${e.source}->${e.target}`, source: e.source, target: e.target } })),
-  ];
-  if (!window.cytoscape) { toast('cytoscape failed to load from CDN', 'error'); return; }
-  if (state.cy) { state.cy.destroy(); state.cy = null; }
-  if (window.cytoscapeDagre && !cytoscape.__dagreReg) { try { cytoscape.use(cytoscapeDagre); } catch (e) { /* already registered */ } cytoscape.__dagreReg = true; }
-  const cy = cytoscape({
-    container: $('#cy'), elements,
-    style: [
-      { selector: 'node', style: { shape: 'round-rectangle', width: (n) => Math.min(150, Math.max(64, 7 * Math.max(...n.data('label').split('\n').map((s) => s.length)) + 16)), height: (n) => (n.data('label').includes('\n') ? 34 : 24), padding: '4px', 'background-color': (n) => nodeFill(n.data('backend')), 'border-width': 1.5, 'border-color': (n) => (n.data('backend') === 'graph' ? graphLine : nodeFill(n.data('backend'))), label: 'data(label)', 'text-wrap': 'wrap', 'text-valign': 'center', 'text-halign': 'center', 'font-size': 11, 'font-family': getComputedStyle(document.body).fontFamily, 'font-weight': 600, color: (n) => nodeText(n.data('backend')), 'text-max-width': '140px', 'line-height': 1.2 } },
-      { selector: 'node[backend = "graph"]', style: { 'background-color': surface, 'border-style': 'dashed', 'font-weight': 400, 'font-size': 10 } },
-      { selector: 'node[backend = "passthrough"]', style: { color: text } },
-      { selector: 'node:selected', style: { 'border-color': text, 'border-width': 2.5, 'overlay-opacity': 0 } },
-      { selector: 'edge', style: { width: 1.2, 'line-color': edgeCol, 'target-arrow-color': edgeCol, 'target-arrow-shape': 'triangle', 'curve-style': 'bezier', 'arrow-scale': 0.7 } },
-      { selector: 'edge.hl', style: { 'line-color': text, 'target-arrow-color': text, width: 2.5 } },
-    ],
+  return {
+    bg: hx('--bg'), fill: hx('--fill'), raised: hx('--raised'), text: hx('--text'), muted: hx('--text-2'), faint: blend('--text', 42),
+    line: blend('--text', 22), edge: blend('--text', 34), accent: hx('--accent'), amber: hx('--amber'), red: hx('--red'),
+    onPrimary: hx('--on-primary'), numpyText: dark ? hx('--on-primary') : '#ffffff', dark,
+    font: getComputedStyle(document.body).fontFamily,
+  };
+}
+
+// Build the `flowchart TD` text from the /api/graph result. Nodes are declared in FX execution order and their
+// incoming edges follow immediately, so dagre sees the same order the model executes in. Parameters (get_attr)
+// are left out unless showParams; when shown they are declared right before their consumer as dashed `[/name/]`
+// nodes with a dotted edge, which keeps them beside the op instead of ranked at the top.
+function buildMermaid(g, showParams, pal) {
+  const nodes = g.nodes.slice().sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const nameCount = {}; nodes.forEach((n) => { nameCount[n.name] = (nameCount[n.name] || 0) + 1; });
+  const used = new Set(); const toMid = {}; const toReal = {};
+  nodes.forEach((n) => {
+    let s = String(n.id).replace(/[^A-Za-z0-9_]/g, '_');
+    if (!s || /^[0-9]/.test(s) || MERMAID_RESERVED.has(s.toLowerCase())) s = 'n_' + s;
+    let u = s, k = 2; while (used.has(u)) u = `${s}_${k++}`;
+    used.add(u); toMid[n.id] = u; toReal[u] = n.id;
   });
-  cy.layout({ name: window.cytoscapeDagre ? 'dagre' : 'breadthfirst', rankDir: 'TB', nodeSep: 20, rankSep: 36, edgeSep: 10, padding: 24, animate: false }).run();
-  // Deep graphs fit too small to read: keep a readable zoom anchored at the first node (the input).
-  if (cy.zoom() < 0.85 && g.nodes.length) { const spine = cy.nodes('[backend != "graph"]'); const anchor = (spine.length ? spine : cy.nodes())[0]; cy.zoom(0.85); cy.center(anchor); cy.panBy({ x: 0, y: -(cy.height() / 2 - 56) }); }
-  cy.on('tap', 'node', (e) => { selectNode(e.target.id()); });
-  cy.on('tap', (e) => { if (e.target === cy) { state.selected = null; cy.edges().removeClass('hl'); renderNodePanel(); } });
-  state.cy = cy;
-  if (state.selected) { cy.$id(state.selected).select(); cy.$id(state.selected).connectedEdges().addClass('hl'); }
+  const title = (n) => mmText(nameCount[n.name] > 1 && n.name !== n.id ? `${n.name} (${n.id})` : n.name || n.id);
+  const decl = (n) => {
+    const id = toMid[n.id];
+    if (isBoundaryNode(n)) return `${id}(["${title(n)}"]):::boundary`;
+    if (isParamNode(n)) return `${id}[/"${title(n)}"/]:::param`;
+    return `${id}["${title(n)}<br/><small>${mmText(n.op)}</small>"]:::${n.backend === 'graph' ? 'boundary' : n.backend}`;
+  };
+  const lines = ['flowchart TD'];
+  const declared = new Set();
+  nodes.forEach((n) => {
+    if (isParamNode(n)) return; // declared beside their consumer (or hidden)
+    lines.push(`  ${decl(n)}`); declared.add(n.id);
+    (n.inputs || []).forEach((src) => {
+      const s = byId.get(src); if (!s) return;
+      if (isParamNode(s)) {
+        if (!showParams) return;
+        if (!declared.has(s.id)) { lines.push(`  ${decl(s)}`); declared.add(s.id); }
+        lines.push(`  ${toMid[s.id]} -.-> ${toMid[n.id]}`);
+      } else lines.push(`  ${toMid[s.id]} --> ${toMid[n.id]}`);
+    });
+  });
+  lines.push('');
+  lines.push(`  classDef emulator fill:${pal.accent},stroke:${pal.accent},color:#ffffff`);
+  lines.push(`  classDef numpy fill:${pal.amber},stroke:${pal.amber},color:${pal.numpyText}`);
+  lines.push(`  classDef passthrough fill:${pal.faint},stroke:${pal.faint},color:${pal.text}`);
+  lines.push(`  classDef skip fill:${pal.red},stroke:${pal.red},color:#ffffff`);
+  lines.push(`  classDef boundary fill:${pal.fill},stroke:${pal.muted},stroke-dasharray:4 3,color:${pal.text}`);
+  lines.push(`  classDef param fill:${pal.fill},stroke:${pal.faint},stroke-dasharray:3 3,color:${pal.muted}`);
+  return { text: lines.join('\n'), toMid, toReal };
+}
+
+let graphRenderSeq = 0;
+async function drawGraph() {
+  const g = state.graph; const canvas = $('#graphCanvas'); if (!g || !canvas) return;
+  const c = g.counts || {};
+  const params = g.nodes.filter(isParamNode).length;
+  $('#graphCount').textContent = `${g.model_class || g.model} · ${c.total ?? g.nodes.length} nodes · input ${fmtShape(g.input_shape)}`;
+  $('#counts').innerHTML = [['emulated', 'Emulated', 'emulator'], ['numpy', 'NumPy', 'numpy'], ['passthrough', 'Passthrough', 'passthrough'], ['skip', 'Skip', 'skip']].map(([k, l, b]) => `<span class="stat"><i class="sw" style="background:var(${BACKEND_VAR[b]})"></i>${l} <b>${c[k] ?? 0}</b></span>`).join('')
+    + `<span class="stat">Graph nodes <b>${(c.total ?? g.nodes.length) - ((c.emulated || 0) + (c.numpy || 0) + (c.passthrough || 0) + (c.skip || 0))}</b></span>`
+    + `<span class="stat" title="get_attr nodes (weights, biases, mask buffers); ${state.showParams ? 'shown as dashed nodes' : 'hidden; listed under inputs in the node panel'}">Parameters <b>${params}</b>${state.showParams ? '' : ' <span class="muted">hidden</span>'}</span>`;
+  renderOverrideChips();
+  if (!window.mermaid) { toast('mermaid failed to load from CDN', 'error'); return; }
+  const pal = graphPalette();
+  const built = buildMermaid(g, state.showParams, pal);
+  state.mermaidText = built.text; state.graphIds = built;
+  mermaid.initialize({
+    startOnLoad: false, securityLevel: 'loose', theme: 'base', fontFamily: pal.font,
+    themeVariables: { fontFamily: pal.font, fontSize: '12px', background: pal.fill, primaryColor: pal.raised, primaryTextColor: pal.text, primaryBorderColor: pal.line, lineColor: pal.edge, secondaryColor: pal.fill, tertiaryColor: pal.fill, textColor: pal.text, nodeBorder: pal.line, mainBkg: pal.raised, edgeLabelBackground: pal.raised, clusterBkg: pal.fill, clusterBorder: pal.line, titleColor: pal.text },
+    flowchart: { curve: 'linear', nodeSpacing: 26, rankSpacing: 40, htmlLabels: true, useMaxWidth: false, padding: 10, diagramPadding: 12 },
+  });
+  const seq = ++graphRenderSeq;
+  let out;
+  try { out = await mermaid.render(`atallaGraph${seq}`, built.text); }
+  catch (e) { console.error('mermaid render failed', e); toast(`Graph render failed: ${e.message || e}`, 'error'); return; }
+  if (seq !== graphRenderSeq || !$('#graphCanvas')) return; // a newer render superseded this one or the view changed
+  $('#graphCanvas').innerHTML = out.svg;
+  const svg = $('#graphCanvas svg');
+  svg.removeAttribute('style'); // mermaid sets max-width on the root svg; the wrapper owns sizing
+  orthogonalEdges(svg);
+  // Map rendered node groups back to real node ids: mermaid formats the element id as `flowchart-<id>-<n>`.
+  const els = {};
+  svg.querySelectorAll('g.node').forEach((ge) => { const m = /^flowchart-(.+)-\d+$/.exec(ge.id || ''); const real = m && built.toReal[m[1]]; if (real) { els[real] = ge; ge.dataset.node = real; ge.setAttribute('tabindex', '0'); ge.setAttribute('role', 'button'); } });
+  state.graphEls = els;
+  svg.addEventListener('keydown', (e) => { if ((e.key === 'Enter' || e.key === ' ') && e.target.closest) { const n = e.target.closest('g.node'); if (n && n.dataset.node) { e.preventDefault(); selectNode(n.dataset.node); } } });
+  const key = `${g.model}|${state.showParams}|${svg.viewBox.baseVal.width}x${svg.viewBox.baseVal.height}`;
+  if (!state.gz || state.gz.key !== key) { state.gz = { k: 1, x: 0, y: 0, key }; fitGraph('width'); } else applyGraphTransform();
+  highlightGraphSelection();
+}
+
+// Mermaid has no orthogonal router (its d3 curves put the elbow at mid-x, which hugs the node edges in a TB chart).
+// Rewrite each linear edge path into vertical-first elbows: down to the gap between ranks, across, down into the target.
+function orthogonalEdges(svg) {
+  svg.querySelectorAll('path.flowchart-link').forEach((path) => {
+    const nums = (path.getAttribute('d') || '').match(/-?\d*\.?\d+(?:e-?\d+)?/g);
+    if (!nums || nums.length < 4 || /[CQSA]/i.test((path.getAttribute('d') || '').replace(/^M/, '').replace(/L/g, ''))) return;
+    const pts = []; for (let i = 0; i + 1 < nums.length; i += 2) pts.push({ x: +nums[i], y: +nums[i + 1] });
+    // drop near-duplicate points and tiny x jogs between waypoints (dagre dummy nodes) so long edges do not staircase
+    const q = [pts[0]];
+    for (let i = 1; i < pts.length; i++) { const a = q[q.length - 1], b = pts[i]; if (Math.abs(a.x - b.x) < 1 && Math.abs(a.y - b.y) < 1) continue; q.push(i < pts.length - 1 && Math.abs(b.x - a.x) < 6 ? { x: a.x, y: b.y } : b); }
+    if (q.length < 2) return;
+    let d = `M${q[0].x},${q[0].y}`;
+    for (let i = 1; i < q.length; i++) {
+      const a = q[i - 1], b = q[i];
+      if (Math.abs(a.x - b.x) < 0.5 || Math.abs(a.y - b.y) < 0.5) { d += ` L${b.x},${b.y}`; continue; }
+      const ym = (a.y + b.y) / 2; d += ` L${a.x},${ym} L${b.x},${ym} L${b.x},${b.y}`;
+    }
+    path.setAttribute('d', d);
+  });
+}
+
+function highlightGraphSelection() {
+  const canvas = $('#graphCanvas'); if (!canvas || !state.graphIds) return;
+  canvas.querySelectorAll('g.node.selected').forEach((n) => n.classList.remove('selected'));
+  canvas.querySelectorAll('.flowchart-link.hl').forEach((p) => p.classList.remove('hl'));
+  const mid = state.selected && state.graphIds.toMid[state.selected]; if (!mid) return;
+  const ge = state.graphEls && state.graphEls[state.selected]; if (ge) ge.classList.add('selected');
+  canvas.querySelectorAll(`.LS-${CSS.escape(mid)}, .LE-${CSS.escape(mid)}`).forEach((p) => p.classList.add('hl'));
 }
 
 function selectNode(id) {
   state.selected = id;
-  if (state.cy) { state.cy.edges().removeClass('hl'); const n = state.cy.$id(id); state.cy.elements().unselect(); n.select(); n.connectedEdges().addClass('hl'); }
+  highlightGraphSelection();
   renderNodePanel();
+}
+
+/* viewport: pan by dragging, zoom with the wheel or the +/−/fit buttons; a CSS transform on #graphCanvas */
+function applyGraphTransform() { const gz = state.gz, c = $('#graphCanvas'); if (gz && c) c.style.transform = `translate(${gz.x}px, ${gz.y}px) scale(${gz.k})`; }
+function zoomGraphAt(f, px, py) {
+  const gz = state.gz; if (!gz) return;
+  const k = Math.min(3, Math.max(0.15, gz.k * f)); const r = k / gz.k;
+  gz.x = px - (px - gz.x) * r; gz.y = py - (py - gz.y) * r; gz.k = k; applyGraphTransform();
+}
+function fitGraph(mode = 'all') {
+  const view = $('#graphView'), svg = $('#graphCanvas svg'), gz = state.gz; if (!view || !svg || !gz) return;
+  const W = view.clientWidth, H = view.clientHeight, w = svg.viewBox.baseVal.width || svg.clientWidth, h = svg.viewBox.baseVal.height || svg.clientHeight, pad = 20;
+  let k = (W - 2 * pad) / w; if (mode === 'all') k = Math.min(k, (H - 2 * pad) / h);
+  k = Math.min(1.15, Math.max(0.15, k));
+  gz.k = k; gz.x = (W - w * k) / 2; gz.y = mode === 'all' ? Math.max(pad, (H - h * k) / 2) : pad;
+  applyGraphTransform();
+}
+function initGraphViewport(view, canvas) {
+  let drag = null;
+  view.addEventListener('pointerdown', (e) => { if (e.button !== 0) return; drag = { x: e.clientX, y: e.clientY, ox: state.gz ? state.gz.x : 0, oy: state.gz ? state.gz.y : 0, moved: false, target: e.target }; view.setPointerCapture(e.pointerId); });
+  view.addEventListener('pointermove', (e) => {
+    if (!drag || !state.gz) return;
+    const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+    if (!drag.moved && Math.abs(dx) + Math.abs(dy) > 4) { drag.moved = true; view.classList.add('dragging'); }
+    if (drag.moved) { state.gz.x = drag.ox + dx; state.gz.y = drag.oy + dy; applyGraphTransform(); }
+  });
+  const end = () => { if (!drag) return null; const d = drag; drag = null; view.classList.remove('dragging'); return d; };
+  view.addEventListener('pointerup', () => {
+    const d = end(); if (!d || d.moved) return;
+    const n = d.target && d.target.closest ? d.target.closest('g.node') : null;
+    if (n && n.dataset.node) selectNode(n.dataset.node);
+    else if (state.selected) { state.selected = null; highlightGraphSelection(); renderNodePanel(); }
+  });
+  view.addEventListener('pointercancel', end);
+  view.addEventListener('wheel', (e) => { if (!state.gz) return; e.preventDefault(); const r = view.getBoundingClientRect(); zoomGraphAt(Math.exp(-e.deltaY * 0.0015), e.clientX - r.left, e.clientY - r.top); }, { passive: false });
+  canvas.style.transformOrigin = '0 0';
+}
+
+/* Mermaid source: copy to clipboard / view in a modal so the same chart can be pasted into docs */
+async function copyMermaid() {
+  const text = state.mermaidText; if (!text) { toast('No graph yet', 'warn'); return; }
+  try { await navigator.clipboard.writeText(text); toast('Mermaid source copied', 'ok'); return; } catch (e) { /* fall through to execCommand */ }
+  try { const ta = document.createElement('textarea'); ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0'; document.body.appendChild(ta); ta.select(); const ok = document.execCommand('copy'); ta.remove(); toast(ok ? 'Mermaid source copied' : 'Copy failed: select the text in View source', ok ? 'ok' : 'warn'); }
+  catch (e) { toast('Copy failed: select the text in View source', 'warn'); }
+}
+function openMermaidSource() {
+  const text = state.mermaidText; if (!text) { toast('No graph yet', 'warn'); return; }
+  const g = state.graph || {};
+  const body = el('<div></div>');
+  const row = el(`<div class="btn-row mb8"><button class="btn sm">${icon('i-copy')}Copy</button><span class="muted small">Paste inside a <code>\`\`\`mermaid</code> fence in Markdown. Colours are the current theme's tokens.</span></div>`);
+  row.querySelector('button').addEventListener('click', () => copyMermaid());
+  body.appendChild(row); body.appendChild(codeView(text));
+  modal('Mermaid source', `${g.model_class || g.model || ''} · ${text.split('\n').length} lines · parameters ${state.showParams ? 'shown' : 'hidden'}`, body);
 }
 
 function renderOverrideChips() {
