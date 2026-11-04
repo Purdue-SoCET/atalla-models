@@ -1,5 +1,13 @@
 # Model baselines — measured notes (agent "models", 2026-11-04)
 
+> **Update, later on 2026-11-04:** both failures recorded below were fixed the same day.
+> The multi-tile `add` defect was a compiler immediate-range bug (`addi_s` wraps `+2048` to `-2048`),
+> worked around in `kernels/{add,mul,relu}.py`; see `docs/add_kernel_multitile_fix.md`. The flash SDPA
+> trial failed because K was read from the wrong scratchpad and V was not transposed; see
+> `docs/flash_sdpa_investigation.md`. Authoritative post-fix numbers: `docs/baselines/README.md`.
+> The tables below are kept as the pre-fix record.
+
+
 All numbers below come from runs executed on 2026-11-04 in the `robert` worktree
 (`atalla-models` HEAD `3124659` + uncommitted changes listed at the bottom; submodules
 `aihw-ppci-compiler 351b5fab`, `functional_sim f159f0d`). Python:
@@ -56,7 +64,7 @@ Notes
   (emu_norm 2.86 vs ref_norm 5.90), which drags the end-to-end output to cos 0.986 /
   rel-L2 0.165. So the **flash trial still fails** exactly as in the spring report; the default
   path passes (cos 0.999994).
-* Related knob: `ATALLA_FFN_ADD_NUMPY` (default `1`) in `_plan_add` forces any add with
+* Related knob: `ATALLA_FFN_ADD_NUMPY` (default now `0`; was `1` before the fix) in `_plan_add` forces any add with
   > 1024 elements onto NumPy. See the GPT-2 section for why (multi-tile add kernel is wrong).
 
 ## GPT-2 blocks (new: `model/gpt2_block.py`, issue #66)
@@ -90,7 +98,7 @@ not emitted in the schedule** (pre-existing limitation of `scripts/generate_sche
 documented in its module docstring; `kernels/kernels.h` already declares `layernorm_kernel`,
 `gelu_kernel`, `softmax_kernel`). The patch to add them is in `docs/_handoff_models.md`.
 
-### Finding: multi-tile `add` kernel is wrong on the emulator (> 1024 elements)
+### Finding (RESOLVED same day, see docs/add_kernel_multitile_fix.md): multi-tile `add` kernel was wrong on the emulator (> 1024 elements)
 
 With `ATALLA_FFN_ADD_NUMPY=0` the 4096-element FFN bias add (`(32,128) + (128,)`, 128 rows ->
 4 scratchpad tiles of 32 rows) compiles and runs but returns garbage:

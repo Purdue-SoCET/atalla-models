@@ -1122,14 +1122,18 @@ def emit_sdpa(
     q_addr, k_addr, v_addr, o_addr = 0x1000, 0x3000, 0x5000, 0x7000
     img = DRAMWriter()
     img.f32(scale_addr, inv)
-    # K scratchpad in flash kernel is consumed column-wise; layout matches
-    # functional_sim contract_flash: row-major of K with matmul (Q @ K^T) — same
-    # storage as aihw-ppci flash test (K at 0x3000 as (N,D) in row order).
+    # Systolic weight contract (functional_sim gemm.vv): each lw.vi'd vector w_c becomes
+    # weight column c and gemm computes out[j] = sum_k a[k] * G[k, j] = sum_k a[k] * w_j[k],
+    # i.e. lane j of the output is (activation . w_j).  The kernel loads tile row c as w_c
+    # (reversed + shift mode, so DRAM row c -> column c).  Hence:
+    #   scores: s[j] = q . K[j, :]  -> K tile row-major (w_j = K row j)      (K at 0x3000)
+    #   P @ V : o[j] = p . V[:, j]  -> V tile must be V^T  (w_j = V column j) (V at 0x5000)
+    # Storing V row-major made the kernel compute P @ V^T (docs/flash_sdpa_investigation.md).
     for i, val in enumerate(qf[0].reshape(-1)):
         img.bf16(q_addr + i * 2, float(val))
     for i, val in enumerate(kf[0].reshape(-1)):
         img.bf16(k_addr + i * 2, float(val))
-    for i, val in enumerate(vf[0].reshape(-1)):
+    for i, val in enumerate(np.ascontiguousarray(vf[0].T).reshape(-1)):
         img.bf16(v_addr + i * 2, float(val))
     for i in range(n * d):
         img.bf16(o_addr + i * 2, 0.0)

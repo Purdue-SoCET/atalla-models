@@ -366,8 +366,10 @@ def run_schedule(gm, example_input: torch.Tensor, out_dir: str,
             print(
                 "  Note: F.linear in recent PyTorch FX traces is lowered in "
                 "``lower_linear_modules`` to matmul+add so matmul_kernel appears. "
-                "``layer_norm``, ``gelu``, and fused ``AtallaSdpa`` are not yet "
-                "emitted in graph_schedule.c (TBD; schedule is partial vs validate)."
+                "``layer_norm``/``gelu``/``softmax`` are emitted as layernorm_kernel/"
+                "gelu_kernel/softmax_kernel; the fused ``AtallaSdpa`` leaf is still "
+                "not emitted in graph_schedule.c (schedule is partial vs validate "
+                "only for vit_micro's sdpa node)."
             )
     return c_code
 

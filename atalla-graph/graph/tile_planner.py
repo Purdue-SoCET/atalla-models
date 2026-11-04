@@ -283,9 +283,12 @@ def _plan_add(node: Node) -> TileConfig:
     total = 1
     for d in (shape or [1]):
         total *= d
-    # 2048-wide FFN bias add: multi-tile C path may deviate in sim; set
-    # ``ATALLA_FFN_ADD_NUMPY=0`` to force the AtallaC add image in validate.
-    ffn_add_numpy = os.environ.get("ATALLA_FFN_ADD_NUMPY", "1") == "1"
+    # Multi-tile adds (> 1024 elements, i.e. more than one 32x32 scratchpad tile)
+    # run on the emulator by default since the ``kernels/add.py`` tile-stride fix
+    # (the old failure was a compiler addi_s immediate overflow, see
+    # docs/add_kernel_multitile_fix.md). ``ATALLA_FFN_ADD_NUMPY=1`` restores the
+    # previous behaviour (adds > 1024 elements on NumPy); ``0``/unset = emulator.
+    ffn_add_numpy = os.environ.get("ATALLA_FFN_ADD_NUMPY", "0") == "1"
     use_numpy = ffn_add_numpy and total > 1024
     return TileConfig(
         kernel_type="add",
