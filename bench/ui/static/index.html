@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Atalla Workbench</title>
+  <meta name="description" content="Visual benchmarking workbench for Atalla models: call graph, kernel mapping, live runs, metrics and tracker export.">
+  <script>
+    // Theme before first paint (per-viewer convenience only). No stored choice => follow prefers-color-scheme.
+    try { var t = localStorage.getItem('atalla.theme'); if (t === 'light' || t === 'dark') document.documentElement.setAttribute('data-theme', t); } catch (e) {}
+    // Asset base: FastAPI serves the UI at "/" with files under "/static/"; python -m http.server serves "/index.html" next to them.
+    (function () {
+      var base = location.pathname === '/' ? '/static/' : './';
+      var l = document.createElement('link'); l.rel = 'stylesheet'; l.href = base + 'style.css'; document.head.appendChild(l);
+      window.__ATALLA_BASE__ = base;
+    })();
+  </script>
+  <!-- Pinned libraries. cytoscape-dagre is not published on cdnjs (404 at every version), so it is pinned on jsdelivr.
+       Chart.js 4.4.4 does not exist on cdnjs; 4.4.1 is the newest 4.4.x build there. -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.30.2/cytoscape.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/dagre/0.8.5/dagre.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/cytoscape-dagre@2.5.0/cytoscape-dagre.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+</head>
+<body>
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+    <defs>
+      <symbol id="i-workbench" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M4 5h16v11H4zM8 20h8M12 16v4M8 9h3M8 12h6"/></symbol>
+      <symbol id="i-runs" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M4 6h16M4 12h16M4 18h10"/><circle cx="19" cy="18" r="2" fill="currentColor"/></symbol>
+      <symbol id="i-kernels" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M9 3v3M15 3v3M9 18v3M15 18v3M3 9h3M3 15h3M18 9h3M18 15h3"/><rect x="6" y="6" width="12" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="1.8"/><rect x="10" y="10" width="4" height="4" fill="currentColor"/></symbol>
+      <symbol id="i-metrics" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M4 20V10M10 20V4M16 20v-8M22 20H2"/></symbol>
+      <symbol id="i-play" viewBox="0 0 24 24"><path fill="currentColor" d="M8 5v14l11-7z"/></symbol>
+      <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor"/></symbol>
+      <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4" fill="none" stroke="currentColor" stroke-width="1.8"/><path stroke="currentColor" stroke-width="1.8" stroke-linecap="round" d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></symbol>
+      <symbol id="i-moon" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z"/></symbol>
+      <symbol id="i-x" viewBox="0 0 24 24"><path stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M6 6l12 12M18 6L6 18"/></symbol>
+      <symbol id="i-fit" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></symbol>
+      <symbol id="i-plus" viewBox="0 0 24 24"><path stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M12 5v14M5 12h14"/></symbol>
+      <symbol id="i-minus" viewBox="0 0 24 24"><path stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M5 12h14"/></symbol>
+      <symbol id="i-graph" viewBox="0 0 24 24"><circle cx="12" cy="5" r="2.5" fill="none" stroke="currentColor" stroke-width="1.8"/><circle cx="6" cy="19" r="2.5" fill="none" stroke="currentColor" stroke-width="1.8"/><circle cx="18" cy="19" r="2.5" fill="none" stroke="currentColor" stroke-width="1.8"/><path stroke="currentColor" stroke-width="1.8" d="M11 7l-4 10M13 7l4 10"/></symbol>
+      <symbol id="i-doc" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" d="M6 3h8l4 4v14H6zM14 3v4h4M9 12h6M9 16h6"/></symbol>
+      <symbol id="i-export" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M12 3v12M7 10l5 5 5-5M5 21h14"/></symbol>
+      <symbol id="i-compare" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" d="M9 4v16M15 4v16M4 9h5M15 9h5M4 15h5M15 15h5"/></symbol>
+      <symbol id="i-inbox" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" d="M3 13l2-8h14l2 8v6H3zM3 13h5l2 3h4l2-3h5"/></symbol>
+    </defs>
+  </svg>
+
+  <div class="shell">
+    <aside class="rail">
+      <div class="brand">
+        <span class="logo"><svg width="20" height="20" viewBox="0 0 24 24"><path fill="currentColor" d="M12 2L2 20h20L12 2zm0 5.5L17.5 18h-11L12 7.5z"/></svg></span>
+        <span class="txt">Atalla<small>Benchmark workbench</small></span>
+      </div>
+      <nav class="nav" id="nav" aria-label="Primary">
+        <a href="#/workbench" data-view="workbench"><svg><use href="#i-workbench"/></svg><span>Workbench</span></a>
+        <a href="#/runs" data-view="runs"><svg><use href="#i-runs"/></svg><span>Runs</span></a>
+        <a href="#/kernels" data-view="kernels"><svg><use href="#i-kernels"/></svg><span>Kernels</span></a>
+        <a href="#/metrics" data-view="metrics"><svg><use href="#i-metrics"/></svg><span>Metrics</span></a>
+      </nav>
+      <div class="rail-footer">
+        <button class="btn ghost" id="themeToggle" aria-label="Toggle light / dark theme" title="Toggle theme"><svg><use href="#i-sun"/></svg><span class="lbl">Theme</span></button>
+        <span class="mode-pill" id="modePill" title="Data source"><span class="dot"></span><span class="lbl">connecting</span></span>
+      </div>
+    </aside>
+
+    <div class="main">
+      <section class="center">
+        <header class="topbar">
+          <div style="min-width:0">
+            <h1 id="title">Workbench</h1>
+            <div class="sub"><span id="subtitle"></span><span class="origin" id="origin" title="Open this URL from any machine on the LAN"></span></div>
+          </div>
+          <span class="spacer"></span>
+          <div id="topActions" class="btn-row"></div>
+          <button class="btn primary" id="runBtn"><svg><use href="#i-play"/></svg>Run</button>
+        </header>
+        <div class="content" id="content"></div>
+      </section>
+      <aside class="right" id="right"></aside>
+    </div>
+  </div>
+
+  <div id="modalRoot"></div>
+  <div class="toasts" id="toasts" aria-live="polite"></div>
+
+  <script>document.write('<script type="module" src="' + window.__ATALLA_BASE__ + 'app.js"><\/script>');</script>
+</body>
+</html>
