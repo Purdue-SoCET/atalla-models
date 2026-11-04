@@ -1,0 +1,243 @@
+{
+  "run_id": "vit_micro__flash-trial-chained__20261104-1439",
+  "model": "vit_micro",
+  "model_class": "ViTMicro",
+  "tag": "flash-trial-chained",
+  "scale": null,
+  "seed": 42,
+  "seed_effective": 42,
+  "extra_args": "",
+  "env": {
+    "ATALLA_SDPA_FLASH": "1"
+  },
+  "mode": "validate",
+  "validate_inputs": "chained",
+  "command": "/Users/robert.zhang/.venvs/atalla/bin/python run_graph.py --model vit_micro --mode validate --out-dir /Users/robert.zhang/Documents/GitHub/atalla-models-rz/docs/baselines/vit_micro__flash-trial-chained__20261104-1439/out --metrics-json /Users/robert.zhang/Documents/GitHub/atalla-models-rz/docs/baselines/vit_micro__flash-trial-chained__20261104-1439/metrics.json --layer-metrics-csv /Users/robert.zhang/Documents/GitHub/atalla-models-rz/docs/baselines/vit_micro__flash-trial-chained__20261104-1439/layers.csv --seed 42",
+  "cwd": "/Users/robert.zhang/Documents/GitHub/atalla-models-rz/atalla-graph",
+  "returncode": 0,
+  "elapsed_s": 13.005,
+  "timestamp_utc": "2026-11-04T14:39:14.181929+00:00",
+  "hostname": "Roberts-MacBook-Pro-3",
+  "platform": "macOS-26.0.1-arm64-arm-64bit",
+  "versions": {
+    "python": "3.11.6",
+    "python_exe": "/Users/robert.zhang/.venvs/atalla/bin/python",
+    "torch": "2.15.0",
+    "numpy": "2.4.6"
+  },
+  "git": {
+    "atalla_models": {
+      "path": "/Users/robert.zhang/Documents/GitHub/atalla-models-rz",
+      "sha": "3124659ec3ab4e22c918361f93adf6a2758a7b29",
+      "short_sha": "3124659",
+      "branch": "robert",
+      "dirty": true
+    },
+    "compiler": {
+      "path": "/Users/robert.zhang/Documents/GitHub/atalla-models-rz/aihw-ppci-compiler",
+      "sha": "351b5fabf76fa3352ebc2e9571e9793d53c7cbe6",
+      "short_sha": "351b5fab",
+      "branch": "HEAD",
+      "dirty": false
+    },
+    "functional_sim": {
+      "path": "/Users/robert.zhang/Documents/GitHub/atalla-models-rz/functional_sim",
+      "sha": "f159f0db15e48847e344cd8ada2106527278db94",
+      "short_sha": "f159f0d",
+      "branch": "HEAD",
+      "dirty": false
+    }
+  },
+  "shapes": [
+    {
+      "node": "matmul",
+      "op": "matmul",
+      "shape": [
+        1,
+        32,
+        32
+      ]
+    },
+    {
+      "node": "add_3",
+      "op": "add",
+      "shape": [
+        1,
+        32,
+        32
+      ]
+    },
+    {
+      "node": "add",
+      "op": "add",
+      "shape": [
+        1,
+        32,
+        32
+      ]
+    },
+    {
+      "node": "layer_norm",
+      "op": "layernorm",
+      "shape": [
+        1,
+        32,
+        32
+      ]
+    },
+    {
+      "node": "matmul_1",
+      "op": "matmul",
+      "shape": [
+        1,
+        32,
+        32
+      ]
+    },
+    {
+      "node": "add_4",
+      "op": "add",
+      "shape": [
+        1,
+        32,
+        32
+      ]
+    },
+    {
+      "node": "matmul_2",
+      "op": "matmul",
+      "shape": [
+        1,
+        32,
+        32
+      ]
+    },
+    {
+      "node": "add_5",
+      "op": "add",
+      "shape": [
+        1,
+        32,
+        32
+      ]
+    },
+    {
+      "node": "matmul_3",
+      "op": "matmul",
+      "shape": [
+        1,
+        32,
+        32
+      ]
+    },
+    {
+      "node": "add_6",
+      "op": "add",
+      "shape": [
+        1,
+        32,
+        32
+      ]
+    },
+    {
+      "node": "sdpa",
+      "op": "atalla_sdpa",
+      "shape": [
+        1,
+        32,
+        32
+      ]
+    },
+    {
+      "node": "matmul_4",
+      "op": "matmul",
+      "shape": [
+        1,
+        32,
+        32
+      ]
+    },
+    {
+      "node": "add_7",
+      "op": "add",
+      "shape": [
+        1,
+        32,
+        32
+      ]
+    },
+    {
+      "node": "add_1",
+      "op": "add",
+      "shape": [
+        1,
+        32,
+        32
+      ]
+    },
+    {
+      "node": "layer_norm_1",
+      "op": "layernorm",
+      "shape": [
+        1,
+        32,
+        32
+      ]
+    },
+    {
+      "node": "matmul_5",
+      "op": "matmul",
+      "shape": [
+        1,
+        32,
+        64
+      ]
+    },
+    {
+      "node": "add_8",
+      "op": "add",
+      "shape": [
+        1,
+        32,
+        64
+      ]
+    },
+    {
+      "node": "gelu",
+      "op": "gelu",
+      "shape": [
+        1,
+        32,
+        64
+      ]
+    },
+    {
+      "node": "matmul_6",
+      "op": "matmul",
+      "shape": [
+        1,
+        32,
+        32
+      ]
+    },
+    {
+      "node": "add_9",
+      "op": "add",
+      "shape": [
+        1,
+        32,
+        32
+      ]
+    },
+    {
+      "node": "add_2",
+      "op": "add",
+      "shape": [
+        1,
+        32,
+        32
+      ]
+    }
+  ],
+  "notes": []
+}

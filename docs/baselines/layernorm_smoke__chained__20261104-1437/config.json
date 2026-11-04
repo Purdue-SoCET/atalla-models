@@ -1,0 +1,75 @@
+{
+  "run_id": "layernorm_smoke__chained__20261104-1437",
+  "model": "layernorm_smoke",
+  "model_class": "LayerNormSmoke",
+  "tag": "chained",
+  "scale": null,
+  "seed": 42,
+  "seed_effective": 42,
+  "extra_args": "--strict-end",
+  "mode": "validate",
+  "validate_inputs": "chained",
+  "command": "/Users/robert.zhang/.venvs/atalla/bin/python run_graph.py --model layernorm_smoke --mode validate --out-dir /Users/robert.zhang/Documents/GitHub/atalla-models-rz/docs/baselines/layernorm_smoke__chained__20261104-1437/out --metrics-json /Users/robert.zhang/Documents/GitHub/atalla-models-rz/docs/baselines/layernorm_smoke__chained__20261104-1437/metrics.json --layer-metrics-csv /Users/robert.zhang/Documents/GitHub/atalla-models-rz/docs/baselines/layernorm_smoke__chained__20261104-1437/layers.csv --seed 42 --strict-end",
+  "cwd": "/Users/robert.zhang/Documents/GitHub/atalla-models-rz/atalla-graph",
+  "returncode": 0,
+  "elapsed_s": 3.811,
+  "timestamp_utc": "2026-11-04T14:37:41.095909+00:00",
+  "hostname": "Roberts-MacBook-Pro-3",
+  "platform": "macOS-26.0.1-arm64-arm-64bit",
+  "versions": {
+    "python": "3.11.6",
+    "python_exe": "/Users/robert.zhang/.venvs/atalla/bin/python",
+    "torch": "2.15.0",
+    "numpy": "2.4.6"
+  },
+  "git": {
+    "atalla_models": {
+      "path": "/Users/robert.zhang/Documents/GitHub/atalla-models-rz",
+      "sha": "3124659ec3ab4e22c918361f93adf6a2758a7b29",
+      "short_sha": "3124659",
+      "branch": "robert",
+      "dirty": true
+    },
+    "compiler": {
+      "path": "/Users/robert.zhang/Documents/GitHub/atalla-models-rz/aihw-ppci-compiler",
+      "sha": "351b5fabf76fa3352ebc2e9571e9793d53c7cbe6",
+      "short_sha": "351b5fab",
+      "branch": "HEAD",
+      "dirty": false
+    },
+    "functional_sim": {
+      "path": "/Users/robert.zhang/Documents/GitHub/atalla-models-rz/functional_sim",
+      "sha": "f159f0db15e48847e344cd8ada2106527278db94",
+      "short_sha": "f159f0d",
+      "branch": "HEAD",
+      "dirty": false
+    }
+  },
+  "shapes": [
+    {
+      "node": "matmul",
+      "op": "matmul",
+      "shape": [
+        1,
+        32
+      ]
+    },
+    {
+      "node": "add",
+      "op": "add",
+      "shape": [
+        1,
+        32
+      ]
+    },
+    {
+      "node": "layer_norm",
+      "op": "layernorm",
+      "shape": [
+        1,
+        32
+      ]
+    }
+  ],
+  "notes": []
+}
