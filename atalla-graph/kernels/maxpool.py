@@ -36,11 +36,9 @@ def maxpool_c(H: int, W: int, C: int, pool: int, stride: int) -> str:
 
     return (
         "int main() {\n"
-        f"    int cfg = {ADDR_TABLE};\n"
-        "    int IN_BASE;\n"
-        "    int OUT_BASE;\n"
-        '    asm("lw_s %0, 0(%1)" : "=r"(IN_BASE)  : "r"(cfg));\n'
-        '    asm("lw_s %0, 4(%1)" : "=r"(OUT_BASE) : "r"(cfg));\n'
+        f"    int* cfg = (int*){ADDR_TABLE};\n"
+        "    int IN_BASE = *(cfg + 0);\n"
+        "    int OUT_BASE = *(cfg + 1);\n"
         "\n"
         "    int sp = 0;\n"
         "    int all_mask = -1;\n"
@@ -69,7 +67,7 @@ def maxpool_c(H: int, W: int, C: int, pool: int, stride: int) -> str:
         "        ch = ch + 1;\n"
         "    }\n"
         "\n"
-        '    asm("halt");\n'
+        "    atalla_halt();\n"
         "    return 0;\n"
         "}\n"
     )

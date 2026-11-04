@@ -22,17 +22,12 @@ def layernorm_c(M: int, D: int, eps: float) -> str:
 
     return (
         "int main() {\n"
-        f"    int cfg = {ADDR_TABLE};\n"
-        "    int IN0;\n"
-        "    int OUT0;\n"
-        "    int GM;\n"
-        "    int BM;\n"
-        "    int M;\n"
-        '    asm("lw_s %0, 0(%1)"  : "=r"(IN0)  : "r"(cfg));\n'
-        '    asm("lw_s %0, 4(%1)"  : "=r"(OUT0) : "r"(cfg));\n'
-        '    asm("lw_s %0, 8(%1)"  : "=r"(GM)    : "r"(cfg));\n'
-        '    asm("lw_s %0, 12(%1)" : "=r"(BM)    : "r"(cfg));\n'
-        '    asm("lw_s %0, 16(%1)" : "=r"(M)     : "r"(cfg));\n'
+        f"    int* cfg = (int*){ADDR_TABLE};\n"
+        "    int IN0 = *(cfg + 0);\n"
+        "    int OUT0 = *(cfg + 1);\n"
+        "    int GM = *(cfg + 2);\n"
+        "    int BM = *(cfg + 3);\n"
+        "    int M = *(cfg + 4);\n"
         "\n"
         "    int sp = 0;\n"
         f"    float inv_d = {inv_d_lit};\n"
@@ -86,7 +81,7 @@ def layernorm_c(M: int, D: int, eps: float) -> str:
         "        grp = grp + 1;\n"
         "    }\n"
         "\n"
-        '    asm("halt");\n'
+        "    atalla_halt();\n"
         "    return 0;\n"
         "}\n"
     )

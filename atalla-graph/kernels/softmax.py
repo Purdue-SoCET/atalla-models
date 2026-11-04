@@ -16,11 +16,9 @@ def softmax_c_batched(num_rows: int, row_len: int) -> str:
 
     return (
         "int main() {\n"
-        f"    int cfg = {ADDR_TABLE};\n"
-        "    int IN_GMEM;\n"
-        "    int dummy;\n"
-        '    asm("lw_s %0, 0(%1)" : "=r"(IN_GMEM) : "r"(cfg));\n'
-        '    asm("lw_s %0, 4(%1)" : "=r"(dummy)   : "r"(cfg));\n'
+        f"    int* cfg = (int*){ADDR_TABLE};\n"
+        "    int IN_GMEM = *(cfg + 0);\n"
+        "    int dummy = *(cfg + 1);\n"
         "\n"
         "    int sp = 0;\n"
         f"    int mask_val = {mask_val};\n"
@@ -47,7 +45,7 @@ def softmax_c_batched(num_rows: int, row_len: int) -> str:
         "        batch = batch + 1;\n"
         "    }\n"
         "\n"
-        '    asm("halt");\n'
+        "    atalla_halt();\n"
         "    return 0;\n"
         "}\n"
     )
@@ -65,11 +63,9 @@ def softmax_c(length: int) -> str:
 
     return (
         "int main() {\n"
-        f"    int cfg = {ADDR_TABLE};\n"
-        "    int IN_GMEM;\n"
-        "    int dummy;\n"
-        '    asm("lw_s %0, 0(%1)" : "=r"(IN_GMEM) : "r"(cfg));\n'
-        '    asm("lw_s %0, 4(%1)" : "=r"(dummy)   : "r"(cfg));\n'
+        f"    int* cfg = (int*){ADDR_TABLE};\n"
+        "    int IN_GMEM = *(cfg + 0);\n"
+        "    int dummy = *(cfg + 1);\n"
         "\n"
         "    int sp = 0;\n"
         f"    int mask_val = {mask_val};\n"
@@ -97,7 +93,7 @@ def softmax_c(length: int) -> str:
         "\n"
         "    scpad_store(sp, IN_GMEM, sdma_ctl);\n"
         "\n"
-        '    asm("halt");\n'
+        "    atalla_halt();\n"
         "    return 0;\n"
         "}\n"
     )

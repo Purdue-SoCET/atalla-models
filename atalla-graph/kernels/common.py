@@ -12,10 +12,6 @@ def sdma_ctl_val(sid: int, num_rows: int, num_cols: int, full_cols: int) -> int:
 
 
 def sdma_ctl_expr(name: str, sid: int, num_rows: int, num_cols: int, full_cols: int) -> str:
-    """Emit C statement that loads a pre-computed sdma_ctl via inline asm li_s.
-
-    The compiler's instruction selector can't handle large constant stores,
-    so we use inline asm to let build_compiler expand li_s -> lui_s+addi_s.
-    """
+    """Emit C statement that defines sdma_ctl."""
     val = sdma_ctl_val(sid, num_rows, num_cols, full_cols)
-    return f'    int {name};\n    asm("li_s %0, {val}" : "=r"({name}));\n'
+    return f"    int {name} = {val};\n"
