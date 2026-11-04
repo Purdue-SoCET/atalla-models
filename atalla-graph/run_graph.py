@@ -24,7 +24,8 @@ Usage:
 Env knobs: --seed (torch+numpy, before load_model); ATALLA_SDPA_FLASH (vit_micro fused
 attention), ATALLA_GELU_KERNEL=horner|tanh (emit_gelu on emulator), ATALLA_FFN_ADD_NUMPY=0
 (force AtallaC add above 1024 elems; multi-tile add kernel currently wrong, see
-docs/model_baselines_notes.md).
+docs/model_baselines_notes.md), ATALLA_GEMM_SCHEDULE=baseline|double_buffer (tiled GEMM
+schedule, docs/experiments/gemm_double_buffer_2026-11.md).
 """
 from __future__ import annotations
 

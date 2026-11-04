@@ -1,0 +1,5 @@
+template_key,map_kind,map_M,map_N,map_K,n_layers,layer_names,sum_packets_executed,sum_instructions_executed,sum_sched_packets,sum_flops_total,sum_flops_matmul,mean_packet_share,sum_bytes_loaded,sum_bytes_written,sum_bytes_loaded_sp0,sum_bytes_loaded_sp1,sum_bytes_stored_sp0,sum_bytes_stored_sp1,reuse_R_A_gemm,reuse_R_W_gemm,sum_dyn_retired_branch_control,sum_dyn_retired_sdma,sum_dyn_retired_scalar_mem,sum_dyn_retired_scalar_alu,sum_dyn_retired_vector_mem,sum_dyn_retired_vector_alu,sum_dyn_retired_gemm_systolic,sum_dyn_retired_move_convert
+add|rows1|width32,add,1,32,,4,add;add_1;add_2;add_3,396,500,416,424,0,0.033662,512,256,256,256,256,0,,,36,12,188,216,36,8,0,4
+gemm|M1|N32|K32,gemm,1,32,32,3,matmul;matmul_1;matmul_2,2226,2532,843,7008,6144,0.252295,6720,192,384,6336,0,192,18.25,1.106061,255,15,1017,819,321,3,99,3
+mul|mul|mul|,mul,mul,mul,,1,mul,105,127,110,106,0,0.035702,128,64,64,64,64,0,,,9,3,54,49,9,2,0,1
+relu|rows1|width32,relu,1,32,,2,relu;relu_1,214,264,224,346,0,0.036382,128,128,128,0,128,0,,,18,4,92,108,26,8,0,8
