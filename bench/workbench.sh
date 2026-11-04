@@ -28,5 +28,10 @@ echo "Atalla Benchmark Workbench"
 echo "  local:   http://127.0.0.1:${PORT}"
 [ "$HOST" = "0.0.0.0" ] && [ -n "$LAN_IP" ] && echo "  network: http://${LAN_IP}:${PORT}"
 echo "  repo:    $REPO   (runs land in docs/baselines/, exports in output/)"
+if [ "$HOST" = "0.0.0.0" ]; then
+  echo "  note:    macOS firewall: if other machines can't connect, click Allow on the"
+  echo "           'accept incoming network connections' prompt, or run once:"
+  echo "           sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add \"$("$PY" -c 'import sys;print(sys.executable)')\" --unblockapp \"$("$PY" -c 'import sys;print(sys.executable)')\""
+fi
 cd "$REPO"
-exec "$PY" -m uvicorn bench.ui.server:app --host "$HOST" --port "$PORT" "${EXTRA[@]}"
+exec "$PY" -m uvicorn bench.ui.server:app --host "$HOST" --port "$PORT" ${EXTRA[@]+"${EXTRA[@]}"}

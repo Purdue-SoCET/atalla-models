@@ -126,6 +126,28 @@ python -m pytest tests/kernels -q          # standalone kernels on the emulator 
 writes a metrics JSON per run under `docs/baselines/`; `bench/build_workbook.py` collects them into
 `output/Atalla_Benchmarking_Workbook.xlsx`. Field definitions: `docs/benchmark_metrics.md`.
 
+### Visual workbench
+
+`bench/workbench.sh` starts the benchmarking workbench (FastAPI + browser UI) on this machine's LAN IP
+and prints the URLs (`--local` binds 127.0.0.1 only, `--port N`, `--reload` for development):
+
+```bash
+bench/workbench.sh          # http://<your-ip>:8765
+```
+
+On macOS the first launch triggers the firewall's "accept incoming network connections" prompt for the
+venv's Python; click Allow (or add it once with `sudo /usr/libexec/ApplicationFirewall/socketfilterfw
+--add <python> --unblockapp <python>`), otherwise other machines get no answer while localhost works.
+
+In the browser: pick a model, inspect the exact FX call graph with every node labelled by its backend
+(emulator kernel / NumPy reference / pass-through), click a node to see the kernel it maps to, its tile
+configuration and DRAM address, force a node to `numpy`, `emulator` or `skip`, pick kernel variants
+(GELU horner/tanh, SDPA flash/numpy), launch a run and watch per-node cosine and packets stream in,
+then export the run to `output/runs/<run>.xlsx` and rebuild `output/Atalla_Benchmarking_Tracker.xlsx`
+(same layout as the team's Atalla Benchmarking Tracker sheet). API and file layout: `bench/ui/README.md`,
+contract: `bench/ui/API_CONTRACT.md`. The same overrides work from the CLI:
+`run_graph.py --overrides ov.json --progress-jsonl progress.jsonl`.
+
 > **Pending upstream change:** the compiler/sim `investigate-weight-load-order` branches flip `lw.vi`
 > weight loading to last-to-first. When the submodule pins move past that, reverse the weight loop in
 > `atalla-graph/kernels/gemm.py` or every GEMM-backed layer fails validation.
