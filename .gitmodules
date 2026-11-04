@@ -1,8 +1,8 @@
 [submodule "aihw-ppci-compiler"]
 	path = aihw-ppci-compiler
-	url = https://github.com/Purdue-SoCET/aihw-ppci-compiler.git
-	branch = atalla-models
+	url = org-726@github.itap.purdue.edu:SoCETOrganization/aihw-ppci-compiler.git
+	branch = atalla-arch
 [submodule "functional_sim"]
 	path = functional_sim
-	url = https://github.com/Purdue-SoCET/atalla-functional-sim.git
-	branch = inference_dev
+	url = org-726@github.itap.purdue.edu:SoCETOrganization/atalla-functional-sim.git
+	branch = main
