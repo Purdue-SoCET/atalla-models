@@ -1,4 +1,13 @@
-# Forward and backward graph capture
+# atalla-graph: forward and backward graph capture
+
+Pipeline overview and directory map: `../docs/REPO_GUIDE.md`. Setup: `../docs/ENVIRONMENT.md`.
+Canonical runs (from this directory, with the 3.11 venv):
+
+```bash
+python run_graph.py --model basic --mode validate --out-dir out/graph --metrics-json out/graph/m.json
+python run_graph.py --model basic --mode schedule --out-dir out/graph
+python run_graph.py --model basic --mode validate --training --out-dir out/train
+```
 
 `build_graph` still returns a single `torch.fx.GraphModule`. Forward-only calls
 use the existing trace, module lowering, shape propagation, normalization, and
@@ -16,7 +25,7 @@ import torch
 import torch.nn.functional as F
 from run_graph import build_graph, load_model
 
-model, x = load_model("basic")
+model, x, _expected = load_model("basic")   # (model, example_input, expected_output_or_None)
 labels = torch.zeros(x.shape[0], dtype=torch.long)
 gm = build_graph(
     model, x,
@@ -75,15 +84,21 @@ DRAM planning conservatively keeps separate allocations for intermediate results
 including forward values used in backward. Sizes account for BF16, FP32, and
 integer tensors. These annotations are for graph development; the BF16 binary
 allocator and existing C emitter do not yet implement mixed-dtype backward
-execution. `run_schedule` and `run_validate` reject combined graphs with an
-explicit explanation. Run the graph directly in PyTorch to inspect predictions,
-loss, and gradients while implementing the new kernels and backend integration.
+execution in schedule mode: `run_schedule` rejects combined graphs. Validate
+mode does support them: `run_graph.py --training` runs forward, loss and
+backward nodes on the emulator and compares prediction, loss and every
+parameter gradient (`run_validate(training=True, expected_output=...)`).
+Backward kernels that exist today: `threshold_backward`, `sum_dim`, `mse_loss`,
+`mse_loss_backward` (see `kernels/` and `tests/kernels/`).
 
 Graph capture tests (no accelerator kernels required):
 
 ```text
+python -m pytest tests -q            # from atalla-graph/
 python -m unittest discover -s tests -v
 ```
+
+Models not registered in `load_model` on the current branch are skipped.
 
 # Kernel Support Overview
 
@@ -109,4 +124,16 @@ AlexNet-only lowering currently emits just these kernels:
 - `F.softmax` / `nn.Softmax`
 
 Other PyTorch ops (BatchNorm, LayerNorm, GELU, Upsample, etc.) still have kernel prototypes but are not emitted by `generate_schedule.py`.
-Unsupported ops will cause an error. 
+Unsupported ops will cause an error.
+
+## Standalone `.c` kernels (validate path)
+
+`kernels/*.c` are static reference kernels (avgpool, batchnorm, gelu, gelu_tanh, upsample, sum_dim,
+mse_loss, mse_loss_backward, threshold_backward, flash_sdpa_n32d32). They read their ADDR_TABLE through
+`*(cfg_ptr + n)` and finish with `atalla_halt()`; `../tests/kernels/` compiles each with `atalla_cc -p -S`,
+checks for stack spills, assembles with `build_compiler.py --prepacked`, runs the simulator and diffs
+against a BF16 golden (`../run_kernel_tests.sh <name>`).
+
+**Weight-load order:** `kernels/gemm.py` loads systolic weights first-to-last. The pending upstream
+`investigate-weight-load-order` change flips `lw.vi` to last-to-first; reverse the loop when the pins move.
+ 

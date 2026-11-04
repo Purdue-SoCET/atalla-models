@@ -4,25 +4,35 @@ End-to-end pipeline: PyTorch model → AtallaC → Atalla assembly → **atalla-
 
 ## Upstream sources
 
-Two **Git submodules** plus an in-tree graph frontend (not a submodule):
+Two **Git submodules** plus an in-tree graph frontend (not a submodule). Since Oct 2026 the compiler and
+simulator live on Purdue's GitHub Enterprise (ITaP); this repo stays on github.com.
 
-| Path | Upstream | Branch |
-|------|----------|--------|
-| `aihw-ppci-compiler/` | [Purdue-SoCET/aihw-ppci-compiler](https://github.com/Purdue-SoCET/aihw-ppci-compiler) | `atalla-models` |
-| `functional_sim/` | [Purdue-SoCET/atalla-functional-sim](https://github.com/Purdue-SoCET/atalla-functional-sim) | `main` |
-| `atalla-graph/` | Based on [vihaanrc/atalla-graph](https://github.com/vihaanrc/atalla-graph); evolved in this repo | — |
+| Path | Upstream | Branch | Pin (robert / inference-dev) |
+|------|----------|--------|------|
+| `aihw-ppci-compiler/` | `github.itap.purdue.edu/SoCETOrganization/aihw-ppci-compiler` | `atalla-arch` | `351b5fab` |
+| `functional_sim/` | `github.itap.purdue.edu/SoCETOrganization/atalla-functional-sim` | `main` | `f159f0d` |
+| `atalla-graph/` | in-tree SoCET Python pipeline (originally forked from Vihaan's graph code; the ITaP `SoCETOrganization/atalla-graph` is now his separate C++/MLIR rewrite and is **not** a dependency) | — | — |
 
-Graph/compiler/emulator deltas are summarized in `pipeline_reference.md` §9.
+Graph/compiler/emulator deltas are summarized in `pipeline_reference.md` §9. Setup details, versions and
+gotchas: **`docs/ENVIRONMENT.md`**. Visual map of the repo and pipeline: **`docs/REPO_GUIDE.md`**.
+
+**Branches:** `main` (shared integration; its old sim pin `ef513d0b` is dangling after the ITaP move),
+`inference-dev` (inference pipeline), `robert` (this semester's working branch: training path, benchmark
+harness, kernel suite, docs).
 
 ## Clone and submodules
 
 ```bash
-git clone --recurse-submodules git@github.com:Purdue-SoCET/atalla-models.git
-cd atalla-models
-git submodule update --init --recursive
+git clone git@github.com:Purdue-SoCET/atalla-models.git
+cd atalla-models && git checkout robert
+git submodule update --init          # pins only; never --remote
 ```
 
-You need **`functional_sim`** and **`aihw-ppci-compiler`** populated for validate mode. Nested submodules are not required for the graph path.
+You need **`functional_sim`** and **`aihw-ppci-compiler`** populated for validate mode (both require a
+Purdue ITaP login over ssh). The nested `aihw-ppci-compiler/functional_sim` copy is not used.
+
+Python: a **3.11** venv with `torch numpy pytest pydot openpyxl` and `pip install -e aihw-ppci-compiler`
+(never `-r requirements.txt`). Homebrew python 3.14 does not work. See `docs/ENVIRONMENT.md`.
 
 
 ## Pipeline flow
@@ -44,7 +54,8 @@ AtallaC .c ───────────────────────
     v                                         |
 ppci .s                                       |
     |  functional_sim/build_compiler.compile_asm()
-    |  (VLIW scheduling + encoding)           |
+    |  (legacy VLIW scheduling + encoding; the compiler's
+    |   own packetizer, atalla_cc -p, is used by tests/kernels)
     v                                         |
 instruction section ──── + ────── data section
                          |
@@ -66,12 +77,17 @@ atalla-models/
     atalla-graph/
         graph/                 fx_capture.py, tile_planner.py (+ upstream export/lower/allocator)
         codegen/               c_emitter.py, dram_builder.py
-        kernels/               AtallaC generators: gemm, relu, softmax, maxpool, add
-        model/                 basic.py, alexnet.py, alexnet_small.py
-        scripts/               generate_schedule.py
-        run_graph.py           validate | schedule | both
-    functional_sim/            Submodule (emulator + build.py + build_compiler + build_*.py)
-    aihw-ppci-compiler/        Submodule (ppci / atalla_cc)
+        kernels/               AtallaC generators (*.py) + static reference kernels (*.c)
+        model/                 basic.py, alexnet_small.py, layernorm_smoke.py, vit_micro.py, ...
+        scripts/               generate_schedule.py, golden/regression harnesses
+        tests/                 CPU graph-capture tests (pytest)
+        run_graph.py           validate | schedule | both, --training
+    tests/kernels/             Standalone kernel suite (compile -> spill check -> assemble -> sim -> golden)
+    run_kernel_tests.sh        Runner for tests/kernels (uses the venv)
+    bench/                     run_benchmark.py (harness), build_workbook.py (xlsx)
+    docs/                      REPO_GUIDE, ENVIRONMENT, benchmark_metrics, baselines/, flat_ram_layout_finding
+    functional_sim/            Submodule (emulator + build.py + build_compiler + merged_in_to_ram_hex.py)
+    aihw-ppci-compiler/        Submodule (ppci / atalla_cc / packetizer)
     pipeline_reference.md      Technical deep-dive
     CONTRIBUTING.md            How to add a kernel
 ```
@@ -88,9 +104,31 @@ python run_graph.py --model alexnet_small --mode validate --scale 0.01
 python run_graph.py --model basic --mode schedule --out-dir out/graph
 
 python run_graph.py --model alexnet_small --mode validate --metrics-json metrics_alexnet.json
+
+# training path: forward + MSE loss + backward graph, gradients validated on the emulator
+python run_graph.py --model basic --mode validate --training --out-dir out/train
 ```
 
-Models: `basic`, `alexnet_small`
+Models: `basic`, `alexnet_small`, `layernorm_smoke`, `vit_micro` (`load_model` returns
+`(model, example_input, expected_output_or_None)`; names not yet re-registered raise `Unknown model`).
+
+### Tests
+
+```bash
+python -m pytest atalla-graph/tests -q     # graph capture, CPU only
+python -m pytest tests/kernels -q          # standalone kernels on the emulator (~15-25 s)
+./run_kernel_tests.sh avgpool              # one kernel, verbose
+```
+
+### Benchmark harness
+
+`bench/run_benchmark.py` runs validate with provenance (model, shape, seed, submodule revisions, flags) and
+writes a metrics JSON per run under `docs/baselines/`; `bench/build_workbook.py` collects them into
+`output/Atalla_Benchmarking_Workbook.xlsx`. Field definitions: `docs/benchmark_metrics.md`.
+
+> **Pending upstream change:** the compiler/sim `investigate-weight-load-order` branches flip `lw.vi`
+> weight loading to last-to-first. When the submodule pins move past that, reverse the weight loop in
+> `atalla-graph/kernels/gemm.py` or every GEMM-backed layer fails validation.
 
 ## Validation snapshot (representative)
 
@@ -152,7 +190,7 @@ Each emulated layer gets a row in `kernel_metrics`; the file also contains `aggr
 - **Standalone C Goldens:** Kernels are developed as standalone `.c` files with vector intrinsics and 0 stack spills, verified independently against NumPy goldens on `atalla-functional-sim`, and designed to be ported directly to the native C++ MLIR compiler (`atalla-graph`).
 - **Compiler path for compute ops.** Conv, Linear, Matmul, ReLU, Softmax, MaxPool, Add go through AtallaC → ppci → `build_compiler` → emulator. **`mul`** on the basic module may still use a NumPy fallback unless a kernel is added.
 - **Passthrough ops** (flatten, transpose, dropout at inference): reshapes only — no `.in` file.
-- **Graph owns `.data`.** `DRAMWriter` (ADDR_TABLE at `0x3C`) + `render_testfile()`; see `pipeline_reference.md` §6.2.
+- **Graph owns `.data`.** `DRAMWriter` (ADDR_TABLE at `0x3C`) + `render_testfile()`; see `pipeline_reference.md` §6.2. The instruction section starts at 0 and overlaps `0x3C` in a flat RAM image; see `docs/flat_ram_layout_finding.md` before handing `.in` files to RTL.
 - **Per-layer emulator run.** Fresh emulator state per layer; `activation_cache` passes BF16-aligned activations.
 - **Stack / DRAM.** Scalar `x2` placed above tensor data to avoid overlap with spills and globals.
 

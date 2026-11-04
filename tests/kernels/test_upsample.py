@@ -21,11 +21,10 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-# Ensure root workspace and kernels in sys.path
-_ROOT = Path(__file__).resolve().parent.parent.parent.parent
-_REPO_PPCI = _ROOT / "aihw-ppci-compiler"
-_SIM_ROOT = _REPO_PPCI / "functional_sim"
-_MODELS_ROOT = _ROOT / "atalla-models" / "atalla-graph"
+# Paths honor ATALLA_COMPILER_PATH / ATALLA_SIM_PATH and default to the in-repo
+# submodules (see tests/kernels/_paths.py).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _paths import REPO_PPCI as _REPO_PPCI, SIM_ROOT as _SIM_ROOT, MODELS_ROOT as _MODELS_ROOT
 
 sys.path.insert(0, str(_MODELS_ROOT))
 from kernels.upsample import upsample_c
@@ -67,7 +66,7 @@ def run_upsample_sim(channels: int = 1, H_in: int = 4, W_in: int = 8):
         # 1. Compile C to assembly
         atalla_cc = _REPO_PPCI / "atalla_cc"
         res_cc = subprocess.run(
-            [str(atalla_cc), "-p", "-S", str(c_path), "-o", str(s_path)],
+            [sys.executable, str(atalla_cc), "-p", "-S", str(c_path), "-o", str(s_path)],
             capture_output=True,
             text=True,
         )

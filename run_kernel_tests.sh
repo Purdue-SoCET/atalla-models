@@ -5,6 +5,9 @@
 #   ./run_kernel_tests.sh                # Runs all kernel tests
 #   ./run_kernel_tests.sh avgpool        # Runs specific kernel test (test_avgpool.py)
 #   ./run_kernel_tests.sh mse_loss       # Runs mse_loss tests
+#
+# Toolchain paths: ATALLA_COMPILER_PATH / ATALLA_SIM_PATH override the in-repo
+# submodules (tests/kernels/_paths.py).
 
 set -e
 
@@ -17,10 +20,21 @@ while [ -h "$SOURCE" ]; do
 done
 SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
 
-VENV_PYTHON="${SCRIPT_DIR}/../.venv/bin/python3"
-if [ ! -f "${VENV_PYTHON}" ]; then
+# Interpreter: $ATALLA_PYTHON, then an active venv, then ~/.venvs/atalla, then
+# <repo>/.venv, then python3.  Must be a 3.11 venv with torch + editable ppci
+# (see docs/ENVIRONMENT.md); Homebrew python3.14 does not work.
+if [ -n "${ATALLA_PYTHON:-}" ] && [ -x "${ATALLA_PYTHON}" ]; then
+    VENV_PYTHON="${ATALLA_PYTHON}"
+elif [ -n "${VIRTUAL_ENV:-}" ] && [ -x "${VIRTUAL_ENV}/bin/python" ]; then
+    VENV_PYTHON="${VIRTUAL_ENV}/bin/python"
+elif [ -x "${HOME}/.venvs/atalla/bin/python" ]; then
+    VENV_PYTHON="${HOME}/.venvs/atalla/bin/python"
+elif [ -x "${SCRIPT_DIR}/.venv/bin/python" ]; then
+    VENV_PYTHON="${SCRIPT_DIR}/.venv/bin/python"
+else
     VENV_PYTHON="python3"
 fi
+echo "python: ${VENV_PYTHON}"
 
 TESTS_DIR="${SCRIPT_DIR}/tests/kernels"
 
