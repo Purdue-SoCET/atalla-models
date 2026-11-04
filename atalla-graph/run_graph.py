@@ -17,6 +17,14 @@ Usage:
     python run_graph.py --model vit_micro --mode validate --validate-inputs oracle
     python run_graph.py --model vit_micro --mode validate --layer-metrics-csv out/graph/layers.csv
     python plot_graph_layer_packet_share.py --csv out/graph/vit_micro_layer_metrics.csv
+    python run_graph.py --model gpt2_block --mode both --seed 0        # GPT-2 block (issue #66)
+    ATALLA_GELU_KERNEL=horner python run_graph.py --model gpt2_mlp --mode validate  # GELU on emulator
+    ATALLA_SDPA_FLASH=1 python run_graph.py --model vit_micro --mode validate       # flash trial
+
+Env knobs: --seed (torch+numpy, before load_model); ATALLA_SDPA_FLASH (vit_micro fused
+attention), ATALLA_GELU_KERNEL=horner|tanh (emit_gelu on emulator), ATALLA_FFN_ADD_NUMPY=0
+(force AtallaC add above 1024 elems; multi-tile add kernel currently wrong, see
+docs/model_baselines_notes.md).
 """
 from __future__ import annotations
 
@@ -894,20 +902,35 @@ def _resolve_transpose(ndim: int, args) -> tuple:
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def load_model(name: str, scale: float = 0.01):
+    """Return ``(model, example_input, expected_output_or_None)``.
+
+    ``expected_output`` is only used as the MSE target in ``--training`` mode;
+    forward-only validate passes ``None`` through and never dereferences it.
+    """
     if name == "basic":
         from model.basic import BasicModule
-        return BasicModule(dim=32, depth=2), torch.randn(1, 32), torch.randn(1,32)  # For now, we are only returning expected output for basic module
-    # elif name == "alexnet_small":
-    #     from model.alexnet_small import AlexNetSmall
-    #     return AlexNetSmall(scale=scale, num_classes=10), torch.randn(1, 3, 32, 32)
-    # elif name == "layernorm_smoke":
-    #     from model.layernorm_smoke import LayerNormSmoke
-    #     return LayerNormSmoke(dim=32), torch.randn(1, 32)
-    # elif name == "vit_micro":
-    #     from model.vit_micro import ViTMicro
-    #     # n_tokens=dim=32 matches kernels/flash_sdpa_n32d32.c (fused attention on emulator).
-    #     m = ViTMicro(dim=32, n_tokens=32)
-    #     return m, torch.randn(1, 32, 32)
+        # expected_output is a random target used only by --training.
+        return BasicModule(dim=32, depth=2), torch.randn(1, 32), torch.randn(1, 32)
+    elif name == "alexnet_small":
+        from model.alexnet_small import AlexNetSmall
+        return AlexNetSmall(scale=scale, num_classes=10), torch.randn(1, 3, 32, 32), None
+    elif name == "layernorm_smoke":
+        from model.layernorm_smoke import LayerNormSmoke
+        return LayerNormSmoke(dim=32), torch.randn(1, 32), None
+    elif name == "vit_micro":
+        from model.vit_micro import ViTMicro
+        # n_tokens=dim=32 matches kernels/flash_sdpa_n32d32.c (fused attention on emulator).
+        m = ViTMicro(dim=32, n_tokens=32)
+        return m, torch.randn(1, 32, 32), None
+    elif name == "gpt2_mlp":
+        from model.gpt2_block import GPT2MLPBlock
+        return GPT2MLPBlock(n_tokens=32, dim=32, hidden=128), torch.randn(32, 32), None
+    elif name == "gpt2_attn":
+        from model.gpt2_block import GPT2AttnBlock
+        return GPT2AttnBlock(n_tokens=32, dim=32), torch.randn(32, 32), None
+    elif name == "gpt2_block":
+        from model.gpt2_block import GPT2Block
+        return GPT2Block(n_tokens=32, dim=32, hidden=128), torch.randn(32, 32), None
     else:
         raise ValueError(f"Unknown model: {name}")
 
@@ -915,7 +938,10 @@ def load_model(name: str, scale: float = 0.01):
 def main():
     parser = argparse.ArgumentParser(description="Unified Atalla graph pipeline")
     parser.add_argument("--model", default="basic",
-                        choices=["basic", "alexnet_small", "layernorm_smoke", "vit_micro"])
+                        choices=["basic", "alexnet_small", "layernorm_smoke", "vit_micro",
+                                 "gpt2_mlp", "gpt2_attn", "gpt2_block"])
+    parser.add_argument("--seed", type=int, default=0,
+                        help="torch/numpy RNG seed applied before load_model (weights + inputs).")
     parser.add_argument("--mode", default="both",
                         choices=["schedule", "validate", "both"])
     parser.add_argument("--scale", type=float, default=0.01)
@@ -979,14 +1005,16 @@ def main():
     )
     args = parser.parse_args()
 
-    torch.manual_seed(42)
-    np.random.seed(42)
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
 
     # Right now, example_input and expected_output are just pytorch random tensors. However, eventually we want to have a real expected input
     # and expected output function so we can do real training
     model, example_input, expected_output = load_model(args.model, args.scale)
     verbose = not args.quiet
 
+    if args.training and expected_output is None:
+        raise SystemExit(f"--training needs an expected_output target; model {args.model!r} returns None")
     if (args.training):
         gm = build_graph(model, example_input, verbose=verbose,
             include_backward=args.training, example_target=expected_output, loss_fn=nn.MSELoss())

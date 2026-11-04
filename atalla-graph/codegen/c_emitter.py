@@ -40,6 +40,7 @@ from __future__ import annotations
 import importlib.util
 import math
 import os
+import struct
 from collections import Counter
 import subprocess
 import sys
@@ -1372,8 +1373,42 @@ def emit_layernorm(
     return em
 
 
+def _f32_bits(v: float) -> int:
+    return struct.unpack("<I", struct.pack("<f", float(v)))[0]
+
+
+# Polynomial coefficients mirror tests/kernels/test_gelu.py (Aman's standalone suite).
+_GELU_HORNER_WORDS = [0.001803, -0.037653, 0.360243, 0.008555, 0.5, 3.0, -3.0]
+_GELU_TANH_WORDS = [
+    0.797885, 0.035677, -0.002561, 0.039209, -0.237744, 0.968467, 1.0, -1.0, 0.5, 2.5, -2.5,
+]
+
+
+def gelu_kernel_method() -> str:
+    """``ATALLA_GELU_KERNEL`` selects the GELU path in validate.
+
+    "" / "0" / "torch" (default) -> PyTorch BF16 reference (NumPy fallback, no emulator).
+    "horner" -> kernels/gelu.c   (6th-degree minimax polynomial, ~0.018 max abs err)
+    "tanh"   -> kernels/gelu_tanh.c (tanh 7th-degree expansion, ~0.016 max abs err)
+    """
+    v = os.environ.get("ATALLA_GELU_KERNEL", "").strip().lower()
+    if v in ("", "0", "torch", "numpy", "off"):
+        return "torch"
+    if v in ("1", "horner"):
+        return "horner"
+    if v == "tanh":
+        return "tanh"
+    raise ValueError(f"ATALLA_GELU_KERNEL={v!r}: expected '', 'horner' or 'tanh'")
+
+
 def emit_gelu(node: Node, input_data: np.ndarray, tc: TileConfig) -> LayerEmission:
-    """GELU via PyTorch BF16 (ISA kernel TBD)."""
+    """GELU: PyTorch BF16 reference by default; ``ATALLA_GELU_KERNEL=horner|tanh`` emits
+    Aman's standalone AtallaC kernel (kernels/gelu.c / gelu_tanh.c) and runs it on the emulator.
+
+    Kernel ADDR_TABLE layout (bytes from ADDR_TABLE=60), same as tests/kernels/test_gelu.py:
+      +0 IN_GMEM, +4 OUT_GMEM, +8 tile_count, +12 sp_rows, +16 sdma_sp0, +20 tile_bytes,
+      +24.. float32 coefficients (7 for horner, 11 for tanh).
+    """
     p = tc.params
     total = int(p["total_elements"])
     flat = np.asarray(input_data, dtype=np.float32).flatten()[:total]
@@ -1381,20 +1416,67 @@ def emit_gelu(node: Node, input_data: np.ndarray, tc: TileConfig) -> LayerEmissi
         pad = np.zeros(total, dtype=np.float32)
         pad[: flat.size] = flat
         flat = pad
-    x = torch.from_numpy(flat).to(torch.bfloat16)
-    try:
-        y = torch.nn.functional.gelu(x, approximate="tanh")
-    except TypeError:
-        y = torch.nn.functional.gelu(x)
-    y = y.float().numpy()
     out_shape = get_node_shape(node)
     os = tuple(out_shape) if out_shape else (total,)
+    method = gelu_kernel_method()
+
+    if method == "torch":
+        x = torch.from_numpy(flat).to(torch.bfloat16)
+        try:
+            y = torch.nn.functional.gelu(x, approximate="tanh")
+        except TypeError:
+            y = torch.nn.functional.gelu(x)
+        y = y.float().numpy()
+        em = LayerEmission()
+        em.skip_emulator = True
+        em.numpy_result = y.reshape(os)
+        em.output_shape = os
+        em.output_elements = total
+        em.dram = DRAMWriter()
+        em.layer_metrics = {"map_kind": "gelu", "gelu_method": "torch", "use_numpy": True}
+        return em
+
+    width = TILE
+    rows = math.ceil(total / width)
+    sp_rows = min(rows, 32)
+    tile_count = math.ceil(rows / sp_rows)
+    tile_bytes = sp_rows * width * 2
+    sdma_sp0 = sdma_ctl_val(0, sp_rows, width, width)
+
+    IN_GMEM = 0x1000
+    OUT_GMEM = IN_GMEM + _align_data(tile_count * tile_bytes)
+
+    img = DRAMWriter()
+    img.u32(ADDR_TABLE + 0, IN_GMEM)
+    img.u32(ADDR_TABLE + 4, OUT_GMEM)
+    img.u32(ADDR_TABLE + 8, tile_count)
+    img.u32(ADDR_TABLE + 12, sp_rows)
+    img.u32(ADDR_TABLE + 16, sdma_sp0)
+    img.u32(ADDR_TABLE + 20, tile_bytes)
+    coeffs = _GELU_HORNER_WORDS if method == "horner" else _GELU_TANH_WORDS
+    for i, c in enumerate(coeffs):
+        img.u32(ADDR_TABLE + 24 + 4 * i, _f32_bits(c))
+
+    padded = np.zeros(tile_count * sp_rows * width, dtype=np.float32)
+    padded[: flat.size] = flat
+    for i in range(padded.size):
+        img.bf16(IN_GMEM + i * 2, float(padded[i]))
+
     em = LayerEmission()
-    em.skip_emulator = True
-    em.numpy_result = y.reshape(os)
+    em.c_source = _ek.gelu_c(method=method)
+    em.dram = img
+    em.output_addr = OUT_GMEM
     em.output_shape = os
     em.output_elements = total
-    em.dram = DRAMWriter()
+    em.layer_metrics = {
+        "map_kind": "gelu",
+        "gelu_method": method,
+        "map_rows": int(rows),
+        "map_width": int(width),
+        "map_tiles": int(tile_count),
+        "bytes_est_in": int(rows * width * 2),
+        "bytes_est_out": int(rows * width * 2),
+    }
     return em
 
 
