@@ -285,14 +285,21 @@ def main(argv=None) -> int:
                    help="extra environment variable for run_graph.py (repeatable), "
                         "e.g. --env ATALLA_SDPA_FLASH=1; recorded in config.json")
     p.add_argument("--out-root", default=str(DEFAULT_OUT_ROOT))
+    p.add_argument("--run-dir", default=None,
+                   help="explicit run directory (its basename becomes run_id); "
+                        "default: <out-root>/<model>__<tag>__<YYYYMMDD-HHMM>")
     p.add_argument("--python", default=DEFAULT_PYTHON)
     p.add_argument("--quiet", action="store_true", help="pass --quiet to run_graph.py")
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args(argv)
 
     stamp = _dt.datetime.now(_dt.timezone.utc)
-    run_id = f"{args.model}__{args.tag}__{stamp.strftime('%Y%m%d-%H%M')}"
-    run_dir = Path(args.out_root) / run_id
+    if args.run_dir:
+        run_dir = Path(args.run_dir).resolve()
+        run_id = run_dir.name
+    else:
+        run_id = f"{args.model}__{args.tag}__{stamp.strftime('%Y%m%d-%H%M')}"
+        run_dir = Path(args.out_root) / run_id
     cmd = build_cmd(args, run_dir)
     extra_env = dict(kv.split("=", 1) for kv in args.env if "=" in kv)
     env = {**os.environ, **extra_env}

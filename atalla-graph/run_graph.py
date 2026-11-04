@@ -69,10 +69,15 @@ from graph.backward import capture_backward
 from graph.memoryallocator import allocate_memory
 from graph.fx_capture import normalize_ops, get_node_shape
 from graph.tile_planner import plan_tiles
+from graph.overrides import (
+    PlanOverrides, load_overrides, apply_global_env, apply_node_overrides, resolve_backend,
+    BackendDecision, snapshot_env, restore_env,
+)
 from model.atalla_ops import AtallaSdpa
 from scripts.generate_schedule import emit as emit_schedule
 from codegen.c_emitter import (
     emit_node, render_in_file, compile_and_assemble, LayerEmission, _to_bf16_array,
+    has_emitter,
 )
 from codegen.dram_builder import extract_input_data
 from graph.layer_metrics_csv import write_layer_metrics_csv, write_template_summary_csv
@@ -287,12 +292,142 @@ def _aggregate_kernel_metrics(kernel_metrics: list) -> Dict:
     }
 
 
+# ── Progress stream (bench/ui/API_CONTRACT.md section A) ─────────────────────
+
+def _json_default(o):
+    if isinstance(o, (np.integer,)):
+        return int(o)
+    if isinstance(o, (np.floating,)):
+        return float(o)
+    if isinstance(o, np.ndarray):
+        return o.tolist()
+    if isinstance(o, (set, frozenset, tuple)):
+        return list(o)
+    return str(o)
+
+
+class ProgressWriter:
+    """Append one JSON object per line to *path*, flushed after every event.
+
+    Events: start / node_start / node_done / done / error. ``current_node`` tracks the
+    node being executed so ``main`` can attribute a crash in its ``error`` event.
+    """
+
+    def __init__(self, path: Optional[str]):
+        self.path = path
+        self._fh = None
+        self.current_node: Optional[str] = None
+        if path:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            self._fh = open(path, "a", encoding="utf-8")
+
+    def emit(self, event: str, **fields) -> None:
+        if self._fh is None:
+            return
+        rec = {"event": event, **fields, "ts": time.time()}
+        self._fh.write(json.dumps(rec, default=_json_default) + "\n")
+        self._fh.flush()
+
+    def close(self) -> None:
+        if self._fh is not None:
+            self._fh.close()
+            self._fh = None
+
+
+def _progress_backend(dec: BackendDecision) -> str:
+    """Contract A label for a node event (graph nodes count as passthrough)."""
+    return "passthrough" if dec.backend == "graph" else dec.backend
+
+
+def _node_event_fields(index: int, node, dec: BackendDecision) -> Dict:
+    shape = get_node_shape(node)
+    return {
+        "index": index,
+        "name": node.name,
+        "op": node.meta.get("atalla_op") or node.op,
+        "backend": _progress_backend(dec),
+        "shape": list(shape) if shape is not None else None,
+    }
+
+
+def _null_metrics() -> Dict:
+    return {k: None for k in ("cos", "rel_l2", "rel_max", "sched_packets", "packets",
+                              "instructions", "bytes_loaded", "bytes_written", "flops")}
+
+
+def _km_to_progress(km: Optional[Dict]) -> Dict:
+    m = _null_metrics()
+    if not km:
+        return m
+    m["cos"] = km.get("cos_sim")
+    m["rel_l2"] = km.get("rel_l2_error")
+    m["rel_max"] = km.get("rel_max_abs_error")
+    if km.get("backend") == "emulator":
+        m["sched_packets"] = km.get("sched_packets")
+        m["packets"] = km.get("packets")
+        m["instructions"] = km.get("instructions")
+        m["bytes_loaded"] = km.get("bytes_loaded")
+        m["bytes_written"] = km.get("bytes_written")
+        m["flops"] = km.get("flops_total")
+    return m
+
+
+def graph_decisions(gm, overrides: Optional[PlanOverrides] = None) -> Dict[str, BackendDecision]:
+    """``resolve_backend`` for every node of *gm* (the one decision shared with inspect)."""
+    ov = overrides if overrides is not None else gm.meta.get("plan_overrides")
+    out: Dict[str, BackendDecision] = {}
+    for node in gm.graph.nodes:
+        op = node.meta.get("atalla_op")
+        out[node.name] = resolve_backend(node, node.meta.get("tile_config"), has_emitter(op), ov)
+    return out
+
+
+def _count_compute(decisions: Dict[str, BackendDecision]) -> int:
+    return sum(1 for d in decisions.values() if d.backend in ("emulator", "numpy", "skip"))
+
+
+def _eval_node_reference(node, gm, activation_cache: Dict[str, np.ndarray],
+                         ref_activations: Dict[str, np.ndarray]) -> np.ndarray:
+    """Chained NumPy/PyTorch evaluation of one FX node from cached inputs (BF16 semantics).
+
+    Falls back to the PyTorch reference activation when the node cannot be re-evaluated.
+    """
+    from torch.fx.node import map_arg
+
+    def _to_t(a):
+        if isinstance(a, torch.fx.Node):
+            if a.name not in activation_cache:
+                raise KeyError(a.name)
+            v = np.asarray(activation_cache[a.name], dtype=np.float32)
+            return torch.from_numpy(np.ascontiguousarray(v)).to(torch.bfloat16)
+        return a
+
+    try:
+        args = map_arg(node.args, _to_t)
+        kwargs = map_arg(node.kwargs, _to_t)
+        if node.op == "call_function":
+            out = node.target(*args, **kwargs)
+        elif node.op == "call_method":
+            out = getattr(args[0], node.target)(*args[1:], **kwargs)
+        elif node.op == "call_module":
+            out = gm.get_submodule(node.target)(*args, **kwargs)
+        else:
+            raise ValueError(node.op)
+        if not isinstance(out, torch.Tensor):
+            raise TypeError(type(out))
+        return out.detach().float().cpu().numpy()
+    except Exception:
+        if node.name in ref_activations:
+            return np.asarray(ref_activations[node.name], dtype=np.float32)
+        raise
+
+
 # ── Front-end: shared across modes ──────────────────────────────────────────
 
 def build_graph(model: nn.Module, example_input: torch.Tensor,
                 verbose: bool = True, *, include_backward: bool = False,
                 example_target: Optional[torch.Tensor] = None,
-                loss_fn=None):
+                loss_fn=None, overrides=None):
     """Trace → lower → optional loss/backward → shapes → normalize → tiles.
 
     Forward-only calls are unchanged. With include_backward=True, provide a
@@ -300,9 +435,17 @@ def build_graph(model: nn.Module, example_input: torch.Tensor,
     takes (x, target) and returns (prediction, FP32 loss, named BF16 gradients).
     Weights remain graph attributes. Model mode stays eval, as in inference.
     New operators are retained for future kernel implementation.
+
+    ``overrides`` (path / dict / PlanOverrides / None -> ``ATALLA_PLAN_OVERRIDES``): the
+    ``global`` knobs are written to the env *before* ``plan_tiles`` (override file wins),
+    per-node overrides are pushed into the tile params afterwards, and the parsed object is
+    kept in ``gm.meta['plan_overrides']`` for ``run_validate`` / ``run_schedule`` / inspect.
     """
     if include_backward and (example_target is None or loss_fn is None):
         raise ValueError("include_backward requires example_target and loss_fn")
+    ov = load_overrides(overrides)
+    env_snapshot = snapshot_env()
+    override_env = apply_global_env(ov)
     model = model.bfloat16().eval()
     example_bf16 = example_input.bfloat16()
 
@@ -331,20 +474,37 @@ def build_graph(model: nn.Module, example_input: torch.Tensor,
     if verbose:
         print("Normalize ops + plan tiles...")
     gm = normalize_ops(gm)
-    gm = plan_tiles(gm)
+    try:
+        gm = plan_tiles(gm)  # planner records gelu method / sdpa flash / add threshold in tile params
+    finally:
+        restore_env(env_snapshot)  # keep in-process callers (inspect server) stateless
+    apply_node_overrides(gm, ov)
+    gm.meta["plan_overrides"] = ov
+    gm.meta["override_env"] = override_env
     return gm
 
 
 # ── Schedule mode ────────────────────────────────────────────────────────────
 
 def run_schedule(gm, example_input: torch.Tensor, out_dir: str,
-                 verbose: bool = True) -> str:
-    """Emit graph_schedule.c using Vihaan's generate_schedule."""
+                 verbose: bool = True, progress: Optional[ProgressWriter] = None,
+                 model_name: Optional[str] = None) -> str:
+    """Emit graph_schedule.c using Vihaan's generate_schedule.
+
+    With *progress*, node events carry the planned backend (no metrics) so the UI can
+    show the same call graph it will see in validate mode.
+    """
     if gm.meta.get("include_backward"):
         raise NotImplementedError(
             "Backward graphs can be inspected and run in PyTorch, but schedule "
             "emission needs target inputs, backward kernels, and mixed-dtype memory support."
         )
+    progress = progress or ProgressWriter(None)
+    t0 = time.time()
+    nodes = list(gm.graph.nodes)
+    decisions = graph_decisions(gm)
+    progress.emit("start", model=model_name, mode="schedule", total_nodes=len(nodes),
+                  compute_nodes=_count_compute(decisions))
     os.makedirs(out_dir, exist_ok=True)
     placeholder_data = {"x": example_input.bfloat16().clone()}
     gm_alloc = allocate_memory(gm, f"{out_dir}/dram.bin", placeholder_data)
@@ -352,6 +512,18 @@ def run_schedule(gm, example_input: torch.Tensor, out_dir: str,
     c_code = emit_schedule(gm_alloc)
     out_path = f"{out_dir}/graph_schedule.c"
     Path(out_path).write_text(c_code)
+
+    for index, node in enumerate(nodes):
+        if node.op == "output":
+            continue
+        fields = _node_event_fields(index, node, decisions[node.name])
+        progress.current_node = node.name
+        progress.emit("node_start", **fields)
+        progress.emit("node_done", **fields, **_null_metrics(), elapsed_s=0.0)
+    progress.current_node = None
+    progress.emit("done", final_cosine=None, rel_l2=None, rel_max=None, strict_pass=None,
+                  elapsed_s=time.time() - t0, schedule_path=out_path,
+                  kernel_calls=sum(1 for l in c_code.splitlines() if "_kernel(" in l))
 
     kernel_calls = [l.strip() for l in c_code.splitlines() if "_kernel(" in l]
     if verbose:
@@ -395,8 +567,15 @@ def run_validate(
     strict_min_cos: float = 0.999,
     strict_max_rel_l2: float = 0.02,
     strict_max_relmax: float = 0.05,
+    progress: Optional[ProgressWriter] = None,
+    model_name: Optional[str] = None,
 ) -> Dict:
     """Per-node compile → emulate → compare vs PyTorch golden.
+
+    ``progress`` (a :class:`ProgressWriter`) streams start / node_start / node_done / done
+    events (API_CONTRACT.md A). Per-node backend choices, including ``--overrides``
+    (contract B), come from ``graph.overrides.resolve_backend`` via :func:`graph_decisions`;
+    ``gm.meta['plan_overrides']`` is set by :func:`build_graph`.
 
     ``expected_output`` supplies the ``target`` placeholder for backward graphs;
     its dtype is preserved. The model input is converted to BF16 as before.
@@ -450,8 +629,14 @@ def run_validate(
 
     activation_cache: Dict[str, np.ndarray] = {}
 
-    stats = {"total": 0, "emulated": 0, "numpy": 0, "passthrough": 0}
+    stats = {"total": 0, "emulated": 0, "numpy": 0, "passthrough": 0, "skip": 0}
     kernel_metrics = []
+    progress = progress or ProgressWriter(None)
+    overrides: Optional[PlanOverrides] = gm.meta.get("plan_overrides")
+    decisions = graph_decisions(gm, overrides)
+    all_nodes = list(gm.graph.nodes)
+    progress.emit("start", model=model_name, mode="validate", total_nodes=len(all_nodes),
+                  compute_nodes=_count_compute(decisions))
 
     if verbose:
         print(f"\n--- Graph (validate_inputs={validate_inputs}) ---")
@@ -477,13 +662,25 @@ def run_validate(
             print(f"  {node.name:30s}  {str(op):15s}  {str(kt):12s}  {shape}")
         print()
 
-    for node in gm.graph.nodes:
+    for index, node in enumerate(all_nodes):
         atalla_op = node.meta.get("atalla_op")
 
         if node.op == "output":
             continue
 
         stats["total"] += 1
+        dec = decisions[node.name]
+        ev = _node_event_fields(index, node, dec)
+        t_node = time.time()
+        progress.current_node = node.name
+        progress.emit("node_start", **ev)
+
+        def _node_done(km: Optional[Dict] = None, backend: Optional[str] = None) -> None:
+            fields = dict(ev)
+            if backend is not None:
+                fields["backend"] = backend
+            progress.emit("node_done", **fields, **_km_to_progress(km),
+                          elapsed_s=time.time() - t_node)
 
         if node.op == "placeholder":
             value = placeholder_inputs[node.target].detach().cpu()
@@ -492,6 +689,7 @@ def run_validate(
             activation_cache[node.name] = value.numpy().copy()
             if verbose:
                 print(f"  [{node.name}] placeholder")
+            _node_done()
             continue
 
         if node.op == "get_attr":
@@ -504,6 +702,7 @@ def run_validate(
             )
             if verbose:
                 print(f"  [{node.name}] get_attr")
+            _node_done()
             continue
 
         # Passthrough: flatten, dropout, transpose, unknown
@@ -529,6 +728,7 @@ def run_validate(
                     stats["passthrough"] += 1
                     if verbose:
                         print(f"  [{node.name}] {atalla_op or 'passthrough'} -> {data.shape}")
+                    _node_done(backend="passthrough")
                     continue
 
             if node.name in ref_activations:
@@ -536,7 +736,53 @@ def run_validate(
                 stats["passthrough"] += 1
                 if verbose:
                     print(f"  [{node.name}] passthrough (ref)")
+                _node_done(backend="passthrough")
                 continue
+
+        # ── Overrides (contract B): skip -> identity, numpy -> chained reference ──
+        if dec.error and dec.backend != "emulator":
+            progress.emit("error", message=dec.error, node=node.name, fatal=False)
+            if verbose:
+                print(f"  [{node.name}] override warning: {dec.error}")
+
+        if dec.backend == "skip":
+            src = dec.skip_source
+            if src in activation_cache:
+                r = np.asarray(activation_cache[src], dtype=np.float32)
+            else:
+                r = np.asarray(ref_activations[node.name], dtype=np.float32)
+            out_shape = get_node_shape(node)
+            if out_shape and r.size == int(np.prod(out_shape)):
+                r = r.reshape(out_shape)
+            activation_cache[node.name] = r
+            stats["skip"] += 1
+            km = {"name": node.name, "op": atalla_op, "backend": "skip",
+                  "shape": list(r.shape), "elems": int(r.size), "skip_source": src}
+            ref = ref_activations.get(node.name)
+            if ref is not None and np.asarray(ref).shape == r.shape:
+                km.update(_layer_compare_metrics(ref, r))
+            kernel_metrics.append(km)
+            if verbose:
+                print(f"  [{node.name}] {atalla_op} -> SKIP (identity on {src}) {r.shape}")
+            _node_done(km, backend="skip")
+            continue
+
+        if dec.backend == "numpy" and dec.forced:
+            r = _eval_node_reference(node, gm, activation_cache, ref_activations)
+            activation_cache[node.name] = r
+            stats["numpy"] += 1
+            km = {"name": node.name, "op": atalla_op, "backend": "numpy",
+                  "shape": list(r.shape), "elems": int(r.size), "forced": True,
+                  "reason": dec.reason}
+            ref = ref_activations.get(node.name)
+            if ref is not None and np.asarray(ref).shape == r.shape:
+                km.update(_layer_compare_metrics(ref, r))
+            kernel_metrics.append(km)
+            if verbose:
+                extra = f" (cos={km['cos_sim']:.6f})" if "cos_sim" in km else ""
+                print(f"  [{node.name}] {atalla_op} -> NumPy (forced) {r.shape}{extra}")
+            _node_done(km, backend="numpy")
+            continue
 
         if validate_inputs == "oracle" and atalla_op in _EMU_ATALLA_OPS:
             _apply_oracle_inputs(activation_cache, ref_activations)
@@ -553,14 +799,21 @@ def run_validate(
             stats["passthrough"] += 1
             if verbose:
                 print(f"  [{node.name}] {atalla_op} -> passthrough")
+            _node_done(backend="passthrough")
             continue
 
         if emission.skip_emulator:
+            if dec.backend == "emulator" and dec.forced:
+                msg = (f"emulator requested for {node.name} ({atalla_op}) but the emitter has no "
+                       f"kernel image for this configuration; fell back to NumPy")
+                progress.emit("error", message=msg, node=node.name, fatal=False)
+                if verbose:
+                    print(f"  [{node.name}] override warning: {msg}")
             activation_cache[node.name] = emission.numpy_result
             stats["numpy"] += 1
             r = emission.numpy_result
             km = {"name": node.name, "op": atalla_op, "backend": "numpy",
-                  "shape": list(r.shape), "elems": int(r.size)}
+                  "shape": list(r.shape), "elems": int(r.size), "reason": dec.reason}
             ref = ref_activations.get(node.name)
             if ref is not None:
                 km.update(_layer_compare_metrics(ref, r))
@@ -574,6 +827,7 @@ def run_validate(
                         f"relmax={km['rel_max_abs_error']:.6f})"
                     )
                 print(f"  [{node.name}] {atalla_op} -> NumPy {r.shape}{extra}")
+            _node_done(km, backend="numpy")
             continue
 
         # Compile + emulate
@@ -654,6 +908,8 @@ def run_validate(
             },
             "arithmetic_intensity": float(pm.get("arithmetic_intensity", 0.0)),
             "arithmetic_intensity_loads": float(pm.get("arithmetic_intensity_loads", 0.0)),
+            "kernel_variant": dec.variant,
+            "reason": dec.reason,
         }
         km.update(emission.layer_metrics)
         if ref is not None:
@@ -699,6 +955,9 @@ def run_validate(
                 )
             else:
                 print("done")
+        _node_done(km, backend="emulator")
+
+    progress.current_node = None
 
     # Final output comparison
     output_node = next((n for n in gm.graph.nodes if n.op == "output"), None)
@@ -719,7 +978,8 @@ def run_validate(
     if verbose:
         print(f"\n--- Results ({elapsed:.2f}s) ---")
         print(f"  Nodes: {stats['total']} total, {stats['emulated']} emulated, "
-              f"{stats['numpy']} numpy, {stats['passthrough']} passthrough")
+              f"{stats['numpy']} numpy, {stats['passthrough']} passthrough, "
+              f"{stats['skip']} skipped")
 
     aggregate_metrics = _aggregate_kernel_metrics(kernel_metrics)
 
@@ -873,6 +1133,20 @@ def run_validate(
         if verbose:
             print(f"\nWrote metrics JSON: {metrics_json_path}")
 
+    progress.emit(
+        "done",
+        final_cosine=(end_to_end or {}).get("cos_sim"),
+        rel_l2=(end_to_end or {}).get("rel_l2_error"),
+        rel_max=(end_to_end or {}).get("rel_max_abs_error"),
+        strict_pass=out["strict_pass"],
+        elapsed_s=elapsed,
+        stats=stats,
+        total_sched_packets=aggregate_metrics.get("total_sched_packets"),
+        total_emu_packets=aggregate_metrics.get("total_emu_packets"),
+        total_bytes_memory_traffic=aggregate_metrics.get("total_bytes_memory_traffic"),
+        total_flops=aggregate_metrics.get("total_flops"),
+    )
+
     if layer_metrics_csv_path:
         p_csv = Path(layer_metrics_csv_path)
         write_layer_metrics_csv(p_csv, kernel_metrics)
@@ -1005,6 +1279,25 @@ def main():
         action="store_true",
         help="During training validation, print metrics for every parameter gradient instead of only the worst.",
     )
+    parser.add_argument(
+        "--progress-jsonl",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Append start/node_start/node_done/done/error JSON events to PATH, flushed per line "
+            "(bench/ui/API_CONTRACT.md A). Env fallback: ATALLA_PROGRESS_JSONL."
+        ),
+    )
+    parser.add_argument(
+        "--overrides",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Plan overrides JSON: {'global': {gelu_kernel, sdpa, add_numpy_threshold}, "
+            "'nodes': {name: {backend: emulator|numpy|skip, kernel}}} "
+            "(bench/ui/API_CONTRACT.md B). Env fallback: ATALLA_PLAN_OVERRIDES."
+        ),
+    )
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -1017,36 +1310,58 @@ def main():
 
     if args.training and expected_output is None:
         raise SystemExit(f"--training needs an expected_output target; model {args.model!r} returns None")
-    if (args.training):
-        gm = build_graph(model, example_input, verbose=verbose,
-            include_backward=args.training, example_target=expected_output, loss_fn=nn.MSELoss())
-    else:
-        gm = build_graph(model, example_input, verbose=verbose)
 
-    vout: Optional[Dict] = None
-    if args.mode in ("validate", "both"):
-        vout = run_validate(
-            gm,
-            model,
-            example_input,
-            args.out_dir,
-            verbose=verbose,
-            kernel_bundle_dir=args.export_kernel_bundle,
-            metrics_json_path=args.metrics_json,
-            layer_metrics_csv_path=args.layer_metrics_csv,
-            validate_inputs=args.validate_inputs,
-            strict_end_to_end=bool(args.strict_end),
-            training=args.training,
-            expected_output=expected_output if args.training else None,
-            all_gradient_losses=args.all_gradient_losses,
-        )
-    if vout and vout.get("strict_pass") is False:
-        sys.exit(1)
+    progress_path = args.progress_jsonl or os.environ.get("ATALLA_PROGRESS_JSONL") or None
+    overrides_path = args.overrides or os.environ.get("ATALLA_PLAN_OVERRIDES") or None
+    progress = ProgressWriter(progress_path)
+    try:
+        if (args.training):
+            gm = build_graph(model, example_input, verbose=verbose,
+                include_backward=args.training, example_target=expected_output,
+                loss_fn=nn.MSELoss(), overrides=overrides_path)
+        else:
+            gm = build_graph(model, example_input, verbose=verbose, overrides=overrides_path)
+        if verbose and overrides_path:
+            print(f"Plan overrides: {overrides_path} -> env {gm.meta.get('override_env')}")
 
-    if args.mode in ("schedule", "both"):
-        import copy
-        gm_sched = copy.deepcopy(gm)
-        run_schedule(gm_sched, example_input, args.out_dir, verbose=verbose)
+        vout: Optional[Dict] = None
+        if args.mode in ("validate", "both"):
+            vout = run_validate(
+                gm,
+                model,
+                example_input,
+                args.out_dir,
+                verbose=verbose,
+                kernel_bundle_dir=args.export_kernel_bundle,
+                metrics_json_path=args.metrics_json,
+                layer_metrics_csv_path=args.layer_metrics_csv,
+                validate_inputs=args.validate_inputs,
+                strict_end_to_end=bool(args.strict_end),
+                training=args.training,
+                expected_output=expected_output if args.training else None,
+                all_gradient_losses=args.all_gradient_losses,
+                progress=progress,
+                model_name=args.model,
+            )
+        if vout and vout.get("strict_pass") is False:
+            sys.exit(1)
+
+        if args.mode in ("schedule", "both"):
+            import copy
+            gm_sched = copy.deepcopy(gm)
+            # In --mode both the validate pass already streamed the graph; only a pure
+            # schedule run streams its (metric-less) node events.
+            run_schedule(gm_sched, example_input, args.out_dir, verbose=verbose,
+                         progress=progress if args.mode == "schedule" else None,
+                         model_name=args.model)
+    except SystemExit:
+        raise
+    except BaseException as exc:  # noqa: BLE001 - report then re-raise
+        progress.emit("error", message=f"{type(exc).__name__}: {exc}", node=progress.current_node,
+                      fatal=True)
+        raise
+    finally:
+        progress.close()
 
 
 if __name__ == "__main__":

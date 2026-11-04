@@ -20,6 +20,7 @@ import torch.nn as nn
 from torch.fx import GraphModule, Node
 
 from .fx_capture import get_node_shape
+from .overrides import gelu_method_from_env, add_numpy_threshold_from_env
 
 VL = 32
 TILE = 32
@@ -147,9 +148,13 @@ def _plan_gelu(node: Node) -> TileConfig:
     for d in (shape or [1]):
         total *= d
     width = min(total, VL)
+    # Method resolved from ATALLA_GELU_KERNEL (overrides may rewrite it afterwards);
+    # ``torch`` means the PyTorch BF16 reference (no emulator).
+    method = gelu_method_from_env()
     return TileConfig(
         kernel_type="gelu",
-        params=dict(total_elements=total, width=width),
+        params=dict(total_elements=total, width=width, method=method,
+                    use_numpy=(method == "torch")),
     )
 
 
@@ -272,9 +277,11 @@ def _plan_softmax(node: Node, gm: GraphModule) -> TileConfig:
     dim = _softmax_axis(node, gm)
     row_len = int(shape[dim])
     num_rows = _prod(shape) // row_len
+    # emit_softmax falls back to PyTorch when a row does not fit one vector (row_len > 32).
     return TileConfig(
         kernel_type="softmax",
-        params=dict(num_rows=num_rows, row_len=row_len, softmax_dim=dim),
+        params=dict(num_rows=num_rows, row_len=row_len, softmax_dim=dim,
+                    use_numpy=(row_len > 32)),
     )
 
 
@@ -288,11 +295,13 @@ def _plan_add(node: Node) -> TileConfig:
     # (the old failure was a compiler addi_s immediate overflow, see
     # docs/add_kernel_multitile_fix.md). ``ATALLA_FFN_ADD_NUMPY=1`` restores the
     # previous behaviour (adds > 1024 elements on NumPy); ``0``/unset = emulator.
-    ffn_add_numpy = os.environ.get("ATALLA_FFN_ADD_NUMPY", "0") == "1"
-    use_numpy = ffn_add_numpy and total > 1024
+    # ``ATALLA_FFN_ADD_NUMPY_THRESHOLD=N`` (set by the ``add_numpy_threshold`` override)
+    # generalises the 1024 cut-off.
+    threshold = add_numpy_threshold_from_env()
+    use_numpy = threshold is not None and total > threshold
     return TileConfig(
         kernel_type="add",
-        params=dict(total_elements=total, use_numpy=use_numpy),
+        params=dict(total_elements=total, use_numpy=use_numpy, numpy_threshold=threshold),
     )
 
 
@@ -312,13 +321,13 @@ def _plan_sdpa(node: Node, gm: GraphModule) -> TileConfig:
     if not node.args or not isinstance(node.args[0], Node):
         return TileConfig(
             kernel_type="atalla_sdpa",
-            params=dict(B=1, N=1, D=1, use_flash=False, inv_sqrt_d=1.0),
+            params=dict(B=1, N=1, D=1, use_flash=False, use_numpy=True, inv_sqrt_d=1.0),
         )
     qs = get_node_shape(node.args[0])
     if not qs or len(qs) < 2:
         return TileConfig(
             kernel_type="atalla_sdpa",
-            params=dict(B=1, N=1, D=1, use_flash=False, inv_sqrt_d=1.0),
+            params=dict(B=1, N=1, D=1, use_flash=False, use_numpy=True, inv_sqrt_d=1.0),
         )
     d_last = int(qs[-1])
     n_head = int(qs[-2])
@@ -339,6 +348,7 @@ def _plan_sdpa(node: Node, gm: GraphModule) -> TileConfig:
             N=n_head,
             D=d_last,
             use_flash=use_flash,
+            use_numpy=(not use_flash),
             inv_sqrt_d=inv,
         ),
     )
@@ -368,7 +378,8 @@ def _plan_flatten(node: Node) -> TileConfig:
 def _plan_adaptive_avg_pool(node: Node) -> TileConfig:
     shape = get_node_shape(node.args[0])
     C = shape[1] if shape and len(shape) >= 2 else 1
-    return TileConfig(kernel_type="adaptive_avg_pool", params=dict(channels=C))
+    # emit_node always evaluates adaptive_avg_pool with PyTorch (no AtallaC kernel yet).
+    return TileConfig(kernel_type="adaptive_avg_pool", params=dict(channels=C, use_numpy=True))
 
 
 def _prod(xs) -> int:
@@ -404,9 +415,11 @@ def _plan_layernorm(node: Node, gm: GraphModule) -> TileConfig:
     else:
         m_groups = _prod(inp_shape[:-nd])
 
+    # emit_layernorm uses AtallaC only when D is a non-zero multiple of 32.
+    use_hw = (d_norm % 32 == 0) and d_norm >= 32
     return TileConfig(
         kernel_type="layernorm",
-        params=dict(M=m_groups, D=d_norm, eps=eps, normalized_dims=nd),
+        params=dict(M=m_groups, D=d_norm, eps=eps, normalized_dims=nd, use_numpy=(not use_hw)),
     )
 
 

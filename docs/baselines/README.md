@@ -1,6 +1,6 @@
 # Atalla benchmark baselines
 
-Generated 2026-11-04T14:59:50+00:00 by `bench/build_workbook.py` from `docs/baselines/*/summary.json`. Workbook: `output/Atalla_Benchmarking_Workbook.xlsx`. Metric definitions: `docs/benchmark_metrics.md`.
+Generated 2026-11-04T15:32:42+00:00 by `bench/build_workbook.py` from `docs/baselines/*/summary.json`. Workbook: `output/Atalla_Benchmarking_Workbook.xlsx`. Metric definitions: `docs/benchmark_metrics.md`.
 
 All numbers come from the functional simulator (counts only, no cycle timing). Each run directory holds `run.log`, `config.json` (provenance), `metrics.json`, `layers.csv`, `summary.json` and the compiled artifacts under `out/`.
 

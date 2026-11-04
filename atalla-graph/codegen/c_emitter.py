@@ -1422,7 +1422,10 @@ def emit_gelu(node: Node, input_data: np.ndarray, tc: TileConfig) -> LayerEmissi
         flat = pad
     out_shape = get_node_shape(node)
     os = tuple(out_shape) if out_shape else (total,)
-    method = gelu_kernel_method()
+    # tile_planner records the method (and graph/overrides may rewrite it); env is the fallback.
+    method = str(p.get("method") or gelu_kernel_method()).lower()
+    if method in ("pytorch", "numpy", ""):
+        method = "torch"
 
     if method == "torch":
         x = torch.from_numpy(flat).to(torch.bfloat16)
@@ -1482,6 +1485,65 @@ def emit_gelu(node: Node, input_data: np.ndarray, tc: TileConfig) -> LayerEmissi
         "bytes_est_out": int(rows * width * 2),
     }
     return em
+
+
+# atalla_op values that emit_node dispatches (anything else returns None -> passthrough).
+EMITTER_OPS = frozenset({
+    "conv", "linear", "relu", "softmax", "maxpool", "adaptive_avg_pool", "matmul", "add",
+    "mul", "atalla_sdpa", "layernorm", "gelu",
+    "threshold_backward", "aten.threshold_backward.default",
+    "sum_dim", "aten.sum.dim_IntList",
+    "mse_loss", "aten.mse_loss.default",
+    "mse_loss_backward", "aten.mse_loss_backward.default",
+})
+
+# atalla_op -> (kernel name, file under atalla-graph/kernels/, kind). ``None`` = NumPy/PyTorch only.
+# Variants (gelu method, sdpa flash) are resolved by kernel_source_for().
+_KERNEL_SOURCES = {
+    "conv": ("gemm", "gemm.py", "generator"),          # im2col (functional_sim build_conv_tiled) + _gemm_c
+    "linear": ("gemm", "gemm.py", "generator"),
+    "matmul": ("gemm", "gemm.py", "generator"),
+    "relu": ("relu", "relu.py", "generator"),
+    "softmax": ("softmax", "softmax.py", "generator"),
+    "maxpool": ("maxpool", "maxpool.py", "generator"),
+    "add": ("add", "add.py", "generator"),
+    "mul": ("mul", "mul.py", "generator"),
+    "layernorm": ("layernorm", "layernorm.py", "generator"),
+    "atalla_sdpa": ("flash_sdpa_n32d32", "flash_sdpa_n32d32.c", "static_c"),
+    "gelu": ("gelu", "gelu.c", "static_c"),
+    "threshold_backward": ("threshold_backward", "threshold_backward.c", "static_c"),
+    "aten.threshold_backward.default": ("threshold_backward", "threshold_backward.c", "static_c"),
+    "sum_dim": ("sum_dim", "sum_dim.c", "static_c"),
+    "aten.sum.dim_IntList": ("sum_dim", "sum_dim.c", "static_c"),
+    "mse_loss": ("mse_loss", "mse_loss.c", "static_c"),
+    "aten.mse_loss.default": ("mse_loss", "mse_loss.c", "static_c"),
+    "mse_loss_backward": ("mse_loss_backward", "mse_loss_backward.c", "static_c"),
+    "aten.mse_loss_backward.default": ("mse_loss_backward", "mse_loss_backward.c", "static_c"),
+    "adaptive_avg_pool": None,
+}
+
+
+def has_emitter(atalla_op: Optional[str]) -> bool:
+    """True when :func:`emit_node` has an ``emit_<op>`` path for *atalla_op*."""
+    return atalla_op in EMITTER_OPS
+
+
+def kernel_source_for(atalla_op: Optional[str], tc: Optional[TileConfig]) -> Optional[Dict[str, str]]:
+    """Which kernel generator / static C file *atalla_op* maps to (repo-relative ``source``)."""
+    entry = _KERNEL_SOURCES.get(atalla_op)
+    if entry is None:
+        return None
+    name, fname, kind = entry
+    p = tc.params if tc is not None else {}
+    if atalla_op == "gelu":
+        method = str(p.get("method") or "torch").lower()
+        if method == "tanh":
+            name, fname = "gelu_tanh", "gelu_tanh.c"
+        elif method in ("torch", "pytorch", ""):
+            return None
+    if atalla_op == "atalla_sdpa" and not p.get("use_flash"):
+        return None
+    return {"name": name, "source": f"atalla-graph/kernels/{fname}", "kind": kind}
 
 
 def emit_node(node: Node, gm: GraphModule,
