@@ -1,0 +1,125 @@
+$ /Users/robert.zhang/.venvs/atalla/bin/python run_graph.py --model vit_micro --mode validate --out-dir /Users/robert.zhang/Documents/GitHub/atalla-models-rz/docs/baselines/vit_micro__default-sdpa-chained__20261104-1458/out --metrics-json /Users/robert.zhang/Documents/GitHub/atalla-models-rz/docs/baselines/vit_micro__default-sdpa-chained__20261104-1458/metrics.json --layer-metrics-csv /Users/robert.zhang/Documents/GitHub/atalla-models-rz/docs/baselines/vit_micro__default-sdpa-chained__20261104-1458/layers.csv --seed 42
+FX trace + lower modules...
+Shape propagation...
+Normalize ops + plan tiles...
+
+--- Graph (validate_inputs=chained) ---
+  Note: cos similarity is direction-only (ignores scale). Prefer rmse, rel_l2, rel_max_abs (max_abs / max|ref|) for element error. Refs use the traced BF16 model (numpy float), i.e. BF16 matmul semantics.
+  chained: true pipeline — bad early layers corrupt later per-layer cos.
+  x                               placeholder      -             (1, 32, 32)
+  patch_embed_weight              get_attr         -             (32, 32)
+  patch_embed_bias                get_attr         -             (32,)
+  transpose                       transpose        flatten       (32, 32)
+  matmul                          matmul           matmul        (1, 32, 32)
+  add_3                           add              add           (1, 32, 32)
+  pos_embed                       get_attr         -             (1, 32, 32)
+  add                             add              add           (1, 32, 32)
+  ln1_weight                      get_attr         -             (32,)
+  ln1_bias                        get_attr         -             (32,)
+  layer_norm                      layernorm        layernorm     (1, 32, 32)
+  q_proj_weight                   get_attr         -             (32, 32)
+  q_proj_bias                     get_attr         -             (32,)
+  transpose_1                     transpose        flatten       (32, 32)
+  matmul_1                        matmul           matmul        (1, 32, 32)
+  add_4                           add              add           (1, 32, 32)
+  k_proj_weight                   get_attr         -             (32, 32)
+  k_proj_bias                     get_attr         -             (32,)
+  transpose_2                     transpose        flatten       (32, 32)
+  matmul_2                        matmul           matmul        (1, 32, 32)
+  add_5                           add              add           (1, 32, 32)
+  v_proj_weight                   get_attr         -             (32, 32)
+  v_proj_bias                     get_attr         -             (32,)
+  transpose_3                     transpose        flatten       (32, 32)
+  matmul_3                        matmul           matmul        (1, 32, 32)
+  add_6                           add              add           (1, 32, 32)
+  sdpa                            atalla_sdpa      atalla_sdpa   (1, 32, 32)
+  attn_proj_weight                get_attr         -             (32, 32)
+  attn_proj_bias                  get_attr         -             (32,)
+  transpose_4                     transpose        flatten       (32, 32)
+  matmul_4                        matmul           matmul        (1, 32, 32)
+  add_7                           add              add           (1, 32, 32)
+  add_1                           add              add           (1, 32, 32)
+  ln2_weight                      get_attr         -             (32,)
+  ln2_bias                        get_attr         -             (32,)
+  layer_norm_1                    layernorm        layernorm     (1, 32, 32)
+  ff1_weight                      get_attr         -             (64, 32)
+  ff1_bias                        get_attr         -             (64,)
+  transpose_5                     transpose        flatten       (32, 64)
+  matmul_5                        matmul           matmul        (1, 32, 64)
+  add_8                           add              add           (1, 32, 64)
+  gelu                            gelu             gelu          (1, 32, 64)
+  ff2_weight                      get_attr         -             (32, 64)
+  ff2_bias                        get_attr         -             (32,)
+  transpose_6                     transpose        flatten       (64, 32)
+  matmul_6                        matmul           matmul        (1, 32, 32)
+  add_9                           add              add           (1, 32, 32)
+  add_2                           add              add           (1, 32, 32)
+  output                          output           -             (1, 32, 32)
+
+  [x] placeholder
+  [patch_embed_weight] get_attr
+  [patch_embed_bias] get_attr
+  [transpose] transpose -> (32, 32)
+  [matmul] matmul -> emulator (0x5000, 1024 elems)... done (cos=1.000000, max_abs=0.000000, relmax=0.000000, rmse=0.000000, rel_l2=0.000000, emu_norm=18.875372, ref_norm=18.875372, emu_nz=1024, ref_nz=1024, slot_eff=0.286, bytes_ld=6208, bytes_st=2048)
+  [add_3] add -> emulator (0x5000, 1024 elems)... done (cos=1.000000, max_abs=0.000000, relmax=0.000000, rmse=0.000000, rel_l2=0.000000, emu_norm=19.194025, ref_norm=19.194025, emu_nz=1024, ref_nz=1024, slot_eff=0.310, bytes_ld=4096, bytes_st=2048)
+  [pos_embed] get_attr
+  [add] add -> emulator (0x5000, 1024 elems)... done (cos=1.000000, max_abs=0.000000, relmax=0.000000, rmse=0.000000, rel_l2=0.000000, emu_norm=19.194025, ref_norm=19.194025, emu_nz=1024, ref_nz=1024, slot_eff=0.310, bytes_ld=4096, bytes_st=2048)
+  [ln1_weight] get_attr
+  [ln1_bias] get_attr
+  [layer_norm] layernorm -> emulator (0x3000, 1024 elems)... done (cos=0.999995, max_abs=0.015625, relmax=0.005155, rmse=0.003353, rel_l2=0.003353, emu_norm=32.022995, ref_norm=31.998180, emu_nz=1023, ref_nz=1024, slot_eff=0.312, bytes_ld=10240, bytes_st=2048)
+  [q_proj_weight] get_attr
+  [q_proj_bias] get_attr
+  [transpose_1] transpose -> (32, 32)
+  [matmul_1] matmul -> emulator (0x5000, 1024 elems)... done (cos=0.999992, max_abs=0.007812, relmax=0.004831, rmse=0.002212, rel_l2=0.004070, emu_norm=17.405272, ref_norm=17.392822, emu_nz=1024, ref_nz=1024, slot_eff=0.286, bytes_ld=6208, bytes_st=2048)
+  [add_4] add -> emulator (0x5000, 1024 elems)... done (cos=0.999992, max_abs=0.007812, relmax=0.004717, rmse=0.002300, rel_l2=0.004162, emu_norm=17.698668, ref_norm=17.685884, emu_nz=1024, ref_nz=1022, slot_eff=0.310, bytes_ld=4096, bytes_st=2048)
+  [k_proj_weight] get_attr
+  [k_proj_bias] get_attr
+  [transpose_2] transpose -> (32, 32)
+  [matmul_2] matmul -> emulator (0x5000, 1024 elems)... done (cos=0.999992, max_abs=0.015625, relmax=0.007937, rmse=0.002430, rel_l2=0.004063, emu_norm=19.154423, ref_norm=19.139328, emu_nz=1024, ref_nz=1024, slot_eff=0.286, bytes_ld=6208, bytes_st=2048)
+  [add_5] add -> emulator (0x5000, 1024 elems)... done (cos=0.999992, max_abs=0.015625, relmax=0.008065, rmse=0.002519, rel_l2=0.004130, emu_norm=19.529898, ref_norm=19.516294, emu_nz=1024, ref_nz=1024, slot_eff=0.310, bytes_ld=4096, bytes_st=2048)
+  [v_proj_weight] get_attr
+  [v_proj_bias] get_attr
+  [transpose_3] transpose -> (32, 32)
+  [matmul_3] matmul -> emulator (0x5000, 1024 elems)... done (cos=0.999992, max_abs=0.007812, relmax=0.004386, rmse=0.002466, rel_l2=0.004089, emu_norm=19.313955, ref_norm=19.297216, emu_nz=1024, ref_nz=1024, slot_eff=0.286, bytes_ld=6208, bytes_st=2048)
+  [add_6] add -> emulator (0x5000, 1024 elems)... done (cos=0.999992, max_abs=0.007812, relmax=0.004367, rmse=0.002503, rel_l2=0.004058, emu_norm=19.753706, ref_norm=19.738527, emu_nz=1023, ref_nz=1023, slot_eff=0.310, bytes_ld=4096, bytes_st=2048)
+  [sdpa] atalla_sdpa -> NumPy (1, 32, 32) (cos=0.999993, rmse=0.000795, rel_l2=0.003899, relmax=0.004216)
+  [attn_proj_weight] get_attr
+  [attn_proj_bias] get_attr
+  [transpose_4] transpose -> (32, 32)
+  [matmul_4] matmul -> emulator (0x5000, 1024 elems)... done (cos=0.999990, max_abs=0.002441, relmax=0.006250, rmse=0.000649, rel_l2=0.004824, emu_norm=4.298919, ref_norm=4.306655, emu_nz=1024, ref_nz=1024, slot_eff=0.286, bytes_ld=6208, bytes_st=2048)
+  [add_7] add -> emulator (0x5000, 1024 elems)... done (cos=0.999992, max_abs=0.002441, relmax=0.004845, rmse=0.000691, rel_l2=0.004212, emu_norm=5.242586, ref_norm=5.248887, emu_nz=1024, ref_nz=1023, slot_eff=0.310, bytes_ld=4096, bytes_st=2048)
+  [add_1] add -> emulator (0x5000, 1024 elems)... done (cos=0.999998, max_abs=0.007812, relmax=0.003378, rmse=0.001154, rel_l2=0.001851, emu_norm=19.946383, ref_norm=19.943266, emu_nz=1023, ref_nz=1022, slot_eff=0.310, bytes_ld=4096, bytes_st=2048)
+  [ln2_weight] get_attr
+  [ln2_bias] get_attr
+  [layer_norm_1] layernorm -> emulator (0x3000, 1024 elems)... done (cos=0.999992, max_abs=0.015625, relmax=0.005348, rmse=0.004472, rel_l2=0.004471, emu_norm=32.061157, ref_norm=32.000294, emu_nz=1024, ref_nz=1024, slot_eff=0.312, bytes_ld=10240, bytes_st=2048)
+  [ff1_weight] get_attr
+  [ff1_bias] get_attr
+  [transpose_5] transpose -> (32, 64)
+  [matmul_5] matmul -> emulator (0x5000, 2048 elems)... done (cos=0.999989, max_abs=0.011719, relmax=0.006224, rmse=0.002856, rel_l2=0.005060, emu_norm=25.594906, ref_norm=25.548527, emu_nz=2048, ref_nz=2048, slot_eff=0.286, bytes_ld=12416, bytes_st=4096)
+  [add_8] add -> emulator (0x5000, 2048 elems)... done (cos=0.999989, max_abs=0.015625, relmax=0.007905, rmse=0.002939, rel_l2=0.005069, emu_norm=26.288572, ref_norm=26.241926, emu_nz=2047, ref_nz=2046, slot_eff=0.310, bytes_ld=8192, bytes_st=4096)
+  [gelu] gelu -> NumPy (1, 32, 64) (cos=0.999986, rmse=0.001931, rel_l2=0.005747, relmax=0.008097)
+  [ff2_weight] get_attr
+  [ff2_bias] get_attr
+  [transpose_6] transpose -> (64, 32)
+  [matmul_6] matmul -> emulator (0x5000, 1024 elems)... done (cos=0.999981, max_abs=0.005859, relmax=0.006977, rmse=0.001228, rel_l2=0.006494, emu_norm=6.064537, ref_norm=6.052310, emu_nz=1024, ref_nz=1024, slot_eff=0.286, bytes_ld=12416, bytes_st=4096)
+  [add_9] add -> emulator (0x5000, 1024 elems)... done (cos=0.999980, max_abs=0.007812, relmax=0.009804, rmse=0.001280, rel_l2=0.006489, emu_norm=6.320061, ref_norm=6.310717, emu_nz=1024, ref_nz=1022, slot_eff=0.310, bytes_ld=4096, bytes_st=2048)
+  [add_2] add -> emulator (0x5000, 1024 elems)... done (cos=0.999995, max_abs=0.007812, relmax=0.003289, rmse=0.002064, rel_l2=0.003127, emu_norm=21.133064, ref_norm=21.125748, emu_nz=1024, ref_nz=1024, slot_eff=0.310, bytes_ld=4096, bytes_st=2048)
+
+--- Results (9.57s) ---
+  Nodes: 48 total, 19 emulated, 2 numpy, 7 passthrough
+  Output: emu=(1, 32, 32) ref=(1, 32, 32)
+  cos=0.999995  max_abs=0.007812  relmax=0.003289  rmse=0.002064  rel_l2=0.003127
+  RELAXED PASS (cos>0.95 only) — for chained E2E, use --strict-end or inspect rel_l2/relmax above.
+
+--- Aggregate metrics (all emulated layers) ---
+  Static slot efficiency (all scheduled packets): 0.2972
+  Static slot efficiency (non-empty packets only): 0.2972
+  Dynamic slot efficiency (emulator retired): 0.3213
+  Total bytes loaded / written: 121408 / 45056
+  Total FLOPs (model counters): 668399
+  Aggregate arithmetic intensity (FLOPs / byte moved): 4.0153
+
+Wrote metrics JSON: /Users/robert.zhang/Documents/GitHub/atalla-models-rz/docs/baselines/vit_micro__default-sdpa-chained__20261104-1458/metrics.json
+
+Wrote per-layer metrics CSV: /Users/robert.zhang/Documents/GitHub/atalla-models-rz/docs/baselines/vit_micro__default-sdpa-chained__20261104-1458/layers.csv
+Wrote template rollup CSV: /Users/robert.zhang/Documents/GitHub/atalla-models-rz/docs/baselines/vit_micro__default-sdpa-chained__20261104-1458/layers_template_summary.csv

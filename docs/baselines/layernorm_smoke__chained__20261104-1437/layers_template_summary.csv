@@ -1,4 +1,0 @@
-template_key,map_kind,map_M,map_N,map_K,n_layers,layer_names,sum_packets_executed,sum_instructions_executed,sum_sched_packets,sum_flops_total,sum_flops_matmul,mean_packet_share,sum_bytes_loaded,sum_bytes_written,sum_bytes_loaded_sp0,sum_bytes_loaded_sp1,sum_bytes_stored_sp0,sum_bytes_stored_sp1,reuse_R_A_gemm,reuse_R_W_gemm,sum_dyn_retired_branch_control,sum_dyn_retired_sdma,sum_dyn_retired_scalar_mem,sum_dyn_retired_scalar_alu,sum_dyn_retired_vector_mem,sum_dyn_retired_vector_alu,sum_dyn_retired_gemm_systolic,sum_dyn_retired_move_convert
-add|rows1|width32,add,1,32,,1,add,94,120,99,105,0,0.085845,128,64,64,64,64,0,,,9,3,43,53,9,2,0,1
-gemm|M1|N32|K32,gemm,1,32,32,1,matmul,742,844,281,2336,2048,0.677626,2240,64,128,2112,0,64,18.25,1.106061,85,5,339,273,107,1,33,1
-layernorm|M1|D32,layernorm,1,32,,1,layer_norm,259,325,259,577,0,0.23653,320,64,320,0,64,0,,,15,6,99,148,33,14,0,10

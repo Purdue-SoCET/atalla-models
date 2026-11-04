@@ -1,0 +1,65 @@
+$ /Users/robert.zhang/.venvs/atalla/bin/python run_graph.py --model basic --mode validate --out-dir /Users/robert.zhang/Documents/GitHub/atalla-models-rz/docs/baselines/basic__strict-chained__20261104-1458/out --metrics-json /Users/robert.zhang/Documents/GitHub/atalla-models-rz/docs/baselines/basic__strict-chained__20261104-1458/metrics.json --layer-metrics-csv /Users/robert.zhang/Documents/GitHub/atalla-models-rz/docs/baselines/basic__strict-chained__20261104-1458/layers.csv --seed 42 --strict-end
+FX trace + lower modules...
+Shape propagation...
+Normalize ops + plan tiles...
+
+--- Graph (validate_inputs=chained) ---
+  Note: cos similarity is direction-only (ignores scale). Prefer rmse, rel_l2, rel_max_abs (max_abs / max|ref|) for element error. Refs use the traced BF16 model (numpy float), i.e. BF16 matmul semantics.
+  chained: true pipeline — bad early layers corrupt later per-layer cos.
+  x                               placeholder      -             (1, 32)
+  weights_0                       get_attr         -             (32, 32)
+  biases_0                        get_attr         -             (32,)
+  matmul                          matmul           matmul        (1, 32)
+  add                             add              add           (1, 32)
+  relu                            relu             relu          (1, 32)
+  weights_1                       get_attr         -             (32, 32)
+  biases_1                        get_attr         -             (32,)
+  matmul_1                        matmul           matmul        (1, 32)
+  add_1                           add              add           (1, 32)
+  relu_1                          relu             relu          (1, 32)
+  mul                             mul              mul           (1, 32)
+  add_2                           add              add           (1, 32)
+  output_weight                   get_attr         -             (32, 32)
+  transpose                       transpose        flatten       (32, 32)
+  matmul_2                        matmul           matmul        (1, 32)
+  output_bias                     get_attr         -             (32,)
+  add_3                           add              add           (1, 32)
+  output_1                        output           -             (1, 32)
+
+  [x] placeholder
+  [weights_0] get_attr
+  [biases_0] get_attr
+  [matmul] matmul -> emulator (0x5000, 32 elems)... done (cos=1.000000, max_abs=0.000000, relmax=0.000000, rmse=0.000000, rel_l2=0.000000, emu_norm=3.885348, ref_norm=3.885348, emu_nz=32, ref_nz=32, slot_eff=0.286, bytes_ld=2240, bytes_st=64)
+  [add] add -> emulator (0x5000, 32 elems)... done (cos=1.000000, max_abs=0.000000, relmax=0.000000, rmse=0.000000, rel_l2=0.000000, emu_norm=3.998531, ref_norm=3.998531, emu_nz=32, ref_nz=32, slot_eff=0.310, bytes_ld=128, bytes_st=64)
+  [relu] relu -> emulator (0x3000, 32 elems)... done (cos=1.000000, max_abs=0.000000, relmax=0.000000, rmse=0.000000, rel_l2=0.000000, emu_norm=1.988558, ref_norm=1.988558, emu_nz=16, ref_nz=16, slot_eff=0.304, bytes_ld=64, bytes_st=64)
+  [weights_1] get_attr
+  [biases_1] get_attr
+  [matmul_1] matmul -> emulator (0x5000, 32 elems)... done (cos=1.000000, max_abs=0.000000, relmax=0.000000, rmse=0.000000, rel_l2=0.000000, emu_norm=1.243897, ref_norm=1.243897, emu_nz=32, ref_nz=32, slot_eff=0.286, bytes_ld=2240, bytes_st=64)
+  [add_1] add -> emulator (0x5000, 32 elems)... done (cos=1.000000, max_abs=0.000000, relmax=0.000000, rmse=0.000000, rel_l2=0.000000, emu_norm=1.283188, ref_norm=1.283188, emu_nz=32, ref_nz=32, slot_eff=0.310, bytes_ld=128, bytes_st=64)
+  [relu_1] relu -> emulator (0x3000, 32 elems)... done (cos=1.000000, max_abs=0.000000, relmax=0.000000, rmse=0.000000, rel_l2=0.000000, emu_norm=0.883709, ref_norm=0.883709, emu_nz=13, ref_nz=13, slot_eff=0.304, bytes_ld=64, bytes_st=64)
+  [mul] mul -> emulator (0x5000, 32 elems)... done (cos=1.000000, max_abs=0.000000, relmax=0.000000, rmse=0.000000, rel_l2=0.000000, emu_norm=0.994279, ref_norm=0.994279, emu_nz=16, ref_nz=16, slot_eff=0.298, bytes_ld=128, bytes_st=64)
+  [add_2] add -> emulator (0x5000, 32 elems)... done (cos=1.000000, max_abs=0.000000, relmax=0.000000, rmse=0.000000, rel_l2=0.000000, emu_norm=1.502372, ref_norm=1.502372, emu_nz=23, ref_nz=23, slot_eff=0.310, bytes_ld=128, bytes_st=64)
+  [output_weight] get_attr
+  [transpose] transpose -> (32, 32)
+  [matmul_2] matmul -> emulator (0x5000, 32 elems)... done (cos=1.000000, max_abs=0.000000, relmax=0.000000, rmse=0.000000, rel_l2=0.000000, emu_norm=0.842778, ref_norm=0.842778, emu_nz=32, ref_nz=32, slot_eff=0.286, bytes_ld=2240, bytes_st=64)
+  [output_bias] get_attr
+  [add_3] add -> emulator (0x5000, 32 elems)... done (cos=1.000000, max_abs=0.000000, relmax=0.000000, rmse=0.000000, rel_l2=0.000000, emu_norm=1.179995, ref_norm=1.179995, emu_nz=32, ref_nz=32, slot_eff=0.310, bytes_ld=128, bytes_st=64)
+
+--- Results (4.74s) ---
+  Nodes: 18 total, 10 emulated, 0 numpy, 1 passthrough
+  Output: emu=(1, 32) ref=(1, 32)
+  cos=1.000000  max_abs=0.000000  relmax=0.000000  rmse=0.000000  rel_l2=0.000000
+  PASS (strict: cos≥0.999, rel_l2≤0.02, relmax≤0.05)
+
+--- Aggregate metrics (all emulated layers) ---
+  Static slot efficiency (all scheduled packets): 0.2958
+  Static slot efficiency (non-empty packets only): 0.2958
+  Dynamic slot efficiency (emulator retired): 0.2910
+  Total bytes loaded / written: 7488 / 640
+  Total FLOPs (model counters): 7884
+  Aggregate arithmetic intensity (FLOPs / byte moved): 0.9700
+
+Wrote metrics JSON: /Users/robert.zhang/Documents/GitHub/atalla-models-rz/docs/baselines/basic__strict-chained__20261104-1458/metrics.json
+
+Wrote per-layer metrics CSV: /Users/robert.zhang/Documents/GitHub/atalla-models-rz/docs/baselines/basic__strict-chained__20261104-1458/layers.csv
+Wrote template rollup CSV: /Users/robert.zhang/Documents/GitHub/atalla-models-rz/docs/baselines/basic__strict-chained__20261104-1458/layers_template_summary.csv
