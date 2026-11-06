@@ -1,4 +1,4 @@
-"""AtallaC gelu kernel generators: fast polynomial approximation and tanh approximation."""
+"""Ordinary-C GELU sources: legacy polynomials and stable piecewise evaluation."""
 
 from pathlib import Path
 
@@ -11,9 +11,12 @@ def gelu_c(method: str = "horner", **kwargs) -> str:
     """Return the static AtallaC gelu kernel source code.
 
     Methods:
-      - 'horner': Fast 6th-degree minimax Horner polynomial (2x faster, 0.018 max error, ~12 instrs)
-      - 'tanh': Tanh 7th-degree expansion (0.016 max error, ~22 instrs)
+      - 'horner': Legacy 6th-degree Horner polynomial
+      - 'tanh': Legacy tanh 7th-degree expansion
+      - 'piecewise': Centered cubic intervals with stable negative-tail evaluation
     """
+    if method.lower() == "piecewise":
+        return (_C_DIR / "gelu_piecewise.c").read_text()
     if method.lower() == "tanh":
         return _C_TANH.read_text()
     return _C_HORNER.read_text()

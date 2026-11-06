@@ -154,3 +154,25 @@ infinity padding, including any trailing ceil window. The runner performs no
 horizontal pooling reduction, and wide tensors do not take a NumPy pooling route.
 Both module and functional index-returning pooling fail explicitly: this kernel
 returns values only.
+
+
+## Graph GELU
+
+Graph GELU executes `kernels/gelu_piecewise.c` in the simulator. Module and
+functional calls preserve `approximate="none"` or `"tanh"`, with separate
+coefficient tables for the erf and tanh references. Four centered cubic intervals
+use vector arithmetic, evaluating the CDF ratio near zero and the small tail
+correction elsewhere to reduce cancellation. Finite tails beyond magnitude four
+use identity/signed-zero limits. The implementation is a numerical approximation,
+not bit-exact PyTorch GELU. Signed zeros, NaNs and infinities are covered, including
+the erf reference's extreme positive overflow ordering.
+
+Python packs BF16 input, padded DMA tiles and constant coefficients; it does not
+compute execution GELU outputs. Logical output sizes include scalar, empty and
+partial tiles. FP32 coefficient words are read through four-byte union storage
+because ordinary C `float` storage is BF16-sized in the current frontend.
+The older Horner/tanh sources remain available for standalone experiments.
+
+GELU reporting `emulator` does not mean every graph operation is compiled. The
+validated flash ViT still has one explicit NumPy broadcast add. Simulator packets
+and static spill counts are not hardware-cycle or end-to-end speedup measurements.

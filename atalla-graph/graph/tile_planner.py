@@ -141,15 +141,19 @@ def _plan_relu(node: Node) -> TileConfig:
     )
 
 
-def _plan_gelu(node: Node) -> TileConfig:
+def _plan_gelu(node: Node, gm: GraphModule) -> TileConfig:
     shape = get_node_shape(node.args[0])
     total = 1
     for d in (shape or [1]):
         total *= d
     width = min(total, VL)
+    mod = _get_module(gm, node.target) if node.op == "call_module" else None
+    approximate = mod.approximate if isinstance(mod, nn.GELU) else node.kwargs.get("approximate", "none")
+    if approximate not in ("none", "tanh"):
+        raise ValueError("GELU approximate must be none or tanh")
     return TileConfig(
         kernel_type="gelu",
-        params=dict(total_elements=total, width=width),
+        params=dict(total_elements=total, width=width, approximate=approximate),
     )
 
 
@@ -465,7 +469,7 @@ def plan_tiles(gm: GraphModule) -> GraphModule:
         elif atalla_op == "layernorm":
             tc = _plan_layernorm(node, gm)
         elif atalla_op == "gelu":
-            tc = _plan_gelu(node)
+            tc = _plan_gelu(node, gm)
         elif atalla_op in ("threshold_backward", "aten.threshold_backward.default"):
             tc = _plan_threshold_backward(node)
         elif atalla_op in ("sum_dim", "aten.sum.dim_IntList"):

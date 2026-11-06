@@ -1371,28 +1371,50 @@ def emit_layernorm(
 
 
 def emit_gelu(node: Node, input_data: np.ndarray, tc: TileConfig) -> LayerEmission:
-    """GELU via PyTorch BF16 (ISA kernel TBD)."""
-    p = tc.params
-    total = int(p["total_elements"])
-    flat = np.asarray(input_data, dtype=np.float32).flatten()[:total]
-    if flat.size < total:
-        pad = np.zeros(total, dtype=np.float32)
-        pad[: flat.size] = flat
-        flat = pad
-    x = torch.from_numpy(flat).to(torch.bfloat16)
-    try:
-        y = torch.nn.functional.gelu(x, approximate="tanh")
-    except TypeError:
-        y = torch.nn.functional.gelu(x)
-    y = y.float().numpy()
-    out_shape = get_node_shape(node)
-    os = tuple(out_shape) if out_shape else (total,)
+    """Compile vector GELU; host work only packs data and runtime coefficients."""
+    total = int(tc.params["total_elements"])
+    approximate = tc.params.get("approximate", "none")
+    if approximate not in ("none", "tanh"):
+        raise ValueError("GELU approximate must be none or tanh")
+    flat = np.asarray(input_data, dtype=np.float32).ravel()
+    if flat.size != total:
+        raise ValueError("GELU execution input disagrees with planned shape")
+    rows = max(1, math.ceil(total / 32))
+    sp_rows = min(rows, 32)
+    tile_count = math.ceil(rows / sp_rows)
+    padded_count = tile_count * sp_rows * 32
+    input_addr = 0x1000
+    output_addr = input_addr + _align_data(padded_count * 2)
+    img = DRAMWriter()
+    values = [input_addr, output_addr, tile_count, sp_rows,
+              sdma_ctl_val(0, sp_rows, 32, 32), sp_rows * 64]
+    for i, value in enumerate(values):
+        img.u32(ADDR_TABLE + i * 4, value)
+    zero_addr = output_addr + padded_count * 2
+    img.u32(ADDR_TABLE + 24, zero_addr)
+    img.u32(ADDR_TABLE + 28, int(approximate == "tanh"))
+    for offset, value in [(32, 0.), (36, 1.), (40, -1.), (44, float('inf'))]:
+        img.f32(ADDR_TABLE + offset, value)
+    for segment, c in enumerate(kernel_config.GELU_PIECEWISE_COEFFICIENTS[approximate]):
+        values = [float(segment), float(segment + 1), segment + .5, *reversed(c)]
+        for j, value in enumerate(values):
+            img.f32(ADDR_TABLE + 48 + segment * 28 + j * 4, value)
+    img.f32(ADDR_TABLE + 160, .5)
+    img.write_zeros(zero_addr, 64)
+    padded = np.zeros(padded_count, dtype=np.float32)
+    padded[:total] = flat
+    bits = torch.from_numpy(padded).bfloat16().view(torch.int16).numpy().astype('<i2')
+    img.write_bytes(input_addr, bits.tobytes())
+    img.write_zeros(output_addr, padded_count * 2)
     em = LayerEmission()
-    em.skip_emulator = True
-    em.numpy_result = y.reshape(os)
-    em.output_shape = os
+    em.c_source = _ek.gelu_c(method="piecewise")
+    em.dram = img
+    em.output_addr = output_addr
+    shape = get_node_shape(node)
+    em.output_shape = tuple(shape) if shape is not None else (total,)
     em.output_elements = total
-    em.dram = DRAMWriter()
+    em.layer_metrics = {"map_kind": "gelu", "map_elements": total,
+                        "gelu_approximate": approximate, "kernel_source": "gelu_piecewise.c"}
     return em
 
 
