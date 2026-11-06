@@ -145,10 +145,11 @@ def _read_bf16(mem: Memory, addr: int, count: int) -> np.ndarray:
 
 def _cos_sim(a: np.ndarray, b: np.ndarray) -> float:
     af, bf = a.flatten(), b.flatten()
-    n = min(len(af), len(bf))
-    af, bf = af[:n], bf[:n]
-    d = np.dot(af, bf)
-    return float(d / (np.linalg.norm(af) * np.linalg.norm(bf) + 1e-12))
+    an, bn = np.linalg.norm(af), np.linalg.norm(bf)
+    if an == 0 or bn == 0:
+        return 1.0 if an == bn == 0 else 0.0
+    return float(np.clip(np.dot(af / an, bf / bn), -1.0, 1.0))
+
 
 
 def _nz_count(a: np.ndarray, eps: float = 1e-8) -> int:
@@ -190,9 +191,14 @@ def _layer_compare_metrics(
     ref: np.ndarray, result: np.ndarray, eps: float = 1e-12
 ) -> Dict[str, float]:
     """Compare ref vs result: cos (direction-only), abs errors, rel ℓ₂, rel max error."""
-    rf = np.asarray(ref, dtype=np.float64).flatten()
-    ef = np.asarray(result, dtype=np.float64).flatten()
-    n = min(len(rf), len(ef))
+    rf = np.asarray(ref, dtype=np.float64)
+    ef = np.asarray(result, dtype=np.float64)
+    if rf.shape != ef.shape:
+        raise ValueError(f"Comparison shape mismatch: ref={rf.shape}, result={ef.shape}")
+    if not np.all(np.isfinite(rf)) or not np.all(np.isfinite(ef)):
+        raise ValueError("Cannot compare non-finite reference or computed values")
+    rf, ef = rf.flatten(), ef.flatten()
+    n = len(rf)
     if n == 0:
         return {
             "cos_sim": 1.0,
@@ -203,17 +209,13 @@ def _layer_compare_metrics(
             "ref_max_abs": 0.0,
             "rel_max_abs_error": 0.0,
         }
-    rf, ef = rf[:n], ef[:n]
     diff = ef - rf
     ref_norm = float(np.linalg.norm(rf))
     err_norm = float(np.linalg.norm(diff))
     ref_max_abs = float(np.max(np.abs(rf)))
     max_abs = float(np.max(np.abs(diff)))
     return {
-        "cos_sim": _cos_sim(
-            rf.astype(np.float32, copy=False),
-            ef.astype(np.float32, copy=False),
-        ),
+        "cos_sim": _cos_sim(rf, ef),
         "max_abs_error": max_abs,
         "mean_abs_error": float(np.mean(np.abs(diff))),
         "rmse": float(np.sqrt(np.mean(diff * diff))),
@@ -221,6 +223,7 @@ def _layer_compare_metrics(
         "ref_max_abs": ref_max_abs,
         "rel_max_abs_error": float(max_abs / (ref_max_abs + eps)),
     }
+
 
 
 def _aggregate_kernel_metrics(kernel_metrics: list) -> Dict:
@@ -396,6 +399,9 @@ def run_validate(
     """
     if validate_inputs not in ("chained", "oracle"):
         raise ValueError("validate_inputs must be 'chained' or 'oracle'")
+    placeholders = [node for node in gm.graph.nodes if node.op == "placeholder"]
+    if len(placeholders) != 1:
+        raise ValueError("Forward kernel validation requires exactly one input placeholder")
     t0 = time.time()
     os.makedirs(out_dir, exist_ok=True)
     bundle_ops = kernel_bundle_ops or DEFAULT_KERNEL_BUNDLE_OPS
@@ -765,6 +771,9 @@ def run_validate(
             "kernel_metrics": kernel_metrics,
             "stats": stats,
             "elapsed_s": elapsed,
+            "end_to_end": end_to_end,
+            "strict_pass": out["strict_pass"],
+            "strict_fail_reasons": strict_fail_reasons,
         }
         Path(metrics_json_path).write_text(json.dumps(blob, indent=2) + "\n")
         if verbose:
@@ -784,6 +793,8 @@ def run_validate(
 
 def _resolve_transpose(ndim: int, args) -> tuple:
     """Convert transpose method args (dim0, dim1) to numpy axes tuple."""
+    if ndim == 0:
+        return ()  # A scalar transpose has no axes to permute.
     if len(args) >= 2:
         d0, d1 = int(args[0]), int(args[1])
         if d0 < 0:
@@ -794,6 +805,7 @@ def _resolve_transpose(ndim: int, args) -> tuple:
         axes[d0], axes[d1] = axes[d1], axes[d0]
         return tuple(axes)
     return tuple(range(ndim))
+
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────

@@ -234,3 +234,13 @@ result = execute_depthwise(op, {
 }, 'out/depthwise')
 assert np.frombuffer(result.buffers['output'], dtype='<i4')[0] == 24
 ```
+
+
+## Kernel and training branch boundaries
+
+`atalla-linalg-kernels` is based on `main` and contains standalone kernels and
+forward graph integration. Its runner accepts one input and has no backprop
+capture, training targets/gradient reporting, or `--training` CLI. Peter's
+training integration and tests are preserved on `atalla-linalg-with-training`.
+Reduction, loss and gradient C kernels remain available as standalone numerical
+primitives; keeping those kernels does not enable a training graph pipeline.
