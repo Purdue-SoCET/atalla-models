@@ -1502,6 +1502,7 @@ def compile_c(c_source: str, work_dir: str, tag: str) -> str:
     env = {**os.environ, "PYTHONPATH": str(_COMPILER)}
     result = subprocess.run(
         [sys.executable, "-m", "ppci", "atalla_cc", "-m", "atalla",
+         "-I", str(Path(__file__).resolve().parents[1] / "kernels"),
          "-S", c_path, "-o", s_path],
         capture_output=True, text=True, env=env,
     )

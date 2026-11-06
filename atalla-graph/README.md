@@ -176,3 +176,61 @@ The older Horner/tanh sources remain available for standalone experiments.
 GELU reporting `emulator` does not mean every graph operation is compiled. The
 validated flash ViT still has one explicit NumPy broadcast add. Simulator packets
 and static spill counts are not hardware-cycle or end-to-end speedup measurements.
+
+
+## Standalone depthwise convolution
+
+`DepthwiseOp` and `execute_depthwise` run dedicated ordinary-C kernels for these
+non-quantized named subsets. Each name has its own entry point and layout-specific loops. Identical byte
+access, BF16 rounding and scalar multiply/add helpers live in
+`kernels/depthwise_common.h`; Python shares validation, allocation and runtime
+configuration. The compilation wrapper supplies the kernel include directory.
+For manual compilation, pass `-I atalla-graph/kernels`; moving a C source also
+requires the shared header.
+
+| Spatial rank | Channel-first | Channel-last | Explicit multiplier |
+|---|---|---|---|
+| 1D | `depthwise_conv_1d_ncw_cw` | `depthwise_conv_1d_nwc_wc` | `depthwise_conv_1d_nwc_wcm` |
+| 2D | `depthwise_conv_2d_nchw_chw` | `depthwise_conv_2d_nhwc_hwc` | `depthwise_conv_2d_nhwc_hwcm` |
+| 3D | `depthwise_conv_3d_ncdhw_cdhw` | `depthwise_conv_3d_ndhwc_dhwc` | `depthwise_conv_3d_ndhwc_dhwcm` |
+
+Input, filter and initialized output must have matching BF16 or i32 storage.
+BF16 rounds each product and each addition separately; i32 arithmetic wraps
+modulo32. Spatial steps and dilations are runtime metadata. Output windows must
+fit the input; there is no implicit padding. Empty reductions preserve initial
+output bits, and empty outputs write nothing. TensorViews support byte strides,
+negative input/filter strides and nonoverlapping strided output. The C kernel
+snapshots either operand when it aliases output, before any writes.
+
+The basic BF16 vector paths span contiguous channels, multiplier lanes, or output
+width for channel-first width step one. Other strides/alignment and i32 use scalar
+C arithmetic. This boundary never substitutes a NumPy/PyTorch numerical result.
+It does not implement FX/textual-MLIR dispatch, quantized zero points, mixed dtype
+casts or other arithmetic dtypes. Compiler spills remain; no hardware-cycle
+performance claim is made.
+
+The pinned 3D multiplier YAML has a five-axis output shape map but a six-axis
+static indexing map. This standalone contract follows the explicit indexing map:
+output is `N,D,H,W,C,M`. This is a documented numerical subset, not a claim that
+the inconsistent pinned declaration has been integrated into a textual compiler.
+
+```python
+import numpy as np
+from graph.layout import TensorView
+from graph.depthwise import DepthwiseOp
+from depthwise_runtime import execute_depthwise
+
+x = np.array([[[2], [3]]], dtype='<i4')
+w = np.array([[4], [5]], dtype='<i4')
+y = np.array([[[1]]], dtype='<i4')
+op = DepthwiseOp(
+    'linalg.depthwise_conv_1d_nwc_wc',
+    TensorView('input', x.shape, 'i32'),
+    TensorView('filter', w.shape, 'i32'),
+    TensorView('output', y.shape, 'i32'),
+)
+result = execute_depthwise(op, {
+    'input': x.tobytes(), 'filter': w.tobytes(), 'output': y.tobytes(),
+}, 'out/depthwise')
+assert np.frombuffer(result.buffers['output'], dtype='<i4')[0] == 24
+```
