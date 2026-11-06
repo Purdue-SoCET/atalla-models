@@ -561,21 +561,6 @@ def run_validate(
             raw = result.reshape(cp["Ho"], cp["Wo"], cp["C"])
             result = raw.transpose(2, 0, 1).reshape(cp["final_shape"])
 
-        if emission.maxpool_post is not None:
-            pp = emission.maxpool_post
-            raw = result.reshape(pp["C"], pp["H_out"], pp["W"])
-            out = np.empty((pp["C"], pp["H_out"], pp["W_out"]), dtype=np.float32)
-            for c in range(pp["C"]):
-                for oh in range(pp["H_out"]):
-                    for ow in range(pp["W_out"]):
-                        base = ow * pp["stride"]
-                        out[c, oh, ow] = max(
-                            float(raw[c, oh, base + p])
-                            for p in range(pp["pool"])
-                            if base + p < pp["W"]
-                        )
-            result = out.reshape(pp["final_shape"])
-
         activation_cache[node.name] = result
         stats["emulated"] += 1
 

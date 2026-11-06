@@ -83,7 +83,8 @@ comparison correction required by reverse-axis loops.
 ## Standalone pooling family
 
 `PoolingOp` and `execute_pooling` provide a standalone compiled kernel boundary.
-They do not add FX or textual-MLIR dispatch. Each of the 17 pooling names in the
+Graph `MaxPool2d` uses the NCHW max kernel through this boundary; the other
+names remain standalone, and textual-MLIR dispatch is not implemented. Each of the 17 pooling names in the
 pinned Linalg inventory has its own ordinary C source, such as
 `kernels/pooling_nhwc_min.c`. The supported layouts are: NCW/NWC 1D,
 NCHW/NHWC 2D, and NDHWC 3D min/max/sum where those named variants exist, plus
@@ -139,6 +140,17 @@ input/output share an allocation name, C snapshots the input allocation before
 writing output. Unaddressed bytes are preserved. The returned buffers contain
 actual simulator values and may feed another kernel invocation.
 
-This is a correctness-first **scalar** kernel. Float extrema use exact storage-bit
-ordering; BF16 sums use existing scalar arithmetic and explicit storage rounding.
-It makes no vectorization, zero-spill, DMA-overlap or hardware-cycle claim.
+BF16 has guarded vector paths: channel-last lanes span channels, while NCW/NCHW
+lanes span width for steps one and two. Width step two uses a 64-byte C staging
+buffer to gather even result lanes. Scalars handle configuration, staging,
+canonical NaNs and signed-zero repair; other supported dtypes/layouts retain the
+scalar path. Compiler spills remain, and simulator packet counts are not hardware
+cycle measurements.
+
+Graph `MaxPool2d` emits the complete output through `pooling_nchw_max.c`, including
+widths above 32. Its planner preserves batches, CHW/NCHW, rectangular kernels and
+strides, padding, dilation and ceil mode. Input packing materializes negative
+infinity padding, including any trailing ceil window. The runner performs no
+horizontal pooling reduction, and wide tensors do not take a NumPy pooling route.
+Both module and functional index-returning pooling fail explicitly: this kernel
+returns values only.

@@ -207,38 +207,52 @@ def _plan_upsample(node: Node) -> TileConfig:
     return TileConfig(kernel_type="upsample", params=dict(channels=C, H_in=H, W_in=W))
 
 
+def _pool_pair(value):
+    if isinstance(value, (tuple, list)):
+        if len(value) != 2:
+            raise ValueError("MaxPool2d parameters must have two spatial dimensions")
+        return tuple(int(v) for v in value)
+    return (int(value), int(value))
+
+
 def _plan_maxpool(node: Node, gm: GraphModule) -> TileConfig:
     mod = _get_module(gm, node.target) if node.op == "call_module" else None
     input_shape = get_node_shape(node.args[0])
+    if input_shape is None or len(input_shape) not in (3, 4):
+        raise NotImplementedError("MaxPool2d requires CHW or NCHW input metadata")
+    N, C, H, W = (1, *input_shape) if len(input_shape) == 3 else input_shape
 
-    if mod is not None and isinstance(mod, nn.MaxPool2d):
-        pool = mod.kernel_size if isinstance(mod.kernel_size, int) else mod.kernel_size[0]
-        stride = mod.stride if isinstance(mod.stride, int) else mod.stride[0]
+    def argument(index, name, default):
+        return node.args[index] if len(node.args) > index else node.kwargs.get(name, default)
+
+    if isinstance(mod, nn.MaxPool2d):
+        kernel, stride = mod.kernel_size, mod.stride
+        padding, dilation = mod.padding, mod.dilation
+        ceil_mode, return_indices = mod.ceil_mode, mod.return_indices
     else:
-        pool = node.args[1] if len(node.args) > 1 else node.kwargs.get("kernel_size", 3)
-        stride = node.args[2] if len(node.args) > 2 else node.kwargs.get("stride", pool)
-        if isinstance(pool, (tuple, list)):
-            pool = pool[0]
-        if isinstance(stride, (tuple, list)):
-            stride = stride[0]
-
-    C = input_shape[1] if input_shape and len(input_shape) == 4 else 1
-    H = input_shape[2] if input_shape and len(input_shape) == 4 else 1
-    W = input_shape[3] if input_shape and len(input_shape) == 4 else 1
-
-    H_out = (H - pool) // stride + 1
-    W_out = (W - pool) // stride + 1
-    use_numpy = (W > VL)
-
-    return TileConfig(
-        kernel_type="maxpool",
-        params=dict(
-            H=H, W=W, channels=C,
-            pool=pool, stride=stride,
-            H_out=H_out, W_out=W_out,
-            use_numpy=use_numpy,
-        ),
-    )
+        kernel = argument(1, "kernel_size", 3)
+        stride = argument(2, "stride", None)
+        padding = argument(3, "padding", 0)
+        dilation = argument(4, "dilation", 1)
+        ceil_mode = argument(5, "ceil_mode", False)
+        return_indices = argument(6, "return_indices", False)
+    if return_indices or node.target is torch.nn.functional.max_pool2d_with_indices:
+        raise NotImplementedError("MaxPool2d return_indices is not supported by the values-only kernel")
+    kernel = _pool_pair(kernel)
+    stride = _pool_pair(kernel if stride is None else stride)
+    padding, dilation = _pool_pair(padding), _pool_pair(dilation)
+    output = []
+    for size, k, step, pad, dil in zip((H, W), kernel, stride, padding, dilation):
+        numerator = size + 2 * pad - dil * (k - 1) - 1
+        extent = (numerator + (step - 1 if ceil_mode else 0)) // step + 1
+        if ceil_mode and (extent - 1) * step >= size + pad:
+            extent -= 1
+        output.append(extent)
+    return TileConfig(kernel_type="maxpool", params=dict(
+        batch=N, channels=C, H=H, W=W, pool=kernel, stride=stride,
+        padding=padding, dilation=dilation, ceil_mode=bool(ceil_mode),
+        H_out=output[0], W_out=output[1], use_numpy=False,
+    ))
 
 
 def _softmax_axis(node: Node, gm: GraphModule) -> int:
