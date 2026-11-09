@@ -1,10 +1,10 @@
 """Unified pipeline: PyTorch model -> Atalla schedule + emulator validation.
 
-Uses Vihaan's graph front-end (lower_linear_modules, allocate_memory) with
-our kernel back-end (c_emitter, build_compiler, functional_sim).
+Uses the graph front-end (lower_linear_modules, tile planning) with the shared
+kernel back-end (c_emitter, build_compiler, functional_sim).
 
 Modes:
-    schedule  — emit graph_schedule.c (Vihaan's generate_schedule)
+    schedule  — emit a forward AtallaC program using validation's kernels
     validate  — per-node compile + emulate + compare vs PyTorch
     both      — do both
 
@@ -58,11 +58,10 @@ from src.components.scpad import Scratchpad
 
 from graph.lower_modules import lower_linear_modules
 from graph.backward import capture_backward
-from graph.memoryallocator import allocate_memory
 from graph.fx_capture import normalize_ops, get_node_shape
 from graph.tile_planner import plan_tiles
 from model.atalla_ops import AtallaSdpa
-from scripts.generate_schedule import emit as emit_schedule
+from scripts.generate_schedule import write as write_schedule
 from codegen.c_emitter import (
     emit_node, render_in_file, compile_and_assemble, LayerEmission, _to_bf16_array,
 )
@@ -330,38 +329,133 @@ def build_graph(model: nn.Module, example_input: torch.Tensor,
 # ── Schedule mode ────────────────────────────────────────────────────────────
 
 def run_schedule(gm, example_input: torch.Tensor, out_dir: str,
-                 verbose: bool = True) -> str:
-    """Emit graph_schedule.c using Vihaan's generate_schedule."""
+                 verbose: bool = True, *, verify: bool = False) -> str:
+    """Emit connected validation kernels, their DRAM image, and an I/O manifest."""
     if gm.meta.get("include_backward"):
         raise NotImplementedError(
             "Backward graphs can be inspected and run in PyTorch, but schedule "
             "emission needs target inputs, backward kernels, and mixed-dtype memory support."
         )
-    os.makedirs(out_dir, exist_ok=True)
-    placeholder_data = {"x": example_input.bfloat16().clone()}
-    gm_alloc = allocate_memory(gm, f"{out_dir}/dram.bin", placeholder_data)
-
-    c_code = emit_schedule(gm_alloc)
+    placeholders = [node for node in gm.graph.nodes if node.op == "placeholder"]
+    if len(placeholders) != 1:
+        raise ValueError("Forward schedule requires exactly one input placeholder")
+    placeholder_data = {placeholders[0].target: example_input.bfloat16().clone()}
+    schedule = write_schedule(gm, out_dir, placeholder_data)
+    c_code = schedule.source
     out_path = f"{out_dir}/graph_schedule.c"
-    Path(out_path).write_text(c_code)
-
-    kernel_calls = [l.strip() for l in c_code.splitlines() if "_kernel(" in l]
     if verbose:
         print(f"\nSchedule: {len(c_code.splitlines())} lines, "
-              f"{len(kernel_calls)} kernel calls -> {out_path}")
-        for k in kernel_calls[:8]:
-            print(f"  {k[:100]}")
-        if len(kernel_calls) > 8:
-            print(f"  ... ({len(kernel_calls) - 8} more)")
-        n_mm = c_code.count("matmul_kernel(")
-        if n_mm == 0:
-            print(
-                "  Note: F.linear in recent PyTorch FX traces is lowered in "
-                "``lower_linear_modules`` to matmul+add so matmul_kernel appears. "
-                "``layer_norm``, ``gelu``, and fused ``AtallaSdpa`` are not yet "
-                "emitted in graph_schedule.c (TBD; schedule is partial vs validate)."
-            )
+              f"{len(schedule.manifest['kernels'])} validation kernels -> {out_path}")
+        for index, kernel in enumerate(schedule.manifest["kernels"], 1):
+            output = kernel["output"]
+            print(f"  {index:2}. {kernel['node']}: {kernel['operation']} -> "
+                  f"{kernel['function']}() "
+                  f"[kernels/{kernel['source']}, output={tuple(output['shape'])} "
+                  f"at 0x{output['address']:X}]")
+        print(f"  Memory image: {out_dir}/dram.bin; I/O addresses: {out_dir}/schedule.json")
+    if verify:
+        report = verify_schedule(schedule, gm, example_input, out_dir, verbose=verbose)
+        if not report["passed"]:
+            raise RuntimeError(f"Schedule verification failed; see {out_dir}/schedule_verify.json")
     return c_code
+
+
+def verify_schedule(schedule, gm, example_input: torch.Tensor, out_dir: str,
+                    verbose: bool = True) -> Dict:
+    """Compile and run the whole program once, then compare retained buffers.
+
+    Reference tensors are computed separately and never injected into simulator
+    memory. All copies, kernel calls, and intermediate values run on the simulator.
+    """
+    if verbose:
+        print("\nCompile schedule: AtallaC -> PPCI assembly -> scheduled .in", flush=True)
+    emission = schedule.emission()
+    compile_and_assemble(emission, out_dir, "graph_schedule")
+    in_path = Path(out_dir) / "graph_schedule.in"
+    in_path.write_text(render_in_file(emission))
+    if verbose:
+        print("Run complete schedule in functional simulator...", flush=True)
+    start = time.time()
+    memory, _ = _run_emulator(str(in_path), out_dir, "graph_schedule")
+    simulation_seconds = time.time() - start
+
+    references = {}
+
+    class ReferenceInterpreter(torch.fx.Interpreter):
+        def run_node(self, node):
+            result = super().run_node(node)
+            if isinstance(result, torch.Tensor):
+                references[node.name] = result.detach().float().cpu().numpy().copy()
+            return result
+
+    with torch.no_grad():
+        ReferenceInterpreter(gm).run(example_input.bfloat16())
+
+    thresholds = {"cos_min": 0.999, "rel_l2_max": 0.02, "relmax_max": 0.05}
+    comparisons = {}
+    arrays = {}
+
+    def compare(descriptor):
+        name = descriptor["node"]
+        if name in comparisons:
+            return comparisons[name]
+        shape = tuple(descriptor["shape"])
+        result = _read_bf16(memory, descriptor["address"], int(np.prod(shape))).reshape(shape)
+        reference = references[name]
+        arrays[f"result_{name}"] = result
+        arrays[f"reference_{name}"] = reference
+        try:
+            metrics = _layer_compare_metrics(reference, result)
+            passed = (metrics["cos_sim"] >= thresholds["cos_min"]
+                      and metrics["rel_l2_error"] <= thresholds["rel_l2_max"]
+                      and metrics["rel_max_abs_error"] <= thresholds["relmax_max"])
+            comparison = {"passed": passed, **metrics}
+        except ValueError as error:
+            comparison = {"passed": False, "error": str(error)}
+        comparisons[name] = comparison
+        return comparison
+
+    if verbose:
+        print("\n--- Schedule verification vs traced BF16 PyTorch graph ---")
+    for kernel in schedule.manifest["kernels"]:
+        metrics = compare(kernel["output"])
+        if verbose:
+            if "error" in metrics:
+                print(f"  {kernel['node']}: FAIL ({metrics['error']})")
+            else:
+                print(f"  {kernel['node']} ({kernel['operation']}): "
+                      f"{'PASS' if metrics['passed'] else 'FAIL'} "
+                      f"cos={metrics['cos_sim']:.6f}, "
+                      f"max_abs={metrics['max_abs_error']:.6g}, "
+                      f"rmse={metrics['rmse']:.6g}, "
+                      f"rel_l2={metrics['rel_l2_error']:.6g}, "
+                      f"relmax={metrics['rel_max_abs_error']:.6g}")
+
+    def compare_outputs(value):
+        if isinstance(value, dict):
+            if "node" in value and "address" in value:
+                metrics = compare(value)
+                if verbose:
+                    print(f"  Graph output {value['node']}, shape={tuple(value['shape'])}: "
+                          f"{'PASS' if metrics['passed'] else 'FAIL'}")
+            else:
+                for child in value.values():
+                    compare_outputs(child)
+        elif isinstance(value, list):
+            for child in value:
+                compare_outputs(child)
+
+    compare_outputs(schedule.manifest["outputs"])
+    report = {"passed": bool(comparisons) and all(c["passed"] for c in comparisons.values()),
+              "thresholds": thresholds, "comparisons": comparisons,
+              "outputs": schedule.manifest["outputs"], "simulation_seconds": simulation_seconds}
+    (Path(out_dir) / "schedule_verify.json").write_text(json.dumps(report, indent=2) + "\n")
+    np.savez(Path(out_dir) / "schedule_outputs.npz", **arrays)
+    if verbose:
+        print(f"  Overall: {'PASS' if report['passed'] else 'FAIL'} "
+              "(cos>=0.999, rel_l2<=0.02, relmax<=0.05)")
+        print(f"  Metrics: {out_dir}/schedule_verify.json; tensors: {out_dir}/schedule_outputs.npz")
+    return report
 
 
 # ── Validate mode ────────────────────────────────────────────────────────────
@@ -921,6 +1015,11 @@ def main():
     parser.add_argument("--scale", type=float, default=0.01)
     parser.add_argument("--out-dir", default="out/graph")
     parser.add_argument(
+        "--verify-schedule", action="store_true",
+        help="In schedule/both mode, compile and simulate the complete forward schedule, "
+             "then compare kernel and final outputs with the traced BF16 PyTorch graph.",
+    )
+    parser.add_argument(
         "--export-kernel-bundle",
         metavar="DIR",
         default=None,
@@ -978,6 +1077,8 @@ def main():
         help="During training validation, print metrics for every parameter gradient instead of only the worst.",
     )
     args = parser.parse_args()
+    if args.verify_schedule and args.mode == "validate":
+        parser.error("--verify-schedule requires --mode schedule or --mode both")
 
     torch.manual_seed(42)
     np.random.seed(42)
@@ -1016,7 +1117,8 @@ def main():
     if args.mode in ("schedule", "both"):
         import copy
         gm_sched = copy.deepcopy(gm)
-        run_schedule(gm_sched, example_input, args.out_dir, verbose=verbose)
+        run_schedule(gm_sched, example_input, args.out_dir, verbose=verbose,
+                     verify=args.verify_schedule)
 
 
 if __name__ == "__main__":

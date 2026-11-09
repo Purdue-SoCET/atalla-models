@@ -65,7 +65,7 @@ instruction section ──── + ────── data section
 atalla-models/
     atalla-graph/
         graph/                 fx_capture.py, tile_planner.py (+ upstream export/lower/allocator)
-        codegen/               c_emitter.py, dram_builder.py
+        codegen/               c_emitter.py, kernel_schedule.py, dram_builder.py
         kernels/               AtallaC generators: gemm, relu, softmax, maxpool, add
         model/                 basic.py, alexnet.py, alexnet_small.py
         scripts/               generate_schedule.py
@@ -87,10 +87,30 @@ python run_graph.py --model alexnet_small --mode validate --scale 0.01
 
 python run_graph.py --model basic --mode schedule --out-dir out/graph
 
+# Compile the complete forward schedule, simulate it, and compare with PyTorch.
+python run_graph.py --model basic --mode schedule --out-dir out/schedule --verify-schedule
+
 python run_graph.py --model alexnet_small --mode validate --metrics-json metrics_alexnet.json
 ```
 
 Models: `basic`, `alexnet_small`
+
+Schedule mode prints every kernel call in graph order, including its source,
+output shape, and output address. It uses validation's GEMM, add, multiply, and
+ReLU kernels in one AtallaC program; unsupported operations fail explicitly.
+Reshapes and transposes are handled by the schedule. Backward schedules are not
+implemented yet.
+
+`--verify-schedule` compiles `graph_schedule.c` to `graph_schedule.s`, assembles
+`graph_schedule.in`, and runs the whole program once in the functional simulator.
+It compares every kernel output and the graph outputs against the traced BF16
+PyTorch graph, with no reference intermediates injected into execution. It writes
+`schedule_verify.json` (errors and pass/fail) and `schedule_outputs.npz` (result and
+reference tensors). Verification requires cosine >= 0.999, relative L2 <= 0.02,
+and relative maximum error <= 0.05; a failure exits with a nonzero status.
+The input/output addresses are in `schedule.json`, and `dram.bin` contains initial
+data and zero-initialized intermediate buffers. Generation alone does not compile
+or simulate the schedule.
 
 ## Validation snapshot (representative)
 

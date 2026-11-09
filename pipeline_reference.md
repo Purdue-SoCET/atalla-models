@@ -111,7 +111,7 @@ All use first-class intrinsics. Only `lw_s`, `li_s`, `halt` remain as inline asm
 CLI: `--model {basic,alexnet_small}`, `--mode {validate,schedule,both}` (default `both`), `--out-dir` (default `out/graph`, **gitignored**), `--scale`, `--export-kernel-bundle`, `--quiet`.
 
 - **`validate`:** compile → `build_compiler` → `.in` → emulator vs FX reference (cosine / max diff per node).
-- **`schedule`:** Vihaan's `generate_schedule` path (C-focused export).
+- **`schedule`:** `generate_schedule` uses `codegen/kernel_schedule.py` to compose validation's GEMM/add/mul/ReLU sources into one forward AtallaC program, with shared DRAM and layout copies. `--verify-schedule` compiles and simulates it, then compares retained kernel and graph outputs against the traced BF16 PyTorch graph. See `atalla-graph/README.md` for coverage and artifacts.
 - **`both`:** runs validate then schedule.
 
 ---
