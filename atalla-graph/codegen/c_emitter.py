@@ -96,6 +96,7 @@ import build_compiler as _bc
 
 from graph.tile_planner import TileConfig
 from graph.fx_capture import get_node_shape
+from graph.sparsity_2_4 import pack_2_4
 
 
 def _to_bf16_array(tensor: torch.Tensor) -> np.ndarray:
@@ -141,10 +142,11 @@ class LayerEmission:
     __slots__ = ("c_source", "instr_text", "dram", "output_addr", "output_shape",
                  "output_elements", "skip_emulator", "numpy_result", "maxpool_post",
                  "conv_post", "sched_packets", "sched_slots_filled", "sched_slot_efficiency",
-                 "sched_slot_histogram", "layer_metrics")
+                 "sched_slot_histogram", "layer_metrics", "export_only")
 
     def __init__(self):
         self.c_source: str = ""
+        self.export_only: bool = False
         self.instr_text: str = ""
         self.dram: DRAMWriter = DRAMWriter()
         self.output_addr: int = 0
@@ -183,8 +185,14 @@ def _padded_gemm_a(A: np.ndarray, K: int) -> np.ndarray:
     return buf
 
 
+# Prototype software configuration field following the existing offset-40 field.
+# A future sparse loading kernel must explicitly consume this field.
+SPARSE24_META_ADDR_OFFSET = 44
+
+
 def _write_gemm_params(img: DRAMWriter, A_GMEM: int, W_GMEM: int, C_GMEM: int,
-                       M: int, N: int, K: int, Z_GMEM: int):
+                       M: int, N: int, K: int, Z_GMEM: int, *,
+                       W_META_GMEM: Optional[int] = None):
     M_tiles = math.ceil(M / TILE)
     N_tiles = math.ceil(N / TILE)
     K_tiles = math.ceil(K / TILE)
@@ -200,6 +208,8 @@ def _write_gemm_params(img: DRAMWriter, A_GMEM: int, W_GMEM: int, C_GMEM: int,
     img.u32(ADDR_TABLE + 32, K_tiles)
     img.u32(ADDR_TABLE + 36, TILE)
     img.u32(ADDR_TABLE + 40, Z_GMEM)
+    if W_META_GMEM is not None:
+        img.u32(ADDR_TABLE + SPARSE24_META_ADDR_OFFSET, W_META_GMEM)
 
 
 def _write_matrix(img: DRAMWriter, base_addr: int, mat: np.ndarray, rows: int, cols: int):
@@ -222,6 +232,22 @@ def _write_gemm_rhs_weight(img: DRAMWriter, base_addr: int, w_kn: np.ndarray) ->
     buf = np.zeros((n, ks), dtype=np.float32)
     buf[:, :k] = w.T
     _write_matrix(img, base_addr, buf, n, ks)
+
+
+def _pack_sparse24_rhs_tile(w_kn: np.ndarray) -> Tuple[bytes, bytes]:
+    """Serialize one already-masked logical B[K,N] tile using the prototype format.
+
+    The packer validates a full 32x32 tile and exactly two nonzeros per K group.
+    Values are little-endian BF16 words, in column/group/retained-position order.
+    Metadata remains one byte per group; this helper never prunes or pads.
+    """
+    tile = torch.as_tensor(w_kn, dtype=torch.bfloat16)
+    values, metadata = pack_2_4(tile)
+    value_bytes = b"".join(
+        (word & 0xFFFF).to_bytes(2, "little")
+        for word in values.view(torch.int16).tolist()
+    )
+    return value_bytes, metadata
 
 
 def _write_zeros(img: DRAMWriter, base_addr: int, count: int):
@@ -357,9 +383,17 @@ def emit_conv(node: Node, gm: GraphModule,
 
 
 def emit_linear(node: Node, gm: GraphModule,
-                input_data: np.ndarray, tc: TileConfig) -> LayerEmission:
+                input_data: np.ndarray, tc: TileConfig, *,
+                sparse24: bool = False) -> LayerEmission:
+    """Emit dense execution, or an opt-in data-only sparse weight prototype.
+
+    sparse24 accepts exactly one 32x32 logical weight tile, already 2:4 masked.
+    Its image is export-only until the array's metadata loading contract exists.
+    """
     p = tc.params
     M, N, K = p["M"], p["N"], p["K"]
+    if sparse24 and (K, N) != (TILE, TILE):
+        raise ValueError("Sparse 2:4 export currently supports one 32x32 weight tile")
 
     mod = _get_module(gm, node.target) if node.op == "call_module" else None
     if mod is not None:
@@ -376,26 +410,51 @@ def emit_linear(node: Node, gm: GraphModule,
     ks = _gemm_k_stride(K)
     A_dram = _padded_gemm_a(A, K)
 
+    # Pack before allocating so addresses follow the actual buffer sizes.
+    if sparse24:
+        value_bytes, metadata = _pack_sparse24_rhs_tile(W_mat)
+
     A_GMEM = 0x1000
     W_GMEM = A_GMEM + _align_data(M * ks * 2)
-    C_GMEM = W_GMEM + _align_data(N * ks * 2)
+    W_META_GMEM = None
+    if sparse24:
+        W_META_GMEM = W_GMEM + _align_data(len(value_bytes))
+        C_GMEM = W_META_GMEM + _align_data(len(metadata))
+    else:
+        C_GMEM = W_GMEM + _align_data(N * ks * 2)
     Z_GMEM = C_GMEM + M * N * 2
 
     img = DRAMWriter()
-    _write_gemm_params(img, A_GMEM, W_GMEM, C_GMEM, M, N, K, Z_GMEM)
+    _write_gemm_params(
+        img, A_GMEM, W_GMEM, C_GMEM, M, N, K, Z_GMEM,
+        W_META_GMEM=W_META_GMEM,
+    )
     _write_matrix(img, A_GMEM, A_dram, M, ks)
-    _write_gemm_rhs_weight(img, W_GMEM, W_mat)
+    if sparse24:
+        img.write_bytes(W_GMEM, value_bytes)
+        img.write_bytes(W_META_GMEM, metadata)
+    else:
+        _write_gemm_rhs_weight(img, W_GMEM, W_mat)
     _write_zeros(img, C_GMEM, M * N)
     _write_zeros(img, Z_GMEM, TILE)
 
     out_shape = get_node_shape(node)
     em = LayerEmission()
-    em.c_source = _gemm_c(M, N, K)
+    em.export_only = sparse24
+    em.c_source = "" if sparse24 else _gemm_c(M, N, K)
     em.dram = img
     em.output_addr = C_GMEM
     em.output_shape = out_shape if out_shape else (M, N)
     em.output_elements = M * N
     em.layer_metrics = _gemm_map_metrics(M, N, K, kind="gemm")
+    if sparse24:
+        em.layer_metrics.update({
+            "weight_format": "sparse24_prototype_v1",
+            "export_only": True,
+            "bytes_est_weight": len(value_bytes) + len(metadata),
+            "bytes_est_weight_values": len(value_bytes),
+            "bytes_est_weight_metadata": len(metadata),
+        })
     if isinstance(node.args[0], Node):
         pr = node.args[0]
         in_plan = pr.meta.get("dram_addr", "?")
@@ -1091,12 +1150,16 @@ def emit_gelu(node: Node, input_data: np.ndarray, tc: TileConfig) -> LayerEmissi
 
 
 def emit_node(node: Node, gm: GraphModule,
-              activation_cache: Dict[str, np.ndarray]) -> Optional[LayerEmission]:
+              activation_cache: Dict[str, np.ndarray], *,
+              sparse24: bool = False) -> Optional[LayerEmission]:
+    """Emit a node; sparse24 explicitly opts a linear node into data-only export."""
     tc = node.meta.get("tile_config")
     if tc is None:
         return None
 
     atalla_op = node.meta.get("atalla_op")
+    if sparse24 and atalla_op != "linear":
+        raise NotImplementedError("Sparse 2:4 export currently supports linear nodes only")
 
     input_data = None
     if node.args:
@@ -1110,7 +1173,7 @@ def emit_node(node: Node, gm: GraphModule,
     if atalla_op == "conv":
         return emit_conv(node, gm, input_data, tc)
     elif atalla_op == "linear":
-        return emit_linear(node, gm, input_data, tc)
+        return emit_linear(node, gm, input_data, tc, sparse24=sparse24)
     elif atalla_op == "relu":
         return emit_relu(node, input_data, tc)
     elif atalla_op == "softmax":
@@ -1185,6 +1248,10 @@ def compile_and_assemble(emission: LayerEmission, work_dir: str,
     (latency + VLIW port/hazard rules), and encoding into the ``.in`` instruction
     image — not packetization inside ``functional_sim.run``.
     """
+    if emission.export_only:
+        raise NotImplementedError(
+            "Sparse 2:4 images are export-only until the sparse weight loader is implemented"
+        )
     if emission.c_source:
         raw_s = compile_c(emission.c_source, work_dir, tag)
         in_content, _ready, packets = _bc.compile_asm(raw_s)
@@ -1203,6 +1270,10 @@ def compile_and_assemble(emission: LayerEmission, work_dir: str,
 
 
 def render_in_file(emission: LayerEmission) -> str:
-    """Render a LayerEmission to a complete .in file string."""
+    """Render an executable emission to a complete .in file string."""
+    if emission.export_only:
+        raise NotImplementedError(
+            "Sparse 2:4 images are data-only; use emission.dram.render_data_mem()"
+        )
     data_text = emission.dram.render_data_mem(include_zeros=True)
     return render_testfile(emission.instr_text, data_text)
