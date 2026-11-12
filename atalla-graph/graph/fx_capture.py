@@ -24,6 +24,7 @@ ATALLA_OPS = {
 }
 
 _OP_MAP: Dict[object, str] = {
+    operator.getitem: "getitem",
     torch.matmul: "matmul",
     torch.mm: "matmul",
     torch.bmm: "matmul",
@@ -34,10 +35,20 @@ _OP_MAP: Dict[object, str] = {
     torch.ops.aten.transpose.int: "transpose",
     torch.ops.aten.view.default: "flatten",
     torch.ops.aten.reshape.default: "flatten",
+    torch.ops.aten._unsafe_view.default: "flatten",
+    torch.ops.aten.unsqueeze.default: "flatten",
+    torch.ops.aten.squeeze.dim: "flatten",
+    torch.ops.aten.permute.default: "permute",
+    torch.ops.aten.expand.default: "expand",
+    torch.ops.aten.detach.default: "detach",
+    torch.ops.aten.clone.default: "contiguous",
     F.relu: "relu",
     torch.relu: "relu",
     torch.ops.aten.relu.default: "relu",
     F.softmax: "softmax",
+    torch.softmax: "softmax",
+    torch.ops.aten.softmax.int: "softmax",
+    torch.ops.aten._softmax.default: "softmax",
     F.max_pool2d: "maxpool",
     F.conv2d: "conv",
     F.linear: "linear",
@@ -54,8 +65,11 @@ _OP_MAP: Dict[object, str] = {
     F.batch_norm: "batchnorm",
     F.layer_norm: "layernorm",
     F.gelu: "gelu",
+    torch.ops.aten.gelu.default: "gelu",
     F.avg_pool2d: "avgpool",
     F.interpolate: "upsample",
+    F.mse_loss: "mse_loss",
+    torch.sum: "sum_dim",
 }
 
 _METHOD_MAP: Dict[str, str] = {
@@ -67,6 +81,15 @@ _METHOD_MAP: Dict[str, str] = {
     "reshape": "flatten",
     "transpose": "transpose",
     "mean": "avgpool",
+    "permute": "permute",
+    "contiguous": "contiguous",
+    "detach": "detach",
+    "float": "cast",
+    "bfloat16": "cast",
+    "to": "cast",
+    "expand": "expand",
+    "unsqueeze": "flatten",
+    "squeeze": "flatten",
 }
 
 _MODULE_MAP: Dict[type, str] = {
@@ -113,6 +136,16 @@ def normalize_ops(gm: GraphModule) -> GraphModule:
         op_name = None
 
         if node.op == "call_function":
+            if node.target == torch.ops.aten.convolution.default and not node.args[6]:
+                # Autograd capture uses the generalized ATen convolution schema.
+                # Canonicalize its non-transposed 2D case to the forward schema
+                # already consumed by the convolution planner/emitter.
+                if len(get_node_shape(node.args[0]) or ()) == 4:
+                    args = node.args
+                    node.target = F.conv2d
+                    node.args = args[:3]
+                    node.kwargs = {"stride": args[3], "padding": args[4],
+                                   "dilation": args[5], "groups": args[8]}
             if node.target == torch.ops.aten.t.default:
                 shape = get_node_shape(node.args[0])
                 if shape is None:

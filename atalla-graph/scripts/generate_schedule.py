@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate a forward schedule using the same AtallaC kernels as validation.
+"""Generate a schedule using the available forward/backward AtallaC kernels.
 
 The result contains kernel implementations and a single main(), rather than
 calls to the placeholder kernels/kernels.c interface. See schedule.json for the
@@ -30,7 +30,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("graph", help="Serialized, normalized GraphModule with tile plans")
     parser.add_argument("--inputs", required=True,
-                        help="torch.save dictionary of BF16 tensors keyed by placeholder name")
+                        help="torch.save dictionary of input/target tensors keyed by placeholder name")
     parser.add_argument("--out-dir", default="out/schedule")
     args = parser.parse_args()
     graph = torch.load(args.graph, weights_only=False)

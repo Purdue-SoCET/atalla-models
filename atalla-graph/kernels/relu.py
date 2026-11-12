@@ -29,6 +29,8 @@ def relu_c(total: int, width: int) -> str:
         f"    vec zero_vec = vector_load(sp, 0, {w_m1}, 0);\n"
         '    zero_vec = vec_op_masked("*", zero_vec, 0.0, all_mask);\n'
         "\n"
+        "    int tile_step;\n"
+        f'    asm("li_s %0, {tile_bytes}" : "=r"(tile_step));\n'
         "    int tile = 0;\n"
         f"    while (tile < {tile_count}) {{\n"
         "        scpad_load(sp, IN_GMEM, sdma_ctl);\n"
@@ -45,8 +47,8 @@ def relu_c(total: int, width: int) -> str:
         "        }\n"
         "\n"
         "        scpad_store(sp, OUT_GMEM, sdma_ctl);\n"
-        f"        IN_GMEM = IN_GMEM + {tile_bytes};\n"
-        f"        OUT_GMEM = OUT_GMEM + {tile_bytes};\n"
+        "        IN_GMEM = IN_GMEM + tile_step;\n"
+        "        OUT_GMEM = OUT_GMEM + tile_step;\n"
         "        tile = tile + 1;\n"
         "    }\n"
         "\n"

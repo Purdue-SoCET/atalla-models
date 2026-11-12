@@ -21,3 +21,4 @@ from .avgpool import avgpool_c
 from .gelu import gelu_c
 from .batchnorm import batchnorm_c
 from .upsample import upsample_c
+from .training import TRAINING_OPS, TRAINING_HELPERS, EXP_HELPER, check_training, training_body

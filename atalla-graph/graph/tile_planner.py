@@ -67,10 +67,10 @@ def _plan_conv(node: Node, gm: GraphModule) -> TileConfig:
         C_in = weight_shape[1] if weight_shape else 1
         R = weight_shape[2] if weight_shape and len(weight_shape) >= 3 else 1
         S = weight_shape[3] if weight_shape and len(weight_shape) >= 4 else 1
-        stride = node.kwargs.get("stride", 1)
+        stride = node.kwargs.get("stride", node.args[3] if len(node.args) > 3 else 1)
         if isinstance(stride, (tuple, list)):
             stride = stride[0]
-        pad = node.kwargs.get("padding", 0)
+        pad = node.kwargs.get("padding", node.args[4] if len(node.args) > 4 else 0)
         if isinstance(pad, (tuple, list)):
             pad = pad[0]
 
@@ -161,13 +161,15 @@ def _plan_threshold_backward(node: Node) -> TileConfig:
 
 def _plan_sum_dim(node: Node) -> TileConfig:
     inp_shape = get_node_shape(node.args[0]) if node.args else None
-    if inp_shape and len(inp_shape) >= 2:
-        rows = int(inp_shape[0])
-        cols = _prod(inp_shape[1:])
-    else:
-        rows = 1
-        cols = _prod(inp_shape) if inp_shape else 32
-    return TileConfig(kernel_type="sum_dim", params=dict(num_rows=rows, num_cols=cols))
+    rank = len(inp_shape) if inp_shape else 0
+    dims = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim")
+    dims = [dims] if isinstance(dims, int) else dims
+    dims = list(range(rank)) if not dims else sorted(d % rank for d in dims)
+    count = len(dims)
+    rows = _prod(inp_shape[:count]) if inp_shape else 1
+    cols = _prod(inp_shape[count:]) if inp_shape else 1
+    return TileConfig(kernel_type="sum_dim", params=dict(num_rows=rows, num_cols=cols,
+                                                         reduced_dims=dims))
 
 
 def _plan_mse_loss(node: Node) -> TileConfig:
@@ -177,7 +179,8 @@ def _plan_mse_loss(node: Node) -> TileConfig:
 
 
 def _plan_mse_loss_backward(node: Node) -> TileConfig:
-    inp_shape = get_node_shape(node.args[0]) if node.args else None
+    pred_index = 1 if len(node.args) >= 3 else 0
+    inp_shape = get_node_shape(node.args[pred_index]) if node.args else None
     total = _prod(inp_shape) if inp_shape else 32
     return TileConfig(kernel_type="mse_loss_backward", params=dict(total_elements=total))
 
@@ -217,6 +220,8 @@ def _plan_maxpool(node: Node, gm: GraphModule) -> TileConfig:
     else:
         pool = node.args[1] if len(node.args) > 1 else node.kwargs.get("kernel_size", 3)
         stride = node.args[2] if len(node.args) > 2 else node.kwargs.get("stride", pool)
+        if stride is None:
+            stride = pool
         if isinstance(pool, (tuple, list)):
             pool = pool[0]
         if isinstance(stride, (tuple, list)):
@@ -459,7 +464,7 @@ def plan_tiles(gm: GraphModule) -> GraphModule:
             tc = _plan_mul(node)
         elif atalla_op == "atalla_sdpa":
             tc = _plan_sdpa(node, gm)
-        elif atalla_op in ("flatten", "dropout", "transpose"):
+        elif atalla_op in ("flatten", "dropout", "transpose", "permute", "contiguous", "detach", "expand"):
             tc = _plan_flatten(node)
         elif atalla_op == "adaptive_avg_pool":
             tc = _plan_adaptive_avg_pool(node)
@@ -479,6 +484,8 @@ def plan_tiles(gm: GraphModule) -> GraphModule:
             tc = _plan_batchnorm(node)
         elif atalla_op == "upsample":
             tc = _plan_upsample(node)
+        elif atalla_op == "avgpool":
+            tc = TileConfig(kernel_type="avgpool", params={})
 
         if tc is not None:
             node.meta["tile_config"] = tc

@@ -60,7 +60,7 @@ class BackwardGraphTests(unittest.TestCase):
         return gm
 
     def test_existing_forward_path(self):
-        model, x = load_model("basic")
+        model, x, _ = load_model("basic")
         gm = build_graph(model, x, verbose=False)
         self.assertFalse(gm.meta.get("include_backward", False))
         reference = lower_linear_modules(symbolic_trace(model))
@@ -69,9 +69,10 @@ class BackwardGraphTests(unittest.TestCase):
 
     def test_residual_and_bias_gradients(self):
         torch.manual_seed(1)
-        model, x = load_model("basic")
+        model, x, _ = load_model("basic")
         gm = self.assert_gradients(model, x, torch.randn(1, 32), F.mse_loss)
-        self.assertIn("aten.threshold_backward.default", gm.meta["pending_kernel_ops"])
+        self.assertTrue(any(n.meta.get("atalla_op") == "aten.threshold_backward.default"
+                            for n in gm.graph.nodes))
         # Existing weights are live graph attributes, not frozen trace constants.
         with torch.no_grad():
             model.output.bias.add_(1)
@@ -95,7 +96,7 @@ class BackwardGraphTests(unittest.TestCase):
     def test_attention_and_normalization(self):
         for name in ("layernorm_smoke", "vit_micro"):
             with self.subTest(model=name):
-                model, x = load_model(name)
+                model, x, _ = load_model(name)
                 self.assert_gradients(model, x, torch.zeros_like(x), F.mse_loss)
 
     def test_frozen_unused_and_buffers(self):
@@ -118,7 +119,7 @@ class BackwardGraphTests(unittest.TestCase):
         torch.testing.assert_close(model.bn.running_mean, torch.zeros_like(model.bn.running_mean))
 
     def test_validation_and_backend_boundaries(self):
-        model, x = load_model("basic")
+        model, x, _ = load_model("basic")
         with self.assertRaisesRegex(ValueError, "example_target and loss_fn"):
             build_graph(model, x, verbose=False, include_backward=True)
         with self.assertRaisesRegex(ValueError, "scalar tensor"):
@@ -129,9 +130,9 @@ class BackwardGraphTests(unittest.TestCase):
                              example_target=x, loss_fn=F.mse_loss)
             prediction, loss, gradients = gm(x.bfloat16(), x)
             self.assertTrue(gradients)
-        with self.assertRaisesRegex(NotImplementedError, "backward kernels"):
+        with self.assertRaisesRegex(ValueError, "requires expected_output"):
             run_schedule(gm, x, "unused")
-        with self.assertRaisesRegex(NotImplementedError, "gradient validation"):
+        with self.assertRaisesRegex(ValueError, "requires expected_output"):
             run_validate(gm, model, x, "unused")
 
 

@@ -111,7 +111,7 @@ All use first-class intrinsics. Only `lw_s`, `li_s`, `halt` remain as inline asm
 CLI: `--model {basic,alexnet_small}`, `--mode {validate,schedule,both}` (default `both`), `--out-dir` (default `out/graph`, **gitignored**), `--scale`, `--export-kernel-bundle`, `--quiet`.
 
 - **`validate`:** compile → `build_compiler` → `.in` → emulator vs FX reference (cosine / max diff per node).
-- **`schedule`:** `generate_schedule` uses `codegen/kernel_schedule.py` to compose validation's GEMM/add/mul/ReLU sources into one forward AtallaC program, with shared DRAM and layout copies. `--verify-schedule` compiles and simulates it, then compares retained kernel and graph outputs against the traced BF16 PyTorch graph. See `atalla-graph/README.md` for coverage and artifacts.
+- **`schedule`:** `generate_schedule` uses `codegen/kernel_schedule.py` and the registry in `codegen/schedule_ops.py` to compose available kernels into one program. Forward coverage includes normalization, softmax, GELU, pooling, upsampling, and attention lowered to GEMM/mul/softmax. Basic MSE training graphs use existing loss/reduction/ReLU-backward kernels and explicit BF16/FP32 conversions. `--check-schedule` lists all unsupported operations/configurations. `--verify-schedule` compiles, simulates, and compares kernel and graph outputs (including loss/gradients) against PyTorch. See `atalla-graph/README.md` for limits and artifacts.
 - **`both`:** runs validate then schedule.
 
 ---
