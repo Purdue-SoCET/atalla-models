@@ -97,6 +97,7 @@ import build_compiler as _bc
 from graph.tile_planner import TileConfig
 from graph.fx_capture import get_node_shape
 from graph.sparsity_2_4 import pack_2_4
+from graph.meissa_transport import to_meissa_transport
 
 
 def _to_bf16_array(tensor: torch.Tensor) -> np.ndarray:
@@ -185,8 +186,8 @@ def _padded_gemm_a(A: np.ndarray, K: int) -> np.ndarray:
     return buf
 
 
-# Prototype software configuration field following the existing offset-40 field.
-# A future sparse loading kernel must explicitly consume this field.
+# Legacy compact-format descriptor field. Combined MEISSA transport images
+# embed metadata beside each weight pair and do not use this optional pointer.
 SPARSE24_META_ADDR_OFFSET = 44
 
 
@@ -385,10 +386,11 @@ def emit_conv(node: Node, gm: GraphModule,
 def emit_linear(node: Node, gm: GraphModule,
                 input_data: np.ndarray, tc: TileConfig, *,
                 sparse24: bool = False) -> LayerEmission:
-    """Emit dense execution, or an opt-in data-only sparse weight prototype.
+    """Emit dense execution, or an opt-in data-only sparse MEISSA image.
 
-    sparse24 accepts exactly one 32x32 logical weight tile, already 2:4 masked.
-    Its image is export-only until the array's metadata loading contract exists.
+    sparse24 accepts one already-masked 32x32 logical weight tile and exports
+    reverse-column, padded 64-bit groups matching sparse_structured_mul_grid.
+    Runtime loading and simulator execution remain separate integration work.
     """
     p = tc.params
     M, N, K = p["M"], p["N"], p["K"]
@@ -410,29 +412,25 @@ def emit_linear(node: Node, gm: GraphModule,
     ks = _gemm_k_stride(K)
     A_dram = _padded_gemm_a(A, K)
 
-    # Pack before allocating so addresses follow the actual buffer sizes.
+    # Logical packing stays independent of the array's physical transport.
     if sparse24:
         value_bytes, metadata = _pack_sparse24_rhs_tile(W_mat)
+        transport_bytes = to_meissa_transport(value_bytes, metadata)
+        weight_bytes = len(transport_bytes)
+    else:
+        weight_bytes = N * ks * 2
 
     A_GMEM = 0x1000
     W_GMEM = A_GMEM + _align_data(M * ks * 2)
-    W_META_GMEM = None
-    if sparse24:
-        W_META_GMEM = W_GMEM + _align_data(len(value_bytes))
-        C_GMEM = W_META_GMEM + _align_data(len(metadata))
-    else:
-        C_GMEM = W_GMEM + _align_data(N * ks * 2)
+    C_GMEM = W_GMEM + _align_data(weight_bytes)
     Z_GMEM = C_GMEM + M * N * 2
 
     img = DRAMWriter()
-    _write_gemm_params(
-        img, A_GMEM, W_GMEM, C_GMEM, M, N, K, Z_GMEM,
-        W_META_GMEM=W_META_GMEM,
-    )
+    _write_gemm_params(img, A_GMEM, W_GMEM, C_GMEM, M, N, K, Z_GMEM)
     _write_matrix(img, A_GMEM, A_dram, M, ks)
     if sparse24:
-        img.write_bytes(W_GMEM, value_bytes)
-        img.write_bytes(W_META_GMEM, metadata)
+        # Copy raw bytes: a metadata code such as 0x000D is not BF16 number 13.
+        img.write_bytes(W_GMEM, transport_bytes)
     else:
         _write_gemm_rhs_weight(img, W_GMEM, W_mat)
     _write_zeros(img, C_GMEM, M * N)
@@ -449,11 +447,15 @@ def emit_linear(node: Node, gm: GraphModule,
     em.layer_metrics = _gemm_map_metrics(M, N, K, kind="gemm")
     if sparse24:
         em.layer_metrics.update({
-            "weight_format": "sparse24_prototype_v1",
+            "weight_format": "meissa_sparse24_transport_v1",
             "export_only": True,
-            "bytes_est_weight": len(value_bytes) + len(metadata),
+            "bytes_est_weight": len(transport_bytes),
             "bytes_est_weight_values": len(value_bytes),
             "bytes_est_weight_metadata": len(metadata),
+            "bytes_est_weight_padding": (
+                len(transport_bytes) - len(value_bytes) - len(metadata)
+            ),
+            "bytes_est_weight_compact": len(value_bytes) + len(metadata),
         })
     if isinstance(node.args[0], Node):
         pr = node.args[0]
