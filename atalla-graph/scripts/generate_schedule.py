@@ -3,12 +3,17 @@
 Emit graph_schedule.c by consuming an FX GraphModule that already has DRAM
 addresses (node.meta["dram_addr"]) and tensor metadata attached.
 
-**Partial coverage:** this generator emits *matmul_kernel*, *add_kernel*, *relu_*,
-*conv_*, *mul_*, *maxpool_*, *avgpool_* for matching ``call_function``/``call_module``
-nodes. It does **not** yet lower ``F.layer_norm``, ``F.gelu``, or fused
-``AtallaSdpa`` to C calls, so a ViT graph schedule still omits those ops even
-when ``run_graph`` validate emulates them — see ``graph.lower_modules`` (F.linear
-is lowered to matmul+add so linears appear as matmul in the schedule).
+**Coverage:** this generator emits *matmul_kernel*, *add_kernel*, *relu_*,
+*conv_*, *mul_* / *mul_scalar_*, *maxpool_*, *avgpool_*, *layernorm_kernel*,
+*gelu_kernel* and *softmax_kernel* for matching ``call_function``/``call_module``
+nodes (signatures in ``kernels/kernels.h``). F.linear is lowered to matmul+add by
+``graph.lower_modules`` so linears appear as matmul in the schedule.
+
+**Still unsupported in schedule mode** (``_render_call`` returns ``None`` and the
+node is silently skipped): the fused ``AtallaSdpa`` leaf (``call_module``; validate
+runs it as NumPy or ``flash_sdpa_n32d32.c``), ``call_method`` ops other than
+views/``mean`` (e.g. ``flatten``, ``reshape``), and any ``call_function`` not in
+the ``*_TARGETS`` sets above.
 """
 
 from __future__ import annotations
@@ -67,6 +72,18 @@ AVGPOOL_TARGETS = {
     F.avg_pool2d,
 }
 
+LAYERNORM_TARGETS = {
+    F.layer_norm,
+}
+
+GELU_TARGETS = {
+    F.gelu,
+}
+
+SOFTMAX_TARGETS = {
+    F.softmax,
+}
+
 # Functions like builtins.getattr don't need kernels
 IGNORED_FUNCTIONS = {builtins.getattr}
 
@@ -77,6 +94,22 @@ _IDENT_RE = re.compile(r"\W+")
 
 def _ceil_div(value: int, divisor: int) -> int:
     return (value + divisor - 1) // divisor
+
+
+# Render a float as a C literal that ppci's ``atalla_c`` front-end accepts
+# (measured 2026-11-04 with ``python -m ppci atalla_cc -m atalla``): it rejects
+# scientific notation (``1e-05`` -> ValueError in ``utils.float_num``) and any
+# ``f`` suffix (``0.5f`` -> 'Expected ",", got "ID"'), so emit a plain decimal
+# with a decimal point and no suffix. The double literal converts implicitly to
+# the ``float`` parameters declared in ``kernels/kernels.h``.
+def _c_float(value: float) -> str:
+    value = float(value)
+    text = f"{value:.6g}"
+    if "e" in text or "." not in text:
+        text = f"{value:.10f}".rstrip("0")
+        if text.endswith("."):
+            text += "0"
+    return text
 
 
 #Remove non-alphanumeric chars and ensure it doesn't start with a digit
@@ -507,14 +540,14 @@ def _render_call(
             tensor_ref = rhs_ref if lhs_scalar is not None else lhs_ref
             if tensor_ref is None or scalar is None:
                 raise ValueError(f"Mul node {node.name} lacks tensor operand for scalar multiply")
-            return f"    mul_scalar_kernel({tensor_ref}, {dst}, {scalar:.6g}f);\n"
+            return f"    mul_scalar_kernel({tensor_ref}, {dst}, {_c_float(scalar)});\n"
         if lhs_ref is None or rhs_ref is None:
             raise ValueError(f"Mul node {node.name} lacks tensor operands")
         return f"    mul_kernel({lhs_ref}, {rhs_ref}, {dst});\n"
     if node.target in ADD_TARGETS:
         lhs, rhs, alpha = _add_operands(node, specs, scaled_mul)
         dst = _tensor_ref(node, specs)
-        return f"    add_kernel({lhs}, {rhs}, {dst}, {alpha:.6g}f);\n"
+        return f"    add_kernel({lhs}, {rhs}, {dst}, {_c_float(alpha)});\n"
     if node.target in RELU_TARGETS:
         src = _tensor_ref(_get_node_arg(node, 0), specs)
         dst = _tensor_ref(node, specs)
@@ -546,6 +579,37 @@ def _render_call(
             (pad_h, pad_w),
             global_pool=0,
         )
+    if node.target in LAYERNORM_TARGETS:
+        # F.layer_norm(input, normalized_shape, weight=None, bias=None, eps=1e-5)
+        src = _tensor_ref(_get_node_arg(node, 0, fallback="input"), specs)
+        ns = node.args[1] if len(node.args) > 1 else node.kwargs.get("normalized_shape")
+        if ns is None:
+            raise ValueError(f"layer_norm node {node.name} lacks normalized_shape")
+        ndim = int(ns[-1]) if isinstance(ns, (tuple, list, torch.Size)) else int(ns)
+        w = node.args[2] if len(node.args) > 2 else node.kwargs.get("weight")
+        b = node.args[3] if len(node.args) > 3 else node.kwargs.get("bias")
+        eps = float(node.args[4]) if len(node.args) > 4 else float(node.kwargs.get("eps", 1e-5))
+        return (
+            f"    layernorm_kernel({src}, {_tensor_ref_optional(w, specs)}, "
+            f"{_tensor_ref_optional(b, specs)}, {_tensor_ref(node, specs)}, "
+            f"{ndim}, {_c_float(eps)});\n"
+        )
+    if node.target in GELU_TARGETS:
+        # F.gelu(input, approximate="none"); approximate flag 1 == tanh
+        src = _tensor_ref(_get_node_arg(node, 0, fallback="input"), specs)
+        approx = 1 if node.kwargs.get("approximate", "none") == "tanh" else 0
+        return f"    gelu_kernel({src}, {_tensor_ref(node, specs)}, {approx});\n"
+    if node.target in SOFTMAX_TARGETS:
+        # softmax_kernel normalizes over the last dim; refuse anything else.
+        src = _tensor_ref(_get_node_arg(node, 0, fallback="input"), specs)
+        dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim", -1)
+        rank = len(_shape_from_meta(node))
+        if dim is not None and int(dim) not in (-1, rank - 1):
+            raise ValueError(
+                f"softmax node {node.name} normalizes dim={dim}; softmax_kernel only "
+                f"supports the last dim"
+            )
+        return f"    softmax_kernel({src}, {_tensor_ref(node, specs)});\n"
     return None
 
 

@@ -17,6 +17,15 @@ Usage:
     python run_graph.py --model vit_micro --mode validate --validate-inputs oracle
     python run_graph.py --model vit_micro --mode validate --layer-metrics-csv out/graph/layers.csv
     python plot_graph_layer_packet_share.py --csv out/graph/vit_micro_layer_metrics.csv
+    python run_graph.py --model gpt2_block --mode both --seed 0        # GPT-2 block (issue #66)
+    ATALLA_GELU_KERNEL=horner python run_graph.py --model gpt2_mlp --mode validate  # GELU on emulator
+    ATALLA_SDPA_FLASH=1 python run_graph.py --model vit_micro --mode validate       # flash trial
+
+Env knobs: --seed (torch+numpy, before load_model); ATALLA_SDPA_FLASH (vit_micro fused
+attention), ATALLA_GELU_KERNEL=horner|tanh (emit_gelu on emulator), ATALLA_FFN_ADD_NUMPY=0
+(force AtallaC add above 1024 elems; multi-tile add kernel currently wrong, see
+docs/model_baselines_notes.md), ATALLA_GEMM_SCHEDULE=baseline|double_buffer (tiled GEMM
+schedule, docs/experiments/gemm_double_buffer_2026-11.md).
 """
 from __future__ import annotations
 
@@ -37,7 +46,14 @@ import torch.nn as nn
 from torch.fx import GraphModule, Tracer, symbolic_trace
 from torch.fx.passes.shape_prop import ShapeProp
 
-_FUNC_SIM = Path(__file__).resolve().parent.parent / "functional_sim"
+_FUNC_SIM = Path(os.environ.get("ATALLA_SIM_PATH", ""))
+if not (_FUNC_SIM / "src").exists():
+    _models_dir = Path(__file__).resolve().parents[1]
+    _ws_dir = Path(__file__).resolve().parents[2]
+    for cand in (_models_dir / "functional_sim", _ws_dir / "atalla-functional-sim", _ws_dir / "functional_sim"):
+        if (cand / "src").exists():
+            _FUNC_SIM = cand
+            break
 if str(_FUNC_SIM) not in sys.path:
     sys.path.insert(0, str(_FUNC_SIM))
 
@@ -50,13 +66,19 @@ from src.components.execute import ExecuteUnit
 from src.components.scpad import Scratchpad
 
 from graph.lower_modules import lower_linear_modules
+from graph.backward import capture_backward
 from graph.memoryallocator import allocate_memory
 from graph.fx_capture import normalize_ops, get_node_shape
 from graph.tile_planner import plan_tiles
+from graph.overrides import (
+    PlanOverrides, load_overrides, apply_global_env, apply_node_overrides, resolve_backend,
+    BackendDecision, snapshot_env, restore_env,
+)
 from model.atalla_ops import AtallaSdpa
 from scripts.generate_schedule import emit as emit_schedule
 from codegen.c_emitter import (
     emit_node, render_in_file, compile_and_assemble, LayerEmission, _to_bf16_array,
+    has_emitter,
 )
 from codegen.dram_builder import extract_input_data
 from graph.layer_metrics_csv import write_layer_metrics_csv, write_template_summary_csv
@@ -134,10 +156,10 @@ def _read_bf16(mem: Memory, addr: int, count: int) -> np.ndarray:
 
 def _cos_sim(a: np.ndarray, b: np.ndarray) -> float:
     af, bf = a.flatten(), b.flatten()
-    n = min(len(af), len(bf))
-    af, bf = af[:n], bf[:n]
-    d = np.dot(af, bf)
-    return float(d / (np.linalg.norm(af) * np.linalg.norm(bf) + 1e-12))
+    an, bn = np.linalg.norm(af), np.linalg.norm(bf)
+    if an == 0 or bn == 0:
+        return 1.0 if an == bn == 0 else 0.0
+    return float(np.clip(np.dot(af / an, bf / bn), -1.0, 1.0))
 
 
 def _nz_count(a: np.ndarray, eps: float = 1e-8) -> int:
@@ -157,9 +179,14 @@ def _layer_compare_metrics(
     ref: np.ndarray, result: np.ndarray, eps: float = 1e-12
 ) -> Dict[str, float]:
     """Compare ref vs result: cos (direction-only), abs errors, rel ℓ₂, rel max error."""
-    rf = np.asarray(ref, dtype=np.float64).flatten()
-    ef = np.asarray(result, dtype=np.float64).flatten()
-    n = min(len(rf), len(ef))
+    rf = np.asarray(ref, dtype=np.float64)
+    ef = np.asarray(result, dtype=np.float64)
+    if rf.shape != ef.shape:
+        raise ValueError(f"Comparison shape mismatch: ref={rf.shape}, result={ef.shape}")
+    if not np.all(np.isfinite(rf)) or not np.all(np.isfinite(ef)):
+        raise ValueError("Cannot compare non-finite reference or computed values")
+    rf, ef = rf.flatten(), ef.flatten()
+    n = len(rf)
     if n == 0:
         return {
             "cos_sim": 1.0,
@@ -170,17 +197,13 @@ def _layer_compare_metrics(
             "ref_max_abs": 0.0,
             "rel_max_abs_error": 0.0,
         }
-    rf, ef = rf[:n], ef[:n]
     diff = ef - rf
     ref_norm = float(np.linalg.norm(rf))
     err_norm = float(np.linalg.norm(diff))
     ref_max_abs = float(np.max(np.abs(rf)))
     max_abs = float(np.max(np.abs(diff)))
     return {
-        "cos_sim": _cos_sim(
-            rf.astype(np.float32, copy=False),
-            ef.astype(np.float32, copy=False),
-        ),
+        "cos_sim": _cos_sim(rf, ef),
         "max_abs_error": max_abs,
         "mean_abs_error": float(np.mean(np.abs(diff))),
         "rmse": float(np.sqrt(np.mean(diff * diff))),
@@ -188,6 +211,21 @@ def _layer_compare_metrics(
         "ref_max_abs": ref_max_abs,
         "rel_max_abs_error": float(max_abs / (ref_max_abs + eps)),
     }
+
+
+def _compare_gradients(gradient_nodes: Dict, references: Dict, results: Dict) -> tuple:
+    """Compare each used gradient and return all metrics plus the worst cosine."""
+    gradient_metrics = {}
+    worst = None
+    for name, node in gradient_nodes.items():
+        if node is None:  # Unused trainable parameter.
+            gradient_metrics[name] = None
+            continue
+        metrics = _layer_compare_metrics(references[node.name], results[node.name])
+        gradient_metrics[name] = metrics
+        if worst is None or metrics["cos_sim"] < worst["cos_sim"]:
+            worst = {"name": name, **metrics}
+    return gradient_metrics, worst
 
 
 def _aggregate_kernel_metrics(kernel_metrics: list) -> Dict:
@@ -255,11 +293,160 @@ def _aggregate_kernel_metrics(kernel_metrics: list) -> Dict:
     }
 
 
+# ── Progress stream (bench/ui/API_CONTRACT.md section A) ─────────────────────
+
+def _json_default(o):
+    if isinstance(o, (np.integer,)):
+        return int(o)
+    if isinstance(o, (np.floating,)):
+        return float(o)
+    if isinstance(o, np.ndarray):
+        return o.tolist()
+    if isinstance(o, (set, frozenset, tuple)):
+        return list(o)
+    return str(o)
+
+
+class ProgressWriter:
+    """Append one JSON object per line to *path*, flushed after every event.
+
+    Events: start / node_start / node_done / done / error. ``current_node`` tracks the
+    node being executed so ``main`` can attribute a crash in its ``error`` event.
+    """
+
+    def __init__(self, path: Optional[str]):
+        self.path = path
+        self._fh = None
+        self.current_node: Optional[str] = None
+        if path:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            self._fh = open(path, "a", encoding="utf-8")
+
+    def emit(self, event: str, **fields) -> None:
+        if self._fh is None:
+            return
+        rec = {"event": event, **fields, "ts": time.time()}
+        self._fh.write(json.dumps(rec, default=_json_default) + "\n")
+        self._fh.flush()
+
+    def close(self) -> None:
+        if self._fh is not None:
+            self._fh.close()
+            self._fh = None
+
+
+def _progress_backend(dec: BackendDecision) -> str:
+    """Contract A label for a node event (graph nodes count as passthrough)."""
+    return "passthrough" if dec.backend == "graph" else dec.backend
+
+
+def _node_event_fields(index: int, node, dec: BackendDecision) -> Dict:
+    shape = get_node_shape(node)
+    return {
+        "index": index,
+        "name": node.name,
+        "op": node.meta.get("atalla_op") or node.op,
+        "backend": _progress_backend(dec),
+        "shape": list(shape) if shape is not None else None,
+    }
+
+
+def _null_metrics() -> Dict:
+    return {k: None for k in ("cos", "rel_l2", "rel_max", "sched_packets", "packets",
+                              "instructions", "bytes_loaded", "bytes_written", "flops")}
+
+
+def _km_to_progress(km: Optional[Dict]) -> Dict:
+    m = _null_metrics()
+    if not km:
+        return m
+    m["cos"] = km.get("cos_sim")
+    m["rel_l2"] = km.get("rel_l2_error")
+    m["rel_max"] = km.get("rel_max_abs_error")
+    if km.get("backend") == "emulator":
+        m["sched_packets"] = km.get("sched_packets")
+        m["packets"] = km.get("packets")
+        m["instructions"] = km.get("instructions")
+        m["bytes_loaded"] = km.get("bytes_loaded")
+        m["bytes_written"] = km.get("bytes_written")
+        m["flops"] = km.get("flops_total")
+    return m
+
+
+def graph_decisions(gm, overrides: Optional[PlanOverrides] = None) -> Dict[str, BackendDecision]:
+    """``resolve_backend`` for every node of *gm* (the one decision shared with inspect)."""
+    ov = overrides if overrides is not None else gm.meta.get("plan_overrides")
+    out: Dict[str, BackendDecision] = {}
+    for node in gm.graph.nodes:
+        op = node.meta.get("atalla_op")
+        out[node.name] = resolve_backend(node, node.meta.get("tile_config"), has_emitter(op), ov)
+    return out
+
+
+def _count_compute(decisions: Dict[str, BackendDecision]) -> int:
+    return sum(1 for d in decisions.values() if d.backend in ("emulator", "numpy", "skip"))
+
+
+def _eval_node_reference(node, gm, activation_cache: Dict[str, np.ndarray],
+                         ref_activations: Dict[str, np.ndarray]) -> np.ndarray:
+    """Chained NumPy/PyTorch evaluation of one FX node from cached inputs (BF16 semantics).
+
+    Falls back to the PyTorch reference activation when the node cannot be re-evaluated.
+    """
+    from torch.fx.node import map_arg
+
+    def _to_t(a):
+        if isinstance(a, torch.fx.Node):
+            if a.name not in activation_cache:
+                raise KeyError(a.name)
+            v = np.asarray(activation_cache[a.name], dtype=np.float32)
+            return torch.from_numpy(np.ascontiguousarray(v)).to(torch.bfloat16)
+        return a
+
+    try:
+        args = map_arg(node.args, _to_t)
+        kwargs = map_arg(node.kwargs, _to_t)
+        if node.op == "call_function":
+            out = node.target(*args, **kwargs)
+        elif node.op == "call_method":
+            out = getattr(args[0], node.target)(*args[1:], **kwargs)
+        elif node.op == "call_module":
+            out = gm.get_submodule(node.target)(*args, **kwargs)
+        else:
+            raise ValueError(node.op)
+        if not isinstance(out, torch.Tensor):
+            raise TypeError(type(out))
+        return out.detach().float().cpu().numpy()
+    except Exception:
+        if node.name in ref_activations:
+            return np.asarray(ref_activations[node.name], dtype=np.float32)
+        raise
+
+
 # ── Front-end: shared across modes ──────────────────────────────────────────
 
 def build_graph(model: nn.Module, example_input: torch.Tensor,
-                verbose: bool = True):
-    """Trace → lower → shape prop → normalize → plan tiles."""
+                verbose: bool = True, *, include_backward: bool = False,
+                example_target: Optional[torch.Tensor] = None,
+                loss_fn=None, overrides=None):
+    """Trace → lower → optional loss/backward → shapes → normalize → tiles.
+
+    Forward-only calls are unchanged. With include_backward=True, provide a
+    target tensor and a scalar loss_fn(prediction, target). The returned graph
+    takes (x, target) and returns (prediction, FP32 loss, named BF16 gradients).
+    Weights remain graph attributes. Model mode stays eval, as in inference.
+    New operators are retained for future kernel implementation.
+
+    ``overrides`` (path / dict / PlanOverrides / None -> ``ATALLA_PLAN_OVERRIDES``): the
+    ``global`` knobs are written to the env *before* ``plan_tiles`` (override file wins),
+    per-node overrides are pushed into the tile params afterwards, and the parsed object is
+    kept in ``gm.meta['plan_overrides']`` for ``run_validate`` / ``run_schedule`` / inspect.
+    """
+    if include_backward and (example_target is None or loss_fn is None):
+        raise ValueError("include_backward requires example_target and loss_fn")
+    ov = load_overrides(overrides)
+    env_snapshot = snapshot_env()
+    override_env = apply_global_env(ov)
     model = model.bfloat16().eval()
     example_bf16 = example_input.bfloat16()
 
@@ -273,22 +460,52 @@ def build_graph(model: nn.Module, example_input: torch.Tensor,
         gm = symbolic_trace(model)
     gm = lower_linear_modules(gm)
 
+    if include_backward:
+        if verbose:
+            print("Capture forward + loss + backward...")
+        gm = capture_backward(gm, model, example_bf16, example_target, loss_fn)
+
     if verbose:
         print("Shape propagation...")
-    ShapeProp(gm).propagate(example_bf16)
+    if include_backward:
+        ShapeProp(gm).propagate(example_bf16, example_target)
+    else:
+        ShapeProp(gm).propagate(example_bf16)
 
     if verbose:
         print("Normalize ops + plan tiles...")
     gm = normalize_ops(gm)
-    gm = plan_tiles(gm)
+    try:
+        gm = plan_tiles(gm)  # planner records gelu method / sdpa flash / add threshold in tile params
+    finally:
+        restore_env(env_snapshot)  # keep in-process callers (inspect server) stateless
+    apply_node_overrides(gm, ov)
+    gm.meta["plan_overrides"] = ov
+    gm.meta["override_env"] = override_env
     return gm
 
 
 # ── Schedule mode ────────────────────────────────────────────────────────────
 
 def run_schedule(gm, example_input: torch.Tensor, out_dir: str,
-                 verbose: bool = True) -> str:
-    """Emit graph_schedule.c using Vihaan's generate_schedule."""
+                 verbose: bool = True, progress: Optional[ProgressWriter] = None,
+                 model_name: Optional[str] = None) -> str:
+    """Emit graph_schedule.c using Vihaan's generate_schedule.
+
+    With *progress*, node events carry the planned backend (no metrics) so the UI can
+    show the same call graph it will see in validate mode.
+    """
+    if gm.meta.get("include_backward"):
+        raise NotImplementedError(
+            "Backward graphs can be inspected and run in PyTorch, but schedule "
+            "emission needs target inputs, backward kernels, and mixed-dtype memory support."
+        )
+    progress = progress or ProgressWriter(None)
+    t0 = time.time()
+    nodes = list(gm.graph.nodes)
+    decisions = graph_decisions(gm)
+    progress.emit("start", model=model_name, mode="schedule", total_nodes=len(nodes),
+                  compute_nodes=_count_compute(decisions))
     os.makedirs(out_dir, exist_ok=True)
     placeholder_data = {"x": example_input.bfloat16().clone()}
     gm_alloc = allocate_memory(gm, f"{out_dir}/dram.bin", placeholder_data)
@@ -296,6 +513,18 @@ def run_schedule(gm, example_input: torch.Tensor, out_dir: str,
     c_code = emit_schedule(gm_alloc)
     out_path = f"{out_dir}/graph_schedule.c"
     Path(out_path).write_text(c_code)
+
+    for index, node in enumerate(nodes):
+        if node.op == "output":
+            continue
+        fields = _node_event_fields(index, node, decisions[node.name])
+        progress.current_node = node.name
+        progress.emit("node_start", **fields)
+        progress.emit("node_done", **fields, **_null_metrics(), elapsed_s=0.0)
+    progress.current_node = None
+    progress.emit("done", final_cosine=None, rel_l2=None, rel_max=None, strict_pass=None,
+                  elapsed_s=time.time() - t0, schedule_path=out_path,
+                  kernel_calls=sum(1 for l in c_code.splitlines() if "_kernel(" in l))
 
     kernel_calls = [l.strip() for l in c_code.splitlines() if "_kernel(" in l]
     if verbose:
@@ -310,8 +539,10 @@ def run_schedule(gm, example_input: torch.Tensor, out_dir: str,
             print(
                 "  Note: F.linear in recent PyTorch FX traces is lowered in "
                 "``lower_linear_modules`` to matmul+add so matmul_kernel appears. "
-                "``layer_norm``, ``gelu``, and fused ``AtallaSdpa`` are not yet "
-                "emitted in graph_schedule.c (TBD; schedule is partial vs validate)."
+                "``layer_norm``/``gelu``/``softmax`` are emitted as layernorm_kernel/"
+                "gelu_kernel/softmax_kernel; the fused ``AtallaSdpa`` leaf is still "
+                "not emitted in graph_schedule.c (schedule is partial vs validate "
+                "only for vit_micro's sdpa node)."
             )
     return c_code
 
@@ -325,6 +556,9 @@ def run_validate(
     out_dir: str,
     verbose: bool = True,
     *,
+    training: bool = False,
+    expected_output: Optional[torch.Tensor] = None,
+    all_gradient_losses: bool = False,
     kernel_bundle_dir: Optional[str] = None,
     kernel_bundle_ops: Optional[FrozenSet[str]] = None,
     metrics_json_path: Optional[str] = None,
@@ -334,8 +568,19 @@ def run_validate(
     strict_min_cos: float = 0.999,
     strict_max_rel_l2: float = 0.02,
     strict_max_relmax: float = 0.05,
+    progress: Optional[ProgressWriter] = None,
+    model_name: Optional[str] = None,
 ) -> Dict:
     """Per-node compile → emulate → compare vs PyTorch golden.
+
+    ``progress`` (a :class:`ProgressWriter`) streams start / node_start / node_done / done
+    events (API_CONTRACT.md A). Per-node backend choices, including ``--overrides``
+    (contract B), come from ``graph.overrides.resolve_backend`` via :func:`graph_decisions`;
+    ``gm.meta['plan_overrides']`` is set by :func:`build_graph`.
+
+    ``expected_output`` supplies the ``target`` placeholder for backward graphs;
+    its dtype is preserved. The model input is converted to BF16 as before.
+    ``all_gradient_losses`` prints every gradient's metrics instead of only the worst.
 
     ``validate_inputs``:
       * ``chained`` — each layer consumes the previous layer's emulator output
@@ -355,22 +600,44 @@ def run_validate(
     into a subdirectory.
 
     If *strict_end_to_end* is true and *validate_inputs* is *chained*, the
-    result includes *strict_fail_reasons* when the final output violates
+    result includes *strict_fail_reasons* when the prediction, loss, or a gradient violates
     *strict_min_cos* / *strict_max_rel_l2* / *strict_max_relmax* (defaults for
     a meaningful E2E error bar, not direction-only cos).
     """
     if validate_inputs not in ("chained", "oracle"):
         raise ValueError("validate_inputs must be 'chained' or 'oracle'")
+    if training or gm.meta.get("include_backward"):
+        if expected_output is None:
+            raise ValueError("Backward validation requires expected_output for target")
+        placeholder_inputs = {
+            "x": example_input.bfloat16(),
+            "target": expected_output,
+        }
+    else:
+        placeholders = [n for n in gm.graph.nodes if n.op == "placeholder"]
+        if len(placeholders) != 1:
+            raise ValueError("Forward validation requires exactly one input placeholder")
+        placeholder_inputs = {placeholders[0].target: example_input.bfloat16()}
     t0 = time.time()
     os.makedirs(out_dir, exist_ok=True)
     bundle_ops = kernel_bundle_ops or DEFAULT_KERNEL_BUNDLE_OPS
     bundle_exported: Optional[Set[str]] = set() if kernel_bundle_dir else None
 
-    ref_activations = extract_input_data(gm, example_input.bfloat16())
+    if (training):
+        ref_activations = extract_input_data(gm, example_input.bfloat16(), expected_output)
+    else:
+        ref_activations = extract_input_data(gm, example_input.bfloat16())
+
     activation_cache: Dict[str, np.ndarray] = {}
 
-    stats = {"total": 0, "emulated": 0, "numpy": 0, "passthrough": 0}
+    stats = {"total": 0, "emulated": 0, "numpy": 0, "passthrough": 0, "skip": 0}
     kernel_metrics = []
+    progress = progress or ProgressWriter(None)
+    overrides: Optional[PlanOverrides] = gm.meta.get("plan_overrides")
+    decisions = graph_decisions(gm, overrides)
+    all_nodes = list(gm.graph.nodes)
+    progress.emit("start", model=model_name, mode="validate", total_nodes=len(all_nodes),
+                  compute_nodes=_count_compute(decisions))
 
     if verbose:
         print(f"\n--- Graph (validate_inputs={validate_inputs}) ---")
@@ -396,20 +663,34 @@ def run_validate(
             print(f"  {node.name:30s}  {str(op):15s}  {str(kt):12s}  {shape}")
         print()
 
-    for node in gm.graph.nodes:
+    for index, node in enumerate(all_nodes):
         atalla_op = node.meta.get("atalla_op")
 
         if node.op == "output":
             continue
 
         stats["total"] += 1
+        dec = decisions[node.name]
+        ev = _node_event_fields(index, node, dec)
+        t_node = time.time()
+        progress.current_node = node.name
+        progress.emit("node_start", **ev)
+
+        def _node_done(km: Optional[Dict] = None, backend: Optional[str] = None) -> None:
+            fields = dict(ev)
+            if backend is not None:
+                fields["backend"] = backend
+            progress.emit("node_done", **fields, **_km_to_progress(km),
+                          elapsed_s=time.time() - t_node)
 
         if node.op == "placeholder":
-            activation_cache[node.name] = (
-                example_input.detach().bfloat16().float().cpu().numpy()
-            )
+            value = placeholder_inputs[node.target].detach().cpu()
+            if value.dtype == torch.bfloat16:
+                value = value.float()  # NumPy cannot represent BF16 directly.
+            activation_cache[node.name] = value.numpy().copy()
             if verbose:
                 print(f"  [{node.name}] placeholder")
+            _node_done()
             continue
 
         if node.op == "get_attr":
@@ -422,6 +703,7 @@ def run_validate(
             )
             if verbose:
                 print(f"  [{node.name}] get_attr")
+            _node_done()
             continue
 
         # Passthrough: flatten, dropout, transpose, unknown
@@ -447,6 +729,7 @@ def run_validate(
                     stats["passthrough"] += 1
                     if verbose:
                         print(f"  [{node.name}] {atalla_op or 'passthrough'} -> {data.shape}")
+                    _node_done(backend="passthrough")
                     continue
 
             if node.name in ref_activations:
@@ -454,7 +737,53 @@ def run_validate(
                 stats["passthrough"] += 1
                 if verbose:
                     print(f"  [{node.name}] passthrough (ref)")
+                _node_done(backend="passthrough")
                 continue
+
+        # ── Overrides (contract B): skip -> identity, numpy -> chained reference ──
+        if dec.error and dec.backend != "emulator":
+            progress.emit("error", message=dec.error, node=node.name, fatal=False)
+            if verbose:
+                print(f"  [{node.name}] override warning: {dec.error}")
+
+        if dec.backend == "skip":
+            src = dec.skip_source
+            if src in activation_cache:
+                r = np.asarray(activation_cache[src], dtype=np.float32)
+            else:
+                r = np.asarray(ref_activations[node.name], dtype=np.float32)
+            out_shape = get_node_shape(node)
+            if out_shape and r.size == int(np.prod(out_shape)):
+                r = r.reshape(out_shape)
+            activation_cache[node.name] = r
+            stats["skip"] += 1
+            km = {"name": node.name, "op": atalla_op, "backend": "skip",
+                  "shape": list(r.shape), "elems": int(r.size), "skip_source": src}
+            ref = ref_activations.get(node.name)
+            if ref is not None and np.asarray(ref).shape == r.shape:
+                km.update(_layer_compare_metrics(ref, r))
+            kernel_metrics.append(km)
+            if verbose:
+                print(f"  [{node.name}] {atalla_op} -> SKIP (identity on {src}) {r.shape}")
+            _node_done(km, backend="skip")
+            continue
+
+        if dec.backend == "numpy" and dec.forced:
+            r = _eval_node_reference(node, gm, activation_cache, ref_activations)
+            activation_cache[node.name] = r
+            stats["numpy"] += 1
+            km = {"name": node.name, "op": atalla_op, "backend": "numpy",
+                  "shape": list(r.shape), "elems": int(r.size), "forced": True,
+                  "reason": dec.reason}
+            ref = ref_activations.get(node.name)
+            if ref is not None and np.asarray(ref).shape == r.shape:
+                km.update(_layer_compare_metrics(ref, r))
+            kernel_metrics.append(km)
+            if verbose:
+                extra = f" (cos={km['cos_sim']:.6f})" if "cos_sim" in km else ""
+                print(f"  [{node.name}] {atalla_op} -> NumPy (forced) {r.shape}{extra}")
+            _node_done(km, backend="numpy")
+            continue
 
         if validate_inputs == "oracle" and atalla_op in _EMU_ATALLA_OPS:
             _apply_oracle_inputs(activation_cache, ref_activations)
@@ -471,14 +800,21 @@ def run_validate(
             stats["passthrough"] += 1
             if verbose:
                 print(f"  [{node.name}] {atalla_op} -> passthrough")
+            _node_done(backend="passthrough")
             continue
 
         if emission.skip_emulator:
+            if dec.backend == "emulator" and dec.forced:
+                msg = (f"emulator requested for {node.name} ({atalla_op}) but the emitter has no "
+                       f"kernel image for this configuration; fell back to NumPy")
+                progress.emit("error", message=msg, node=node.name, fatal=False)
+                if verbose:
+                    print(f"  [{node.name}] override warning: {msg}")
             activation_cache[node.name] = emission.numpy_result
             stats["numpy"] += 1
             r = emission.numpy_result
             km = {"name": node.name, "op": atalla_op, "backend": "numpy",
-                  "shape": list(r.shape), "elems": int(r.size)}
+                  "shape": list(r.shape), "elems": int(r.size), "reason": dec.reason}
             ref = ref_activations.get(node.name)
             if ref is not None:
                 km.update(_layer_compare_metrics(ref, r))
@@ -492,6 +828,7 @@ def run_validate(
                         f"relmax={km['rel_max_abs_error']:.6f})"
                     )
                 print(f"  [{node.name}] {atalla_op} -> NumPy {r.shape}{extra}")
+            _node_done(km, backend="numpy")
             continue
 
         # Compile + emulate
@@ -507,7 +844,7 @@ def run_validate(
         mem, eu = _run_emulator(in_file, out_dir, node.name)
         result = _read_bf16(mem, emission.output_addr, emission.output_elements)
 
-        if emission.output_shape:
+        if emission.output_shape is not None:
             try:
                 result = result.reshape(emission.output_shape)
             except ValueError:
@@ -572,6 +909,8 @@ def run_validate(
             },
             "arithmetic_intensity": float(pm.get("arithmetic_intensity", 0.0)),
             "arithmetic_intensity_loads": float(pm.get("arithmetic_intensity_loads", 0.0)),
+            "kernel_variant": dec.variant,
+            "reason": dec.reason,
         }
         km.update(emission.layer_metrics)
         if ref is not None:
@@ -617,6 +956,9 @@ def run_validate(
                 )
             else:
                 print("done")
+        _node_done(km, backend="emulator")
+
+    progress.current_node = None
 
     # Final output comparison
     output_node = next((n for n in gm.graph.nodes if n.op == "output"), None)
@@ -637,31 +979,19 @@ def run_validate(
     if verbose:
         print(f"\n--- Results ({elapsed:.2f}s) ---")
         print(f"  Nodes: {stats['total']} total, {stats['emulated']} emulated, "
-              f"{stats['numpy']} numpy, {stats['passthrough']} passthrough")
+              f"{stats['numpy']} numpy, {stats['passthrough']} passthrough, "
+              f"{stats['skip']} skipped")
 
     aggregate_metrics = _aggregate_kernel_metrics(kernel_metrics)
 
     end_to_end: Optional[Dict] = None
-    strict_fail_reasons: list = []
+    training_metrics = None
+    comparisons = {}
     if emu_out is not None and ref_out is not None:
         end_cmp = _layer_compare_metrics(ref_out, emu_out)
         end_to_end = end_cmp
+        comparisons["Output"] = end_cmp
         cos = end_cmp["cos_sim"]
-        rl2 = end_cmp["rel_l2_error"]
-        rmx = end_cmp["rel_max_abs_error"]
-        if strict_end_to_end and validate_inputs == "chained":
-            if cos < strict_min_cos:
-                strict_fail_reasons.append(
-                    f"cos {cos:.6f} < {strict_min_cos} (min)"
-                )
-            if rl2 > strict_max_rel_l2:
-                strict_fail_reasons.append(
-                    f"rel_l2 {rl2:.6f} > {strict_max_rel_l2} (max)"
-                )
-            if rmx > strict_max_relmax:
-                strict_fail_reasons.append(
-                    f"relmax {rmx:.6f} > {strict_max_relmax} (max)"
-                )
         if verbose:
             print(f"  Output: emu={emu_out.shape} ref={ref_out.shape}")
             print(
@@ -669,6 +999,66 @@ def run_validate(
                 f"relmax={end_cmp['rel_max_abs_error']:.6f}  "
                 f"rmse={end_cmp['rmse']:.6f}  rel_l2={end_cmp['rel_l2_error']:.6f}"
             )
+
+    if gm.meta.get("include_backward"):
+        _, loss_node, gradient_nodes = output_node.args[0]
+        ref_loss = ref_activations[loss_node.name]
+        result_loss = activation_cache[loss_node.name]
+        loss_metrics = _layer_compare_metrics(ref_loss, result_loss)
+        gradients, worst = _compare_gradients(
+            gradient_nodes, ref_activations, activation_cache
+        )
+        comparisons["Loss"] = loss_metrics
+        comparisons.update({f"Gradient {name}": metrics
+                            for name, metrics in gradients.items() if metrics is not None})
+        training_metrics = {
+            "loss": {"reference": float(np.asarray(ref_loss).item()),
+                     "result": float(np.asarray(result_loss).item()), **loss_metrics},
+            "gradients": gradients,
+            "worst_gradient": worst,
+        }
+        if verbose:
+            print(
+                f"  Loss: result={training_metrics['loss']['result']:.8g} "
+                f"ref={training_metrics['loss']['reference']:.8g}, "
+                f"abs_error={loss_metrics['max_abs_error']:.6g}, "
+                f"rmse={loss_metrics['rmse']:.6g}, rel_l2={loss_metrics['rel_l2_error']:.6g}, "
+                f"relmax={loss_metrics['rel_max_abs_error']:.6g}"
+            )
+            unused = sum(metrics is None for metrics in gradients.values())
+            print(f"  Gradients: {len(gradients) - unused} compared, {unused} unused")
+            reported_gradients = {}
+            if all_gradient_losses:
+                reported_gradients = gradients
+            elif worst is not None:
+                reported_gradients = {worst["name"]: worst}
+            for name, metrics in reported_gradients.items():
+                if metrics is None:
+                    print(f"  Gradient: {name}, unused")
+                    continue
+                label = "Gradient" if all_gradient_losses else "Worst gradient (lowest cosine)"
+                print(
+                    f"  {label}: {name}, "
+                    f"cos={metrics['cos_sim']:.6f}, max_abs={metrics['max_abs_error']:.6g}, "
+                    f"rmse={metrics['rmse']:.6g}, rel_l2={metrics['rel_l2_error']:.6g}, "
+                    f"relmax={metrics['rel_max_abs_error']:.6g}"
+                )
+
+    strict_fail_reasons = []
+    if strict_end_to_end and validate_inputs == "chained":
+        if end_to_end is None:
+            strict_fail_reasons.append("missing reference or emulator output for strict check")
+        for label, metrics in comparisons.items():
+            # Scalar-loss cosine says little; check its magnitude errors instead.
+            if label != "Loss" and metrics["cos_sim"] < strict_min_cos:
+                strict_fail_reasons.append(f"{label}: cos {metrics['cos_sim']:.6f} < {strict_min_cos}")
+            if metrics["rel_l2_error"] > strict_max_rel_l2:
+                strict_fail_reasons.append(f"{label}: rel_l2 {metrics['rel_l2_error']:.6f} > {strict_max_rel_l2}")
+            if metrics["rel_max_abs_error"] > strict_max_relmax:
+                strict_fail_reasons.append(f"{label}: relmax {metrics['rel_max_abs_error']:.6f} > {strict_max_relmax}")
+
+    if verbose:
+        if end_to_end is not None:
             if strict_end_to_end and validate_inputs == "chained":
                 if strict_fail_reasons:
                     print(
@@ -697,8 +1087,6 @@ def run_validate(
                     "emulated op, so the last add can be exact even when matmul "
                     "outputs vs ref are poor."
                 )
-    elif strict_end_to_end and validate_inputs == "chained":
-        strict_fail_reasons.append("missing reference or emulator output for strict check")
 
     if verbose:
         am = aggregate_metrics
@@ -719,6 +1107,7 @@ def run_validate(
         "emulator_output": emu_out,
         "reference_output": ref_out,
         "end_to_end": end_to_end,
+        "training_metrics": training_metrics,
         "strict_end_to_end": bool(strict_end_to_end),
         "strict_pass": (
             (not strict_fail_reasons) if (strict_end_to_end and validate_inputs == "chained")
@@ -736,10 +1125,28 @@ def run_validate(
             "kernel_metrics": kernel_metrics,
             "stats": stats,
             "elapsed_s": elapsed,
+            "end_to_end": end_to_end,
+            "training_metrics": training_metrics,
+            "strict_pass": out["strict_pass"],
+            "strict_fail_reasons": strict_fail_reasons,
         }
         Path(metrics_json_path).write_text(json.dumps(blob, indent=2) + "\n")
         if verbose:
             print(f"\nWrote metrics JSON: {metrics_json_path}")
+
+    progress.emit(
+        "done",
+        final_cosine=(end_to_end or {}).get("cos_sim"),
+        rel_l2=(end_to_end or {}).get("rel_l2_error"),
+        rel_max=(end_to_end or {}).get("rel_max_abs_error"),
+        strict_pass=out["strict_pass"],
+        elapsed_s=elapsed,
+        stats=stats,
+        total_sched_packets=aggregate_metrics.get("total_sched_packets"),
+        total_emu_packets=aggregate_metrics.get("total_emu_packets"),
+        total_bytes_memory_traffic=aggregate_metrics.get("total_bytes_memory_traffic"),
+        total_flops=aggregate_metrics.get("total_flops"),
+    )
 
     if layer_metrics_csv_path:
         p_csv = Path(layer_metrics_csv_path)
@@ -755,6 +1162,8 @@ def run_validate(
 
 def _resolve_transpose(ndim: int, args) -> tuple:
     """Convert transpose method args (dim0, dim1) to numpy axes tuple."""
+    if ndim == 0:
+        return ()  # A scalar transpose has no axes to permute.
     if len(args) >= 2:
         d0, d1 = int(args[0]), int(args[1])
         if d0 < 0:
@@ -770,20 +1179,35 @@ def _resolve_transpose(ndim: int, args) -> tuple:
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def load_model(name: str, scale: float = 0.01):
+    """Return ``(model, example_input, expected_output_or_None)``.
+
+    ``expected_output`` is only used as the MSE target in ``--training`` mode;
+    forward-only validate passes ``None`` through and never dereferences it.
+    """
     if name == "basic":
         from model.basic import BasicModule
-        return BasicModule(dim=32, depth=2), torch.randn(1, 32)
+        # expected_output is a random target used only by --training.
+        return BasicModule(dim=32, depth=2), torch.randn(1, 32), torch.randn(1, 32)
     elif name == "alexnet_small":
         from model.alexnet_small import AlexNetSmall
-        return AlexNetSmall(scale=scale, num_classes=10), torch.randn(1, 3, 32, 32)
+        return AlexNetSmall(scale=scale, num_classes=10), torch.randn(1, 3, 32, 32), None
     elif name == "layernorm_smoke":
         from model.layernorm_smoke import LayerNormSmoke
-        return LayerNormSmoke(dim=32), torch.randn(1, 32)
+        return LayerNormSmoke(dim=32), torch.randn(1, 32), None
     elif name == "vit_micro":
         from model.vit_micro import ViTMicro
         # n_tokens=dim=32 matches kernels/flash_sdpa_n32d32.c (fused attention on emulator).
         m = ViTMicro(dim=32, n_tokens=32)
-        return m, torch.randn(1, 32, 32)
+        return m, torch.randn(1, 32, 32), None
+    elif name == "gpt2_mlp":
+        from model.gpt2_block import GPT2MLPBlock
+        return GPT2MLPBlock(n_tokens=32, dim=32, hidden=128), torch.randn(32, 32), None
+    elif name == "gpt2_attn":
+        from model.gpt2_block import GPT2AttnBlock
+        return GPT2AttnBlock(n_tokens=32, dim=32), torch.randn(32, 32), None
+    elif name == "gpt2_block":
+        from model.gpt2_block import GPT2Block
+        return GPT2Block(n_tokens=32, dim=32, hidden=128), torch.randn(32, 32), None
     else:
         raise ValueError(f"Unknown model: {name}")
 
@@ -791,7 +1215,10 @@ def load_model(name: str, scale: float = 0.01):
 def main():
     parser = argparse.ArgumentParser(description="Unified Atalla graph pipeline")
     parser.add_argument("--model", default="basic",
-                        choices=["basic", "alexnet_small", "layernorm_smoke", "vit_micro"])
+                        choices=["basic", "alexnet_small", "layernorm_smoke", "vit_micro",
+                                 "gpt2_mlp", "gpt2_attn", "gpt2_block"])
+    parser.add_argument("--seed", type=int, default=0,
+                        help="torch/numpy RNG seed applied before load_model (weights + inputs).")
     parser.add_argument("--mode", default="both",
                         choices=["schedule", "validate", "both"])
     parser.add_argument("--scale", type=float, default=0.01)
@@ -836,41 +1263,106 @@ def main():
         "--strict-end",
         action="store_true",
         help=(
-            "Chained-validate: exit non-zero if final cos < 0.999, rel_l2 > 0.02, "
-            "or relmax > 0.05. Use for paper-style E2E; relaxed PASS only without this."
+            "Chained-validate: require prediction/gradient cos >= 0.999 and "
+            "prediction/loss/gradient rel_l2 <= 0.02, relmax <= 0.05. "
+            "Missing or invalid training outputs also fail."
+        ),
+    )
+    parser.add_argument(
+            "--training",
+            action="store_true",
+            help=(
+                "Generates backpropagation graph/code"
+            ),
+        )
+    parser.add_argument(
+        "--all-gradient-losses",
+        action="store_true",
+        help="During training validation, print metrics for every parameter gradient instead of only the worst.",
+    )
+    parser.add_argument(
+        "--progress-jsonl",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Append start/node_start/node_done/done/error JSON events to PATH, flushed per line "
+            "(bench/ui/API_CONTRACT.md A). Env fallback: ATALLA_PROGRESS_JSONL."
+        ),
+    )
+    parser.add_argument(
+        "--overrides",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Plan overrides JSON: {'global': {gelu_kernel, sdpa, add_numpy_threshold}, "
+            "'nodes': {name: {backend: emulator|numpy|skip, kernel}}} "
+            "(bench/ui/API_CONTRACT.md B). Env fallback: ATALLA_PLAN_OVERRIDES."
         ),
     )
     args = parser.parse_args()
 
-    torch.manual_seed(42)
-    np.random.seed(42)
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
 
-    model, example_input = load_model(args.model, args.scale)
+    # Right now, example_input and expected_output are just pytorch random tensors. However, eventually we want to have a real expected input
+    # and expected output function so we can do real training
+    model, example_input, expected_output = load_model(args.model, args.scale)
     verbose = not args.quiet
 
-    gm = build_graph(model, example_input, verbose=verbose)
+    if args.training and expected_output is None:
+        raise SystemExit(f"--training needs an expected_output target; model {args.model!r} returns None")
 
-    vout: Optional[Dict] = None
-    if args.mode in ("validate", "both"):
-        vout = run_validate(
-            gm,
-            model,
-            example_input,
-            args.out_dir,
-            verbose=verbose,
-            kernel_bundle_dir=args.export_kernel_bundle,
-            metrics_json_path=args.metrics_json,
-            layer_metrics_csv_path=args.layer_metrics_csv,
-            validate_inputs=args.validate_inputs,
-            strict_end_to_end=bool(args.strict_end),
-        )
-    if vout and vout.get("strict_pass") is False:
-        sys.exit(1)
+    progress_path = args.progress_jsonl or os.environ.get("ATALLA_PROGRESS_JSONL") or None
+    overrides_path = args.overrides or os.environ.get("ATALLA_PLAN_OVERRIDES") or None
+    progress = ProgressWriter(progress_path)
+    try:
+        if (args.training):
+            gm = build_graph(model, example_input, verbose=verbose,
+                include_backward=args.training, example_target=expected_output,
+                loss_fn=nn.MSELoss(), overrides=overrides_path)
+        else:
+            gm = build_graph(model, example_input, verbose=verbose, overrides=overrides_path)
+        if verbose and overrides_path:
+            print(f"Plan overrides: {overrides_path} -> env {gm.meta.get('override_env')}")
 
-    if args.mode in ("schedule", "both"):
-        import copy
-        gm_sched = copy.deepcopy(gm)
-        run_schedule(gm_sched, example_input, args.out_dir, verbose=verbose)
+        vout: Optional[Dict] = None
+        if args.mode in ("validate", "both"):
+            vout = run_validate(
+                gm,
+                model,
+                example_input,
+                args.out_dir,
+                verbose=verbose,
+                kernel_bundle_dir=args.export_kernel_bundle,
+                metrics_json_path=args.metrics_json,
+                layer_metrics_csv_path=args.layer_metrics_csv,
+                validate_inputs=args.validate_inputs,
+                strict_end_to_end=bool(args.strict_end),
+                training=args.training,
+                expected_output=expected_output if args.training else None,
+                all_gradient_losses=args.all_gradient_losses,
+                progress=progress,
+                model_name=args.model,
+            )
+        if vout and vout.get("strict_pass") is False:
+            sys.exit(1)
+
+        if args.mode in ("schedule", "both"):
+            import copy
+            gm_sched = copy.deepcopy(gm)
+            # In --mode both the validate pass already streamed the graph; only a pure
+            # schedule run streams its (metric-less) node events.
+            run_schedule(gm_sched, example_input, args.out_dir, verbose=verbose,
+                         progress=progress if args.mode == "schedule" else None,
+                         model_name=args.model)
+    except SystemExit:
+        raise
+    except BaseException as exc:  # noqa: BLE001 - report then re-raise
+        progress.emit("error", message=f"{type(exc).__name__}: {exc}", node=progress.current_node,
+                      fatal=True)
+        raise
+    finally:
+        progress.close()
 
 
 if __name__ == "__main__":

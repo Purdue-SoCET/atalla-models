@@ -20,6 +20,7 @@ import torch.nn as nn
 from torch.fx import GraphModule, Node
 
 from .fx_capture import get_node_shape
+from .overrides import gelu_method_from_env, add_numpy_threshold_from_env
 
 VL = 32
 TILE = 32
@@ -147,10 +148,68 @@ def _plan_gelu(node: Node) -> TileConfig:
     for d in (shape or [1]):
         total *= d
     width = min(total, VL)
+    # Method resolved from ATALLA_GELU_KERNEL (overrides may rewrite it afterwards);
+    # ``torch`` means the PyTorch BF16 reference (no emulator).
+    method = gelu_method_from_env()
     return TileConfig(
         kernel_type="gelu",
-        params=dict(total_elements=total, width=width),
+        params=dict(total_elements=total, width=width, method=method,
+                    use_numpy=(method == "torch")),
     )
+
+
+def _plan_threshold_backward(node: Node) -> TileConfig:
+    shape = get_node_shape(node)
+    total = _prod(shape) if shape else 32
+    return TileConfig(kernel_type="threshold_backward", params=dict(total_elements=total))
+
+
+def _plan_sum_dim(node: Node) -> TileConfig:
+    inp_shape = get_node_shape(node.args[0]) if node.args else None
+    if inp_shape and len(inp_shape) >= 2:
+        rows = int(inp_shape[0])
+        cols = _prod(inp_shape[1:])
+    else:
+        rows = 1
+        cols = _prod(inp_shape) if inp_shape else 32
+    return TileConfig(kernel_type="sum_dim", params=dict(num_rows=rows, num_cols=cols))
+
+
+def _plan_mse_loss(node: Node) -> TileConfig:
+    inp_shape = get_node_shape(node.args[0]) if node.args else None
+    total = _prod(inp_shape) if inp_shape else 32
+    return TileConfig(kernel_type="mse_loss", params=dict(total_elements=total))
+
+
+def _plan_mse_loss_backward(node: Node) -> TileConfig:
+    inp_shape = get_node_shape(node.args[0]) if node.args else None
+    total = _prod(inp_shape) if inp_shape else 32
+    return TileConfig(kernel_type="mse_loss_backward", params=dict(total_elements=total))
+
+
+def _plan_batchnorm(node: Node) -> TileConfig:
+    inp_shape = get_node_shape(node.args[0]) if node.args else None
+    if inp_shape and len(inp_shape) >= 3:
+        C = int(inp_shape[-3])
+        spatial = _prod(inp_shape[-2:])
+    elif inp_shape and len(inp_shape) == 2:
+        C = int(inp_shape[0])
+        spatial = int(inp_shape[1])
+    else:
+        C = 1
+        spatial = _prod(inp_shape) if inp_shape else 32
+    return TileConfig(kernel_type="batchnorm", params=dict(channels=C, spatial_elements=spatial))
+
+
+def _plan_upsample(node: Node) -> TileConfig:
+    inp_shape = get_node_shape(node.args[0]) if node.args else None
+    if inp_shape and len(inp_shape) >= 3:
+        C = int(inp_shape[-3])
+        H = int(inp_shape[-2])
+        W = int(inp_shape[-1])
+    else:
+        C, H, W = 1, 4, 8
+    return TileConfig(kernel_type="upsample", params=dict(channels=C, H_in=H, W_in=W))
 
 
 def _plan_maxpool(node: Node, gm: GraphModule) -> TileConfig:
@@ -218,9 +277,11 @@ def _plan_softmax(node: Node, gm: GraphModule) -> TileConfig:
     dim = _softmax_axis(node, gm)
     row_len = int(shape[dim])
     num_rows = _prod(shape) // row_len
+    # emit_softmax falls back to PyTorch when a row does not fit one vector (row_len > 32).
     return TileConfig(
         kernel_type="softmax",
-        params=dict(num_rows=num_rows, row_len=row_len, softmax_dim=dim),
+        params=dict(num_rows=num_rows, row_len=row_len, softmax_dim=dim,
+                    use_numpy=(row_len > 32)),
     )
 
 
@@ -229,13 +290,18 @@ def _plan_add(node: Node) -> TileConfig:
     total = 1
     for d in (shape or [1]):
         total *= d
-    # 2048-wide FFN bias add: multi-tile C path may deviate in sim; set
-    # ``ATALLA_FFN_ADD_NUMPY=0`` to force the AtallaC add image in validate.
-    ffn_add_numpy = os.environ.get("ATALLA_FFN_ADD_NUMPY", "1") == "1"
-    use_numpy = ffn_add_numpy and total > 1024
+    # Multi-tile adds (> 1024 elements, i.e. more than one 32x32 scratchpad tile)
+    # run on the emulator by default since the ``kernels/add.py`` tile-stride fix
+    # (the old failure was a compiler addi_s immediate overflow, see
+    # docs/add_kernel_multitile_fix.md). ``ATALLA_FFN_ADD_NUMPY=1`` restores the
+    # previous behaviour (adds > 1024 elements on NumPy); ``0``/unset = emulator.
+    # ``ATALLA_FFN_ADD_NUMPY_THRESHOLD=N`` (set by the ``add_numpy_threshold`` override)
+    # generalises the 1024 cut-off.
+    threshold = add_numpy_threshold_from_env()
+    use_numpy = threshold is not None and total > threshold
     return TileConfig(
         kernel_type="add",
-        params=dict(total_elements=total, use_numpy=use_numpy),
+        params=dict(total_elements=total, use_numpy=use_numpy, numpy_threshold=threshold),
     )
 
 
@@ -255,13 +321,13 @@ def _plan_sdpa(node: Node, gm: GraphModule) -> TileConfig:
     if not node.args or not isinstance(node.args[0], Node):
         return TileConfig(
             kernel_type="atalla_sdpa",
-            params=dict(B=1, N=1, D=1, use_flash=False, inv_sqrt_d=1.0),
+            params=dict(B=1, N=1, D=1, use_flash=False, use_numpy=True, inv_sqrt_d=1.0),
         )
     qs = get_node_shape(node.args[0])
     if not qs or len(qs) < 2:
         return TileConfig(
             kernel_type="atalla_sdpa",
-            params=dict(B=1, N=1, D=1, use_flash=False, inv_sqrt_d=1.0),
+            params=dict(B=1, N=1, D=1, use_flash=False, use_numpy=True, inv_sqrt_d=1.0),
         )
     d_last = int(qs[-1])
     n_head = int(qs[-2])
@@ -282,6 +348,7 @@ def _plan_sdpa(node: Node, gm: GraphModule) -> TileConfig:
             N=n_head,
             D=d_last,
             use_flash=use_flash,
+            use_numpy=(not use_flash),
             inv_sqrt_d=inv,
         ),
     )
@@ -311,7 +378,8 @@ def _plan_flatten(node: Node) -> TileConfig:
 def _plan_adaptive_avg_pool(node: Node) -> TileConfig:
     shape = get_node_shape(node.args[0])
     C = shape[1] if shape and len(shape) >= 2 else 1
-    return TileConfig(kernel_type="adaptive_avg_pool", params=dict(channels=C))
+    # emit_node always evaluates adaptive_avg_pool with PyTorch (no AtallaC kernel yet).
+    return TileConfig(kernel_type="adaptive_avg_pool", params=dict(channels=C, use_numpy=True))
 
 
 def _prod(xs) -> int:
@@ -347,20 +415,37 @@ def _plan_layernorm(node: Node, gm: GraphModule) -> TileConfig:
     else:
         m_groups = _prod(inp_shape[:-nd])
 
+    # emit_layernorm uses AtallaC only when D is a non-zero multiple of 32.
+    use_hw = (d_norm % 32 == 0) and d_norm >= 32
     return TileConfig(
         kernel_type="layernorm",
-        params=dict(M=m_groups, D=d_norm, eps=eps, normalized_dims=nd),
+        params=dict(M=m_groups, D=d_norm, eps=eps, normalized_dims=nd, use_numpy=(not use_hw)),
     )
 
 
+def _tensor_outputs(meta, path=()):
+    """Yield tensor metadata leaves, including tuple-valued backward outputs."""
+    if hasattr(meta, "shape") and hasattr(meta, "dtype"):
+        yield path, meta
+    elif isinstance(meta, (tuple, list)):
+        for index, child in enumerate(meta):
+            yield from _tensor_outputs(child, path + (index,))
+    elif isinstance(meta, dict):
+        for key, child in meta.items():
+            yield from _tensor_outputs(child, path + (key,))
+
+
+def _tensor_output_bytes(meta) -> int:
+    count = math.prod(int(d) for d in meta.shape)
+    element_bytes = torch.empty((), dtype=meta.dtype).element_size()
+    return max(TILE_BYTES, _align(count * element_bytes, TILE_BYTES))
+
+
 def _output_bytes(node: Node) -> int:
-    shape = get_node_shape(node)
-    if shape is None:
-        return TILE_BYTES
-    total = 1
-    for d in shape:
-        total *= d
-    return _align(total * 2, TILE_BYTES)  # bf16
+    outputs = list(_tensor_outputs(node.meta.get("tensor_meta")))
+    if outputs:
+        return sum(_tensor_output_bytes(meta) for _, meta in outputs)
+    return TILE_BYTES
 
 
 def plan_tiles(gm: GraphModule) -> GraphModule:
@@ -398,10 +483,32 @@ def plan_tiles(gm: GraphModule) -> GraphModule:
             tc = _plan_layernorm(node, gm)
         elif atalla_op == "gelu":
             tc = _plan_gelu(node)
+        elif atalla_op in ("threshold_backward", "aten.threshold_backward.default"):
+            tc = _plan_threshold_backward(node)
+        elif atalla_op in ("sum_dim", "aten.sum.dim_IntList"):
+            tc = _plan_sum_dim(node)
+        elif atalla_op in ("mse_loss", "aten.mse_loss.default"):
+            tc = _plan_mse_loss(node)
+        elif atalla_op in ("mse_loss_backward", "aten.mse_loss_backward.default"):
+            tc = _plan_mse_loss_backward(node)
+        elif atalla_op == "batchnorm":
+            tc = _plan_batchnorm(node)
+        elif atalla_op == "upsample":
+            tc = _plan_upsample(node)
 
         if tc is not None:
             node.meta["tile_config"] = tc
             node.meta["kernel_type"] = tc.kernel_type
+        elif gm.meta.get("include_backward") and node.op in (
+            "call_function", "call_method", "call_module"
+        ):
+            # Capture and allocate new operations without pretending a kernel
+            # implementation or hardware tiling strategy already exists.
+            node.meta["tile_config"] = TileConfig(
+                kernel_type=atalla_op, params={"pending": True}
+            )
+            node.meta["kernel_type"] = atalla_op
+            node.meta["requires_kernel"] = True
 
         if node.op == "output":
             continue
@@ -410,7 +517,24 @@ def plan_tiles(gm: GraphModule) -> GraphModule:
         aligned = _align(next_addr, TILE_BYTES)
         node.meta["dram_addr"] = aligned
         node.meta["dram_bytes"] = nbytes
+        if gm.meta.get("include_backward"):
+            offset = aligned
+            outputs = []
+            for path, meta in _tensor_outputs(node.meta.get("tensor_meta")):
+                size = _tensor_output_bytes(meta)
+                outputs.append(dict(
+                    path=path, shape=tuple(meta.shape), dtype=str(meta.dtype),
+                    dram_addr=offset, dram_bytes=size,
+                ))
+                offset += size
+            node.meta["dram_outputs"] = outputs
         next_addr = aligned + nbytes
+
+    if gm.meta.get("include_backward"):
+        gm.meta["pending_kernel_ops"] = sorted({
+            n.meta["atalla_op"] for n in gm.graph.nodes
+            if n.meta.get("requires_kernel")
+        })
 
     gm.graph.lint()
     gm.recompile()

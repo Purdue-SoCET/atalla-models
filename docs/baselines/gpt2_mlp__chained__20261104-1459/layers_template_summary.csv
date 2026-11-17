@@ -1,0 +1,6 @@
+template_key,map_kind,map_M,map_N,map_K,n_layers,layer_names,sum_packets_executed,sum_instructions_executed,sum_sched_packets,sum_flops_total,sum_flops_matmul,mean_packet_share,sum_bytes_loaded,sum_bytes_written,sum_bytes_loaded_sp0,sum_bytes_loaded_sp1,sum_bytes_stored_sp0,sum_bytes_stored_sp1,reuse_R_A_gemm,reuse_R_W_gemm,sum_dyn_retired_branch_control,sum_dyn_retired_sdma,sum_dyn_retired_scalar_mem,sum_dyn_retired_scalar_alu,sum_dyn_retired_vector_mem,sum_dyn_retired_vector_alu,sum_dyn_retired_gemm_systolic,sum_dyn_retired_move_convert
+add|rows128|width32,add,128,32,,1,add_1,3503,5062,104,10029,0,0.140553,16384,8192,8192,8192,8192,0,,,275,12,996,2243,1152,256,0,128
+add|rows32|width32,add,32,32,,2,add_2;add,1810,2606,208,5046,0,0.036312,8192,4096,4096,4096,4096,0,,,142,6,528,1162,576,128,0,64
+gemm|M32|N128|K32,gemm,32,128,32,1,matmul,6409,7758,281,268874,262144,0.257152,24832,8192,8448,16384,0,8192,31.826941,16.410767,567,20,2443,2672,1544,128,256,128
+gemm|M32|N32|K128,gemm,32,32,128,1,matmul_1,6370,7719,281,268871,262144,0.255587,24832,8192,8448,16384,0,8192,31.826586,16.410583,555,20,2422,2666,1544,128,256,128
+layernorm|M32|D32,layernorm,32,32,,1,layer_norm,6831,8571,259,17751,0,0.274084,10240,2048,10240,0,2048,0,,,387,192,2362,3806,1056,448,0,320

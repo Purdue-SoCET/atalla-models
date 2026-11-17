@@ -28,6 +28,12 @@ _OP_MAP: Dict[object, str] = {
     torch.mm: "matmul",
     torch.bmm: "matmul",
     torch.ops.aten.matmul.default: "matmul",
+    torch.ops.aten.mm.default: "matmul",
+    torch.ops.aten.bmm.default: "matmul",
+    torch.ops.aten.t.default: "transpose",
+    torch.ops.aten.transpose.int: "transpose",
+    torch.ops.aten.view.default: "flatten",
+    torch.ops.aten.reshape.default: "flatten",
     F.relu: "relu",
     torch.relu: "relu",
     torch.ops.aten.relu.default: "relu",
@@ -102,18 +108,34 @@ def _get_module(gm: GraphModule, target: str) -> nn.Module:
 
 
 def normalize_ops(gm: GraphModule) -> GraphModule:
-    """Tag every node with node.meta['atalla_op'] identifying the Atalla primitive."""
+    """Canonicalize operations and tag each node with its Atalla primitive."""
     for node in gm.graph.nodes:
         op_name = None
 
         if node.op == "call_function":
+            if node.target == torch.ops.aten.t.default:
+                shape = get_node_shape(node.args[0])
+                if shape is None:
+                    raise ValueError("aten.t normalization requires shape propagation first")
+                if len(shape) > 2:
+                    raise ValueError("aten.t only supports tensors with at most two dimensions")
+                # t() swaps matrix axes, but is an identity for vectors/scalars.
+                node.target = torch.ops.aten.transpose.int
+                node.args = (node.args[0], 0, 1 if len(shape) == 2 else 0)
             op_name = _OP_MAP.get(node.target)
-            if op_name is None and hasattr(node.target, "__name__"):
+            if op_name is None and isinstance(node.target, torch._ops.OpOverload):
+                # Preserve the exact operator/overload for kernels not implemented
+                # yet. In particular, addmm has (bias, input, weight) arguments:
+                # labeling it "linear" would mislead the existing tile planner.
+                op_name = str(node.target)
+            elif op_name is None and hasattr(node.target, "__name__"):
                 fname = node.target.__name__.lower()
                 if "addmm" in fname:
                     op_name = "linear"
                 elif "matmul" in fname or "mm" in fname:
                     op_name = "matmul"
+                elif gm.meta.get("include_backward"):
+                    op_name = node.target.__name__
 
         elif node.op == "call_method":
             op_name = _METHOD_MAP.get(node.target)
@@ -148,6 +170,6 @@ def get_node_shape(node: Node) -> Optional[Tuple[int, ...]]:
         return None
     if hasattr(tm, "shape"):
         return tuple(int(d) for d in tm.shape)
-    if isinstance(tm, tuple):
+    if isinstance(tm, tuple) and all(isinstance(d, int) for d in tm):
         return tuple(int(d) for d in tm)
     return None

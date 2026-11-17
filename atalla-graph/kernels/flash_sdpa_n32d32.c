@@ -7,10 +7,15 @@
 /*
  * Flash-attention matched contract (N=32, D=32, non-causal):
  *   Q @ K^T -> row softmax -> (softmax probs) @ V
- * DRAM layout matches functional_sim/kernels/build_flash_attention.py:
- *   scale (f32) @ 0x0C00, Q @ 0x1000, K @ 0x3000, V @ 0x5000, O @ 0x7000
- * Scratchpad:
- *   sid0 row 0 used for single-row DMA / vector loads.
+ * DRAM layout (see codegen/c_emitter.py::emit_sdpa, docs/flash_sdpa_investigation.md):
+ *   scale (f32) @ 0x0C00, Q @ 0x1000 (N,D row-major), K @ 0x3000 (N,D row-major),
+ *   V @ 0x5000 stored TRANSPOSED (V^T, (D,N) row-major), O @ 0x7000 (N,D row-major).
+ * Weight contract of the functional sim's gemm.vv: lane j of the output is the dot
+ * product of the activation with the j-th stationary weight column; the reversed
+ * load loop below (idx = 31 - col, in shift mode) puts scratchpad row j into column j.
+ * So the K tile is used row-major (s[j] = q . K[j,:]) and the V tile must hold V^T
+ * (o[j] = p . V[:,j]).  All scratchpad traffic uses SP0 (sid 0): the K/V tiles are
+ * DMA'd with sid 0 and must be read back with sid 0 (vector_load 4th arg = sid).
  *
  * Keep Unix (LF) line endings — CRLF breaks atalla_cc / ppci and yields wrong code.
  * Canonical source: aihw-ppci-compiler/atalla_tests/kernels/flash_attention_n32_d32.c
@@ -48,7 +53,7 @@ int main() {
         int col = 0;
         while (col < N) {
             int idx = (N - 1) - col;
-            vec k_row = vector_load(sp, idx, N_M1, 1);
+            vec k_row = vector_load(sp, idx, N_M1, 0);
             load_weights(k_row);
             col = col + 1;
         }

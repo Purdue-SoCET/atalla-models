@@ -4,8 +4,9 @@ This guide walks through adding a compute kernel to the Atalla pipeline: standal
 
 ## Prerequisites
 
-- Clone **with submodules** (`functional_sim`, `aihw-ppci-compiler`). See `README.md`.
-- Python env with **PyTorch**, **NumPy**.
+- Clone **with submodules** (`functional_sim`, `aihw-ppci-compiler`, both on Purdue ITaP). See `README.md` and `docs/ENVIRONMENT.md`.
+- Python **3.11** venv with **PyTorch**, **NumPy**, **pytest**, and `pip install -e aihw-ppci-compiler`.
+- Run the two test suites before and after: `python -m pytest atalla-graph/tests -q` and `python -m pytest tests/kernels -q` (or `./run_kernel_tests.sh`).
 - From repo root, emulator code lives in **`functional_sim/`** (submodule); graph code in **`atalla-graph/`**.
 
 ## Architecture (four layers)
@@ -97,9 +98,32 @@ print(text[:800])
 "
 ```
 
+## Step 2b: Static `.c` kernel + standalone test (`atalla-graph/kernels/<op>.c`, `tests/kernels/test_<op>.py`)
+
+Newer kernels (avgpool, batchnorm, gelu, upsample, sum_dim, mse_loss, threshold_backward) are developed as a
+**static `.c` file** with a fixed ADDR_TABLE layout, verified by a pytest in `tests/kernels/` that runs the
+5-step flow: `atalla_cc -p -S` (compiler packetizer) -> spill check (no `sw_s`/`lw_s` on `x8` inside the loop)
+-> `build_compiler.py --prepacked` -> `run.py` -> BF16 NumPy golden diff. Copy `tests/kernels/test_avgpool.py`;
+paths come from `tests/kernels/_paths.py` (`ATALLA_COMPILER_PATH` / `ATALLA_SIM_PATH` or the submodules).
+
+Current kernel style: read the config table through a pointer, no inline asm for loads, and finish with
+`atalla_halt()`:
+
+```c
+int main() {
+    int* cfg_ptr = (int*)60;          /* ADDR_TABLE = 0x3C */
+    int IN_GMEM  = *(cfg_ptr + 0);
+    int OUT_GMEM = *(cfg_ptr + 1);
+    ...
+    atalla_halt();
+    return 0;
+}
+```
+
 ## Step 3: Generator (`atalla-graph/kernels/<op>.py`)
 
 Return AtallaC source as a string. Match **argument order** used in **`gemm.py` / `relu.py`** for `vector_load` / `vector_store` / `scpad_load`.
+The sketch below still shows the older `asm("lw_s ...")` config loads for reference; new generators should use the `*(cfg_ptr + n)` / `atalla_halt()` form shown in Step 2b (see `kernels/relu.py`).
 
 Example shape (adjust ops and SDMA vars):
 
@@ -171,6 +195,14 @@ python run_graph.py --model basic --mode validate --metrics-json metrics_basic.j
 ```
 
 Expect **`emulator`** (not `NumPy`) for your op; check per-node cosine / `max_diff` in verbose logs.
+For the backward path, `--training` validates loss and parameter gradients; add a `_plan_<op>_backward`
+in `graph/tile_planner.py` and an `emit_<op>_backward` in `codegen/c_emitter.py`.
+
+Record a baseline with the harness (`bench/run_benchmark.py`, output under `docs/baselines/`; rebuild the
+workbook with `bench/build_workbook.py`).
+
+**GEMM note:** if you bump the compiler/sim pins past the `investigate-weight-load-order` change, the
+`lw.vi` order becomes last-to-first and the weight loop in `kernels/gemm.py` must be reversed.
 <!--
 
 ## Common issues
@@ -190,7 +222,9 @@ Expect **`emulator`** (not `NumPy`) for your op; check per-node cosine / `max_di
 |-------|----------|
 | Emulator loop | `functional_sim/src/functional_sim.py` |
 | Scratchpad / GMEM vector access | `functional_sim/src/components/scpad_ls.py` |
-| Scheduler + encoder | `functional_sim/build_compiler.py` |
+| Scheduler + encoder (legacy path used by the graph) | `functional_sim/build_compiler.py` |
+| VLIW packetizer (compiler path, `atalla_cc -p`) | `aihw-ppci-compiler/ppci/arch/atalla/packetizer.py` |
+| `.in` -> flat RAM hex for RTL | `functional_sim/merged_in_to_ram_hex.py` (see `docs/flat_ram_layout_finding.md`) |
 | DRAM + single-issue asm | `functional_sim/build.py` |
 | Opcodes | `functional_sim/src/misc/opcode_table.py` |
 | Compiler backend | `aihw-ppci-compiler/ppci/arch/atalla/` |

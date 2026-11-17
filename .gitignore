@@ -13,3 +13,10 @@ build/
 .pytest_cache/
 out/
 atalla-graph/out/
+*.in
+.venv/
+.venvs/
+.DS_Store
+atalla-graph/out/**
+out/**
+*.hex

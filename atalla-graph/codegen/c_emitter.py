@@ -40,6 +40,7 @@ from __future__ import annotations
 import importlib.util
 import math
 import os
+import struct
 from collections import Counter
 import subprocess
 import sys
@@ -50,7 +51,14 @@ import numpy as np
 import torch
 from torch.fx import GraphModule, Node
 
-_FUNC_SIM = Path(__file__).resolve().parent.parent.parent / "functional_sim"
+_models_root = Path(__file__).resolve().parents[2]
+_workspace_root = Path(__file__).resolve().parents[3]
+_FUNC_SIM = Path(os.environ.get("ATALLA_SIM_PATH", ""))
+if not (_FUNC_SIM / "src").exists():
+    for cand in (_models_root / "functional_sim", _workspace_root / "atalla-functional-sim", _workspace_root / "functional_sim"):
+        if (cand / "src").exists():
+            _FUNC_SIM = cand
+            break
 _FUNC_KERNELS = _FUNC_SIM / "kernels"
 for _p in (_FUNC_SIM, _FUNC_KERNELS):
     if str(_p) not in sys.path:
@@ -86,9 +94,17 @@ _maxpool_c = _ek.maxpool_c
 _add_c = _ek.add_c
 _mul_c = _ek.mul_c
 _layernorm_c = _ek.layernorm_c
+_threshold_backward_c = _ek.threshold_backward_c
+_sum_dim_c = _ek.sum_dim_c
+_mse_loss_c = _ek.mse_loss_c
+_mse_loss_backward_c = _ek.mse_loss_backward_c
 
-_default_compiler = Path(__file__).resolve().parent.parent.parent / "aihw-ppci-compiler"
-_COMPILER = Path(os.environ.get("ATALLA_COMPILER_PATH", str(_default_compiler)))
+_COMPILER = Path(os.environ.get("ATALLA_COMPILER_PATH", ""))
+if not (_COMPILER / "atalla_cc").exists():
+    for cand in (_models_root / "aihw-ppci-compiler", _workspace_root / "aihw-ppci-compiler"):
+        if (cand / "atalla_cc").exists():
+            _COMPILER = cand
+            break
 
 from build import DRAMWriter, render_testfile
 from build_conv_tiled import im2col
@@ -448,6 +464,299 @@ def emit_relu(node: Node, input_data: np.ndarray, tc: TileConfig) -> LayerEmissi
         "map_rows": int(rows),
         "map_width": int(width),
         "bytes_est_in": int(rows * width * 2),
+        "bytes_est_out": int(rows * width * 2),
+    }
+    return em
+
+
+def emit_threshold_backward(
+    node: Node, activation_cache: Dict[str, np.ndarray], tc: TileConfig
+) -> LayerEmission:
+    p = tc.params
+    out_shape = get_node_shape(node)
+    total = int(p.get("total_elements", 0) or 0)
+    if total <= 0 and out_shape:
+        total = int(math.prod(out_shape))
+
+    grad_arg = node.args[0] if len(node.args) > 0 else None
+    x_arg = node.args[1] if len(node.args) > 1 else None
+
+    grad_data = (
+        activation_cache.get(grad_arg.name)
+        if isinstance(grad_arg, Node)
+        else (grad_arg if isinstance(grad_arg, np.ndarray) else None)
+    )
+    x_data = (
+        activation_cache.get(x_arg.name)
+        if isinstance(x_arg, Node)
+        else (x_arg if isinstance(x_arg, np.ndarray) else None)
+    )
+
+    if grad_data is None and x_data is not None:
+        grad_data = np.zeros_like(x_data)
+    elif x_data is None and grad_data is not None:
+        x_data = np.zeros_like(grad_data)
+    elif grad_data is None and x_data is None:
+        grad_data = np.zeros(total or 1, dtype=np.float32)
+        x_data = np.zeros(total or 1, dtype=np.float32)
+
+    grad_flat = np.asarray(grad_data, dtype=np.float32).ravel()
+    x_flat = np.asarray(x_data, dtype=np.float32).ravel()
+
+    if total <= 0:
+        total = max(int(grad_flat.size), int(x_flat.size))
+
+    out_shape_resolved = out_shape if out_shape else (total,)
+    width = 32
+    rows = math.ceil(total / width)
+    sp_rows = min(rows, TILE)
+    tile_count = math.ceil(rows / sp_rows)
+    tile_bytes = sp_rows * width * 2
+
+    sdma_sp0 = sdma_ctl_val(0, sp_rows, width, width)
+    sdma_sp1 = sdma_ctl_val(1, sp_rows, width, width)
+
+    GRAD_GMEM = 0x1000
+    X_GMEM = GRAD_GMEM + _align_data(rows * width * 2)
+    OUT_GMEM = X_GMEM + _align_data(rows * width * 2)
+
+    img = DRAMWriter()
+    img.u32(ADDR_TABLE + 0, GRAD_GMEM)
+    img.u32(ADDR_TABLE + 4, X_GMEM)
+    img.u32(ADDR_TABLE + 8, OUT_GMEM)
+    img.u32(ADDR_TABLE + 12, tile_count)
+    img.u32(ADDR_TABLE + 16, sp_rows)
+    img.u32(ADDR_TABLE + 20, sdma_sp0)
+    img.u32(ADDR_TABLE + 24, sdma_sp1)
+    img.u32(ADDR_TABLE + 28, tile_bytes)
+
+    padded_grad = np.zeros(rows * width, dtype=np.float32)
+    padded_x = np.zeros(rows * width, dtype=np.float32)
+    padded_grad[: min(len(grad_flat), rows * width)] = grad_flat[: rows * width]
+    padded_x[: min(len(x_flat), rows * width)] = x_flat[: rows * width]
+
+    for i in range(rows * width):
+        img.bf16(GRAD_GMEM + i * 2, float(padded_grad[i]))
+        img.bf16(X_GMEM + i * 2, float(padded_x[i]))
+
+    em = LayerEmission()
+    em.c_source = _threshold_backward_c(total, width)
+    em.dram = img
+    em.output_addr = OUT_GMEM
+    em.output_shape = out_shape_resolved
+    em.output_elements = total
+    em.layer_metrics = {
+        "map_kind": "threshold_backward",
+        "map_rows": int(rows),
+        "map_width": int(width),
+        "bytes_est_in": int(rows * width * 4),
+        "bytes_est_out": int(rows * width * 2),
+    }
+    return em
+
+
+def emit_sum_dim(
+    node: Node, input_data: np.ndarray, tc: TileConfig
+) -> LayerEmission:
+    p = tc.params
+    out_shape = get_node_shape(node)
+    num_rows = int(p.get("num_rows", 1))
+    num_cols = int(p.get("num_cols", 32))
+    if num_rows <= 0:
+        num_rows = 1
+    if num_cols <= 0:
+        num_cols = 32
+
+    width = min(num_cols, 32)
+    col_tiles = math.ceil(num_cols / width)
+
+    IN_GMEM = 0x1000
+    OUT_GMEM = IN_GMEM + _align_data(num_rows * num_cols * 2)
+
+    sdma_ctl_in = sdma_ctl_val(0, num_rows, width, num_cols)
+    sdma_ctl_out = sdma_ctl_val(0, 1, width, num_cols)
+    in_tile_bytes = width * 2
+    out_tile_bytes = width * 2
+
+    img = DRAMWriter()
+    img.u32(ADDR_TABLE + 0, IN_GMEM)
+    img.u32(ADDR_TABLE + 4, OUT_GMEM)
+    img.u32(ADDR_TABLE + 8, num_rows)
+    img.u32(ADDR_TABLE + 12, col_tiles)
+    img.u32(ADDR_TABLE + 16, sdma_ctl_in)
+    img.u32(ADDR_TABLE + 20, sdma_ctl_out)
+    img.u32(ADDR_TABLE + 24, in_tile_bytes)
+    img.u32(ADDR_TABLE + 28, out_tile_bytes)
+
+    flat_in = np.asarray(input_data, dtype=np.float32).ravel()
+    padded_in = np.zeros(num_rows * num_cols, dtype=np.float32)
+    padded_in[: min(len(flat_in), len(padded_in))] = flat_in[: len(padded_in)]
+
+    for i in range(num_rows * num_cols):
+        img.bf16(IN_GMEM + i * 2, float(padded_in[i]))
+
+    out_shape_resolved = out_shape if out_shape else (num_cols,)
+
+    em = LayerEmission()
+    em.c_source = _sum_dim_c(num_rows, num_cols)
+    em.dram = img
+    em.output_addr = OUT_GMEM
+    em.output_shape = out_shape_resolved
+    em.output_elements = num_cols
+    em.layer_metrics = {
+        "map_kind": "sum_dim",
+        "map_rows": int(num_rows),
+        "map_cols": int(num_cols),
+        "bytes_est_in": int(num_rows * num_cols * 2),
+        "bytes_est_out": int(num_cols * 2),
+    }
+    return em
+
+
+def emit_mse_loss(
+    node: Node, activation_cache: Dict[str, np.ndarray], tc: TileConfig
+) -> LayerEmission:
+    p = tc.params
+    total = int(p.get("total_elements", 32))
+    width = 32
+    rows = math.ceil(total / width)
+    sp_rows = min(rows, TILE)
+    tile_count = math.ceil(rows / sp_rows)
+    tile_bytes = sp_rows * width * 2
+    scale = float(1.0 / max(total, 1))
+
+    x_arg = node.args[0] if len(node.args) > 0 else None
+    y_arg = node.args[1] if len(node.args) > 1 else None
+
+    x_data = activation_cache.get(x_arg.name) if isinstance(x_arg, Node) else None
+    y_data = activation_cache.get(y_arg.name) if isinstance(y_arg, Node) else None
+
+    if x_data is None:
+        x_data = np.zeros(total, dtype=np.float32)
+    if y_data is None:
+        y_data = np.zeros(total, dtype=np.float32)
+
+    flat_x = np.asarray(x_data, dtype=np.float32).ravel()
+    flat_y = np.asarray(y_data, dtype=np.float32).ravel()
+
+    X_GMEM = 0x1000
+    Y_GMEM = X_GMEM + _align_data(rows * width * 2)
+    OUT_GMEM = Y_GMEM + _align_data(rows * width * 2)
+
+    sdma_sp0 = sdma_ctl_val(0, sp_rows, width, width)
+    sdma_sp1 = sdma_ctl_val(1, sp_rows, width, width)
+    sdma_out = sdma_ctl_val(0, 1, 1, 1)
+
+    img = DRAMWriter()
+    img.u32(ADDR_TABLE + 0, X_GMEM)
+    img.u32(ADDR_TABLE + 4, Y_GMEM)
+    img.u32(ADDR_TABLE + 8, OUT_GMEM)
+    img.u32(ADDR_TABLE + 12, tile_count)
+    img.u32(ADDR_TABLE + 16, sp_rows)
+    img.u32(ADDR_TABLE + 20, sdma_sp0)
+    img.u32(ADDR_TABLE + 24, sdma_sp1)
+    img.u32(ADDR_TABLE + 28, tile_bytes)
+    img.f32(ADDR_TABLE + 32, scale)
+    img.u32(ADDR_TABLE + 36, sdma_out)
+
+    padded_x = np.zeros(rows * width, dtype=np.float32)
+    padded_y = np.zeros(rows * width, dtype=np.float32)
+    padded_x[: min(len(flat_x), len(padded_x))] = flat_x[: len(padded_x)]
+    padded_y[: min(len(flat_y), len(padded_y))] = flat_y[: len(padded_y)]
+
+    for i in range(rows * width):
+        img.bf16(X_GMEM + i * 2, float(padded_x[i]))
+        img.bf16(Y_GMEM + i * 2, float(padded_y[i]))
+
+    em = LayerEmission()
+    em.c_source = _mse_loss_c(total, width)
+    em.dram = img
+    em.output_addr = OUT_GMEM
+    em.output_shape = ()
+    em.output_elements = 1
+    em.layer_metrics = {
+        "map_kind": "mse_loss",
+        "map_rows": int(rows),
+        "map_width": int(width),
+        "bytes_est_in": int(rows * width * 4),
+        "bytes_est_out": 2,
+    }
+    return em
+
+
+def emit_mse_loss_backward(
+    node: Node, activation_cache: Dict[str, np.ndarray], tc: TileConfig
+) -> LayerEmission:
+    p = tc.params
+    total = int(p.get("total_elements", 32))
+    width = 32
+    rows = math.ceil(total / width)
+    sp_rows = min(rows, TILE)
+    tile_count = math.ceil(rows / sp_rows)
+    tile_bytes = sp_rows * width * 2
+    scale = float(2.0 / max(total, 1))
+
+    # PyTorch aten.mse_loss_backward signature: (grad_out, pred, target)
+    if len(node.args) >= 3:
+        x_arg = node.args[1]
+        y_arg = node.args[2]
+    elif len(node.args) == 2:
+        x_arg = node.args[0]
+        y_arg = node.args[1]
+    else:
+        x_arg, y_arg = None, None
+
+    x_data = activation_cache.get(x_arg.name) if isinstance(x_arg, Node) else None
+    y_data = activation_cache.get(y_arg.name) if isinstance(y_arg, Node) else None
+
+    if x_data is None:
+        x_data = np.zeros(total, dtype=np.float32)
+    if y_data is None:
+        y_data = np.zeros(total, dtype=np.float32)
+
+    flat_x = np.asarray(x_data, dtype=np.float32).ravel()
+    flat_y = np.asarray(y_data, dtype=np.float32).ravel()
+
+    out_shape = get_node_shape(node) or (total,)
+
+    X_GMEM = 0x1000
+    Y_GMEM = X_GMEM + _align_data(rows * width * 2)
+    OUT_GMEM = Y_GMEM + _align_data(rows * width * 2)
+
+    sdma_sp0 = sdma_ctl_val(0, sp_rows, width, width)
+    sdma_sp1 = sdma_ctl_val(1, sp_rows, width, width)
+
+    img = DRAMWriter()
+    img.u32(ADDR_TABLE + 0, X_GMEM)
+    img.u32(ADDR_TABLE + 4, Y_GMEM)
+    img.u32(ADDR_TABLE + 8, OUT_GMEM)
+    img.u32(ADDR_TABLE + 12, tile_count)
+    img.u32(ADDR_TABLE + 16, sp_rows)
+    img.u32(ADDR_TABLE + 20, sdma_sp0)
+    img.u32(ADDR_TABLE + 24, sdma_sp1)
+    img.u32(ADDR_TABLE + 28, tile_bytes)
+    img.f32(ADDR_TABLE + 32, scale)
+
+    padded_x = np.zeros(rows * width, dtype=np.float32)
+    padded_y = np.zeros(rows * width, dtype=np.float32)
+    padded_x[: min(len(flat_x), len(padded_x))] = flat_x[: len(padded_x)]
+    padded_y[: min(len(flat_y), len(padded_y))] = flat_y[: len(padded_y)]
+
+    for i in range(rows * width):
+        img.bf16(X_GMEM + i * 2, float(padded_x[i]))
+        img.bf16(Y_GMEM + i * 2, float(padded_y[i]))
+
+    em = LayerEmission()
+    em.c_source = _mse_loss_backward_c(total, width)
+    em.dram = img
+    em.output_addr = OUT_GMEM
+    em.output_shape = out_shape
+    em.output_elements = total
+    em.layer_metrics = {
+        "map_kind": "mse_loss_backward",
+        "map_rows": int(rows),
+        "map_width": int(width),
+        "bytes_est_in": int(rows * width * 4),
         "bytes_est_out": int(rows * width * 2),
     }
     return em
@@ -813,14 +1122,18 @@ def emit_sdpa(
     q_addr, k_addr, v_addr, o_addr = 0x1000, 0x3000, 0x5000, 0x7000
     img = DRAMWriter()
     img.f32(scale_addr, inv)
-    # K scratchpad in flash kernel is consumed column-wise; layout matches
-    # functional_sim contract_flash: row-major of K with matmul (Q @ K^T) — same
-    # storage as aihw-ppci flash test (K at 0x3000 as (N,D) in row order).
+    # Systolic weight contract (functional_sim gemm.vv): each lw.vi'd vector w_c becomes
+    # weight column c and gemm computes out[j] = sum_k a[k] * G[k, j] = sum_k a[k] * w_j[k],
+    # i.e. lane j of the output is (activation . w_j).  The kernel loads tile row c as w_c
+    # (reversed + shift mode, so DRAM row c -> column c).  Hence:
+    #   scores: s[j] = q . K[j, :]  -> K tile row-major (w_j = K row j)      (K at 0x3000)
+    #   P @ V : o[j] = p . V[:, j]  -> V tile must be V^T  (w_j = V column j) (V at 0x5000)
+    # Storing V row-major made the kernel compute P @ V^T (docs/flash_sdpa_investigation.md).
     for i, val in enumerate(qf[0].reshape(-1)):
         img.bf16(q_addr + i * 2, float(val))
     for i, val in enumerate(kf[0].reshape(-1)):
         img.bf16(k_addr + i * 2, float(val))
-    for i, val in enumerate(vf[0].reshape(-1)):
+    for i, val in enumerate(np.ascontiguousarray(vf[0].T).reshape(-1)):
         img.bf16(v_addr + i * 2, float(val))
     for i in range(n * d):
         img.bf16(o_addr + i * 2, 0.0)
@@ -1064,8 +1377,42 @@ def emit_layernorm(
     return em
 
 
+def _f32_bits(v: float) -> int:
+    return struct.unpack("<I", struct.pack("<f", float(v)))[0]
+
+
+# Polynomial coefficients mirror tests/kernels/test_gelu.py (Aman's standalone suite).
+_GELU_HORNER_WORDS = [0.001803, -0.037653, 0.360243, 0.008555, 0.5, 3.0, -3.0]
+_GELU_TANH_WORDS = [
+    0.797885, 0.035677, -0.002561, 0.039209, -0.237744, 0.968467, 1.0, -1.0, 0.5, 2.5, -2.5,
+]
+
+
+def gelu_kernel_method() -> str:
+    """``ATALLA_GELU_KERNEL`` selects the GELU path in validate.
+
+    "" / "0" / "torch" (default) -> PyTorch BF16 reference (NumPy fallback, no emulator).
+    "horner" -> kernels/gelu.c   (6th-degree minimax polynomial, ~0.018 max abs err)
+    "tanh"   -> kernels/gelu_tanh.c (tanh 7th-degree expansion, ~0.016 max abs err)
+    """
+    v = os.environ.get("ATALLA_GELU_KERNEL", "").strip().lower()
+    if v in ("", "0", "torch", "numpy", "off"):
+        return "torch"
+    if v in ("1", "horner"):
+        return "horner"
+    if v == "tanh":
+        return "tanh"
+    raise ValueError(f"ATALLA_GELU_KERNEL={v!r}: expected '', 'horner' or 'tanh'")
+
+
 def emit_gelu(node: Node, input_data: np.ndarray, tc: TileConfig) -> LayerEmission:
-    """GELU via PyTorch BF16 (ISA kernel TBD)."""
+    """GELU: PyTorch BF16 reference by default; ``ATALLA_GELU_KERNEL=horner|tanh`` emits
+    Aman's standalone AtallaC kernel (kernels/gelu.c / gelu_tanh.c) and runs it on the emulator.
+
+    Kernel ADDR_TABLE layout (bytes from ADDR_TABLE=60), same as tests/kernels/test_gelu.py:
+      +0 IN_GMEM, +4 OUT_GMEM, +8 tile_count, +12 sp_rows, +16 sdma_sp0, +20 tile_bytes,
+      +24.. float32 coefficients (7 for horner, 11 for tanh).
+    """
     p = tc.params
     total = int(p["total_elements"])
     flat = np.asarray(input_data, dtype=np.float32).flatten()[:total]
@@ -1073,27 +1420,136 @@ def emit_gelu(node: Node, input_data: np.ndarray, tc: TileConfig) -> LayerEmissi
         pad = np.zeros(total, dtype=np.float32)
         pad[: flat.size] = flat
         flat = pad
-    x = torch.from_numpy(flat).to(torch.bfloat16)
-    try:
-        y = torch.nn.functional.gelu(x, approximate="tanh")
-    except TypeError:
-        y = torch.nn.functional.gelu(x)
-    y = y.float().numpy()
     out_shape = get_node_shape(node)
     os = tuple(out_shape) if out_shape else (total,)
+    # tile_planner records the method (and graph/overrides may rewrite it); env is the fallback.
+    method = str(p.get("method") or gelu_kernel_method()).lower()
+    if method in ("pytorch", "numpy", ""):
+        method = "torch"
+
+    if method == "torch":
+        x = torch.from_numpy(flat).to(torch.bfloat16)
+        try:
+            y = torch.nn.functional.gelu(x, approximate="tanh")
+        except TypeError:
+            y = torch.nn.functional.gelu(x)
+        y = y.float().numpy()
+        em = LayerEmission()
+        em.skip_emulator = True
+        em.numpy_result = y.reshape(os)
+        em.output_shape = os
+        em.output_elements = total
+        em.dram = DRAMWriter()
+        em.layer_metrics = {"map_kind": "gelu", "gelu_method": "torch", "use_numpy": True}
+        return em
+
+    width = TILE
+    rows = math.ceil(total / width)
+    sp_rows = min(rows, 32)
+    tile_count = math.ceil(rows / sp_rows)
+    tile_bytes = sp_rows * width * 2
+    sdma_sp0 = sdma_ctl_val(0, sp_rows, width, width)
+
+    IN_GMEM = 0x1000
+    OUT_GMEM = IN_GMEM + _align_data(tile_count * tile_bytes)
+
+    img = DRAMWriter()
+    img.u32(ADDR_TABLE + 0, IN_GMEM)
+    img.u32(ADDR_TABLE + 4, OUT_GMEM)
+    img.u32(ADDR_TABLE + 8, tile_count)
+    img.u32(ADDR_TABLE + 12, sp_rows)
+    img.u32(ADDR_TABLE + 16, sdma_sp0)
+    img.u32(ADDR_TABLE + 20, tile_bytes)
+    coeffs = _GELU_HORNER_WORDS if method == "horner" else _GELU_TANH_WORDS
+    for i, c in enumerate(coeffs):
+        img.u32(ADDR_TABLE + 24 + 4 * i, _f32_bits(c))
+
+    padded = np.zeros(tile_count * sp_rows * width, dtype=np.float32)
+    padded[: flat.size] = flat
+    for i in range(padded.size):
+        img.bf16(IN_GMEM + i * 2, float(padded[i]))
+
     em = LayerEmission()
-    em.skip_emulator = True
-    em.numpy_result = y.reshape(os)
+    em.c_source = _ek.gelu_c(method=method)
+    em.dram = img
+    em.output_addr = OUT_GMEM
     em.output_shape = os
     em.output_elements = total
-    em.dram = DRAMWriter()
+    em.layer_metrics = {
+        "map_kind": "gelu",
+        "gelu_method": method,
+        "map_rows": int(rows),
+        "map_width": int(width),
+        "map_tiles": int(tile_count),
+        "bytes_est_in": int(rows * width * 2),
+        "bytes_est_out": int(rows * width * 2),
+    }
     return em
+
+
+# atalla_op values that emit_node dispatches (anything else returns None -> passthrough).
+EMITTER_OPS = frozenset({
+    "conv", "linear", "relu", "softmax", "maxpool", "adaptive_avg_pool", "matmul", "add",
+    "mul", "atalla_sdpa", "layernorm", "gelu",
+    "threshold_backward", "aten.threshold_backward.default",
+    "sum_dim", "aten.sum.dim_IntList",
+    "mse_loss", "aten.mse_loss.default",
+    "mse_loss_backward", "aten.mse_loss_backward.default",
+})
+
+# atalla_op -> (kernel name, file under atalla-graph/kernels/, kind). ``None`` = NumPy/PyTorch only.
+# Variants (gelu method, sdpa flash) are resolved by kernel_source_for().
+_KERNEL_SOURCES = {
+    "conv": ("gemm", "gemm.py", "generator"),          # im2col (functional_sim build_conv_tiled) + _gemm_c
+    "linear": ("gemm", "gemm.py", "generator"),
+    "matmul": ("gemm", "gemm.py", "generator"),
+    "relu": ("relu", "relu.py", "generator"),
+    "softmax": ("softmax", "softmax.py", "generator"),
+    "maxpool": ("maxpool", "maxpool.py", "generator"),
+    "add": ("add", "add.py", "generator"),
+    "mul": ("mul", "mul.py", "generator"),
+    "layernorm": ("layernorm", "layernorm.py", "generator"),
+    "atalla_sdpa": ("flash_sdpa_n32d32", "flash_sdpa_n32d32.c", "static_c"),
+    "gelu": ("gelu", "gelu.c", "static_c"),
+    "threshold_backward": ("threshold_backward", "threshold_backward.c", "static_c"),
+    "aten.threshold_backward.default": ("threshold_backward", "threshold_backward.c", "static_c"),
+    "sum_dim": ("sum_dim", "sum_dim.c", "static_c"),
+    "aten.sum.dim_IntList": ("sum_dim", "sum_dim.c", "static_c"),
+    "mse_loss": ("mse_loss", "mse_loss.c", "static_c"),
+    "aten.mse_loss.default": ("mse_loss", "mse_loss.c", "static_c"),
+    "mse_loss_backward": ("mse_loss_backward", "mse_loss_backward.c", "static_c"),
+    "aten.mse_loss_backward.default": ("mse_loss_backward", "mse_loss_backward.c", "static_c"),
+    "adaptive_avg_pool": None,
+}
+
+
+def has_emitter(atalla_op: Optional[str]) -> bool:
+    """True when :func:`emit_node` has an ``emit_<op>`` path for *atalla_op*."""
+    return atalla_op in EMITTER_OPS
+
+
+def kernel_source_for(atalla_op: Optional[str], tc: Optional[TileConfig]) -> Optional[Dict[str, str]]:
+    """Which kernel generator / static C file *atalla_op* maps to (repo-relative ``source``)."""
+    entry = _KERNEL_SOURCES.get(atalla_op)
+    if entry is None:
+        return None
+    name, fname, kind = entry
+    p = tc.params if tc is not None else {}
+    if atalla_op == "gelu":
+        method = str(p.get("method") or "torch").lower()
+        if method == "tanh":
+            name, fname = "gelu_tanh", "gelu_tanh.c"
+        elif method in ("torch", "pytorch", ""):
+            return None
+    if atalla_op == "atalla_sdpa" and not p.get("use_flash"):
+        return None
+    return {"name": name, "source": f"atalla-graph/kernels/{fname}", "kind": kind}
 
 
 def emit_node(node: Node, gm: GraphModule,
               activation_cache: Dict[str, np.ndarray]) -> Optional[LayerEmission]:
     tc = node.meta.get("tile_config")
-    if tc is None:
+    if tc is None or tc.params.get("pending"):
         return None
 
     atalla_op = node.meta.get("atalla_op")
@@ -1145,6 +1601,14 @@ def emit_node(node: Node, gm: GraphModule,
         return emit_layernorm(node, gm, input_data, activation_cache, tc)
     elif atalla_op == "gelu":
         return emit_gelu(node, input_data, tc)
+    elif atalla_op in ("threshold_backward", "aten.threshold_backward.default"):
+        return emit_threshold_backward(node, activation_cache, tc)
+    elif atalla_op in ("sum_dim", "aten.sum.dim_IntList"):
+        return emit_sum_dim(node, input_data, tc)
+    elif atalla_op in ("mse_loss", "aten.mse_loss.default"):
+        return emit_mse_loss(node, activation_cache, tc)
+    elif atalla_op in ("mse_loss_backward", "aten.mse_loss_backward.default"):
+        return emit_mse_loss_backward(node, activation_cache, tc)
 
     return None
 
