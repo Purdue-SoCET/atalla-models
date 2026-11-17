@@ -9,6 +9,20 @@ Two schedules are generated from the same DRAM layout (``_write_gemm_*`` in
     ``gemm`` rows and stores the C tile back.  Scratchpad roles: SP0 = zero row
     + A, SP1 = W then C.
 
+``weight_stationary``
+    Loop order ``ni > ki > mi``: each weight tile is DMA'd into SP1 and pushed
+    into the array (32 ``lw.vi``) once per (ni, ki) and then reused by all
+    ``M_tiles`` row tiles.  Because C cannot stay resident across ``ki`` (one
+    tile per scratchpad, and SP0 is reused by every mi), the C tile makes a
+    DRAM round trip per (ni, ki, mi), exactly as in ``baseline``; for
+    ``K_tiles == 1`` that is the single load/store ``double_buffer`` also does.
+    Scratchpad roles as in ``double_buffer`` (SP0 = C, SP1 = W then A); the
+    zero row is only DMA'd for partial-N tiles and ``push_weights`` is shared.
+
+``auto``
+    Per-GEMM selection rule (:func:`auto_schedule`): ``weight_stationary`` when
+    it moves no more DMA bytes than ``double_buffer``, else ``double_buffer``.
+
 ``double_buffer``
     Same loop order and the same arithmetic, but the C tile is resident in SP0
     for the whole K sweep (one load before ``ki = 0``, one store after the last
@@ -36,7 +50,7 @@ import os
 
 from .common import ADDR_TABLE, TILE, sdma_ctl_expr
 
-SCHEDULES = ("baseline", "double_buffer")
+SCHEDULES = ("baseline", "double_buffer", "weight_stationary", "auto")
 SCHEDULE_ENV = "ATALLA_GEMM_SCHEDULE"
 
 
@@ -66,6 +80,10 @@ def gemm_c(M: int, N: int, K: int, schedule: str | None = None) -> str:
         return _gemm_c_baseline(M, N, K)
     if sched == "double_buffer":
         return _gemm_c_double_buffer(M, N, K)
+    if sched == "weight_stationary":
+        return _gemm_c_weight_stationary(M, N, K)
+    if sched == "auto":
+        return gemm_c(M, N, K, schedule=auto_schedule(M, N, K))
     raise ValueError(f"unknown GEMM schedule {sched!r}; expected one of {', '.join(SCHEDULES)}")
 
 
@@ -321,6 +339,153 @@ def _gemm_c_double_buffer(M: int, N: int, K: int) -> str:
         "            ni = ni + 1;\n"
         "        }\n"
         "        mi = mi + 1;\n"
+        "    }\n"
+        "\n"
+        "    atalla_halt();\n"
+        "    return 0;\n"
+        "}\n"
+    )
+
+
+def _tiles(M: int, N: int, K: int):
+    tm, tn, tk = min(TILE, M), min(TILE, N), min(TILE, K)
+    return (math.ceil(M / TILE), math.ceil(N / TILE), math.ceil(K / TILE), tm, tn, tk)
+
+
+def gemm_traffic(M: int, N: int, K: int, schedule: str) -> dict:
+    """Analytic per-GEMM DMA/systolic counts (BF16, 32x32 tiles, as generated).
+
+    Returns ``bytes_loaded``, ``bytes_written``, ``sdma`` (scpad_load + scpad_store
+    issued) and ``lw_vi`` (``load_weights`` retired).
+    """
+    Mt, Nt, Kt, tm, tn, tk = _tiles(M, N, K)
+    W = 2 * tn * tk
+    A = 2 * tm * tk
+    C = 2 * tm * tn
+    zp = 1 if tn < TILE else 0
+    steps = Mt * Nt * Kt
+    if schedule == "baseline":
+        return dict(bytes_loaded=steps * (64 + W + A + C), bytes_written=steps * C,
+                    sdma=steps * 5, lw_vi=steps * TILE)
+    if schedule == "double_buffer":
+        return dict(bytes_loaded=steps * (64 * zp + W + A) + Mt * Nt * C,
+                    bytes_written=Mt * Nt * C,
+                    sdma=steps * (2 + zp) + Mt * Nt * 2, lw_vi=steps * TILE)
+    if schedule == "weight_stationary":
+        return dict(bytes_loaded=Nt * Kt * (64 * zp + W) + steps * (A + C),
+                    bytes_written=steps * C,
+                    sdma=Nt * Kt * (1 + zp) + steps * 3, lw_vi=Nt * Kt * TILE)
+    if schedule == "auto":
+        return gemm_traffic(M, N, K, auto_schedule(M, N, K))
+    raise ValueError(schedule)
+
+
+def auto_schedule(M: int, N: int, K: int) -> str:
+    """Per-GEMM selection rule between ``double_buffer`` and ``weight_stationary``.
+
+    ``weight_stationary`` saves ``(Mt-1)*Nt*Kt`` weight-tile fetches (bytes, SDMA and
+    32 ``lw.vi`` each) but gives up C residency across K (``2*Mt*Nt*(Kt-1)`` extra C
+    tile transfers).  Pick it iff ``Mt > 1`` and its DMA bytes (loaded + written)
+    do not exceed ``double_buffer``'s; ties go to ``weight_stationary`` because it
+    also retires fewer ``lw.vi``.  With ``Kt == 1`` this reduces to ``Mt > 1``.
+    """
+    Mt = math.ceil(M / TILE)
+    if Mt <= 1:
+        return "double_buffer"
+    ws = gemm_traffic(M, N, K, "weight_stationary")
+    db = gemm_traffic(M, N, K, "double_buffer")
+    if ws["bytes_loaded"] + ws["bytes_written"] <= db["bytes_loaded"] + db["bytes_written"]:
+        return "weight_stationary"
+    return "double_buffer"
+
+
+def _gemm_c_weight_stationary(M: int, N: int, K: int) -> str:
+    tn1 = min(TILE, N) - 1
+    tk1 = min(TILE, K) - 1
+    tile_m = min(TILE, M)
+    tile_n = min(TILE, N)
+    tile_k = min(TILE, K)
+    k_stride = int(math.ceil(max(K, 1) / TILE) * TILE)
+    # SP1 streams W (pushed into the array once per (ni, ki)) and then each A tile.
+    sdma_a_s = sdma_ctl_expr("sdma_ctl_a", 1, tile_m, tile_k, k_stride)
+    sdma_w_s = sdma_ctl_expr("sdma_ctl_w", 1, tile_n, tile_k, k_stride)
+    # SP0 holds the C tile of the current (mi, ni); it round-trips per K step.
+    sdma_c_s = sdma_ctl_expr("sdma_ctl_c", 0, tile_m, tile_n, N)
+    sdma_z_s = sdma_ctl_expr("sdma_ctl_z", 1, 1, TILE, TILE)
+
+    return (
+        f"{_fetch_weight_tile_c(tile_n, tk1, sdma_z_s)}"
+        "\n"
+        f"{_push_weights_c(tk1)}"
+        "\n"
+        "int main() {\n"
+        f"    int* cfg = (int*){ADDR_TABLE};\n"
+        "    int A_GMEM = *(cfg + 0);\n"
+        "    int W_GMEM = *(cfg + 1);\n"
+        "    int C_GMEM = *(cfg + 2);\n"
+        "    int gM = *(cfg + 3);\n"
+        "    int gN = *(cfg + 4);\n"
+        "    int gK = *(cfg + 5);\n"
+        "    int M_tiles = *(cfg + 6);\n"
+        "    int N_tiles = *(cfg + 7);\n"
+        "    int K_tiles = *(cfg + 8);\n"
+        "    int tile_sz = *(cfg + 9);\n"
+        "\n"
+        "    int all_mask = -1;\n"
+        "    int sp_c = 0;\n"
+        "    int sp_s = 0;\n"
+        # Byte strides held in registers (no large addi_s immediates).
+        "    int k_step = tile_sz * 2;\n"
+        "    int a_mstep = tile_sz * gK * 2;\n"
+        "    int c_mstep = tile_sz * gN * 2;\n"
+        f"{sdma_a_s}"
+        f"{sdma_w_s}"
+        f"{sdma_c_s}"
+        "\n"
+        "    int ni = 0;\n"
+        "    while (ni < N_tiles) {\n"
+        "            int w_off = ni * tile_sz * gK;\n"
+        "            int w_byte = w_off * 2;\n"
+        "            int w_addr = W_GMEM + w_byte;\n"
+        "            int c_noff = ni * tile_sz * 2;\n"
+        "            int c_naddr = C_GMEM + c_noff;\n"
+        "            int a_kaddr = A_GMEM;\n"
+        "\n"
+        "            int ki = 0;\n"
+        "            while (ki < K_tiles) {\n"
+        "                fetch_weight_tile(sp_s, w_addr, sdma_ctl_w);\n"
+        "                push_weights(sp_s, tile_sz);\n"
+        "\n"
+        "                int a_addr = a_kaddr;\n"
+        "                int c_addr = c_naddr;\n"
+        "                int mi = 0;\n"
+        "                while (mi < M_tiles) {\n"
+        "                    scpad_load(sp_c, c_addr, sdma_ctl_c);\n"
+        "                    scpad_load(sp_s, a_addr, sdma_ctl_a);\n"
+        "\n"
+        "                    int ri = 0;\n"
+        f"                    while (ri < {tile_m}) {{\n"
+        f"                        vec a_row = vector_load(sp_s, ri, {tk1}, 1);\n"
+        f"                        vec c_row = vector_load(sp_c, ri, {tn1}, 0);\n"
+        "\n"
+        "                        vec result = gemm(a_row, c_row, all_mask);\n"
+        "\n"
+        f"                        vector_store(result, sp_c, ri, {tn1}, 0);\n"
+        "                        ri = ri + 1;\n"
+        "                    }\n"
+        "\n"
+        "                    scpad_store(sp_c, c_addr, sdma_ctl_c);\n"
+        "                    a_addr = a_addr + a_mstep;\n"
+        "                    c_addr = c_addr + c_mstep;\n"
+        "                    mi = mi + 1;\n"
+        "                }\n"
+        "\n"
+        "                a_kaddr = a_kaddr + k_step;\n"
+        "                w_addr = w_addr + k_step;\n"
+        "                ki = ki + 1;\n"
+        "            }\n"
+        "\n"
+        "        ni = ni + 1;\n"
         "    }\n"
         "\n"
         "    atalla_halt();\n"
