@@ -236,6 +236,87 @@ assert np.frombuffer(result.buffers['output'], dtype='<i4')[0] == 24
 ```
 
 
+## Named convolutions (`linalg.conv_*`) as compiler-built ELFs
+
+`ConvOp` and `execute_conv` (`conv_runtime.py`) run the 19 named Linalg
+convolutions of the pinned LLVM (`opdsl/ops/core_named_ops.py`). Each name has
+an entry point `kernels/<name>.c`; all share `kernels/conv_engine.h`.
+`graph/conv.py` maps the op's operand axes onto one canonical loop nest
+through byte strides and chooses the path; `codegen/conv.py` packs that plan.
+
+| Family | Ops | bf16 path |
+|---|---|---|
+| Channel-free | `conv_1d`, `conv_2d`, `conv_3d` | vector lanes, per-op bf16 rounding |
+| Channel-last | `conv_1d_nwc_wcf`, `conv_2d_nhwc_hwcf`, `conv_2d_nhwc_fhwc`, `conv_2d_nhwgc_gfhwc`, `conv_3d_ndhwc_dhwcf` | systolic array |
+| Channel-first | `conv_1d_ncw_fcw`, `conv_2d_nchw_fchw`, `conv_2d_ngchw_fgchw`, `conv_2d_ngchw_gfchw`, `conv_3d_ncdhw_fcdhw` | systolic array after on-device restaging |
+| Quantized | `conv_2d_nhwc_hwcf_q`, `conv_2d_nhwc_fhwc_q`, `conv_2d_nchw_fchw_q`, `conv_2d_ngchw_gfchw_q`, `conv_2d_nhwgc_gfhwc_q`, `conv_3d_ndhwc_dhwcf_q` | (integer only) scalar |
+
+**Array path.** Implicit GEMM: for each output tile (up to 32 pixels along the
+innermost output axis x 32 filters, resident in SP1), each tap and each
+32-channel tile loads the filter columns with `lw.vi` (last filter first: each
+`lw.vi` shifts into column 0) and runs one `gemm.vv` per pixel row. The output
+tile is read and written once per tile, not per tap. Input, filter and output
+must be contiguous along channels / channels / filters; any that is not
+(NCHW input and output, FCHW or HWCF filters) is restaged on device into a
+channel-last workspace by array transposes, which load a tile as weights and
+multiply by identity rows. One extra `gemm.vv` on a zero row flags rows
+holding NaN/Inf (0*Inf is NaN); those rows are copied element by element, so
+restaging is exact for every value. The array rounds once per (tap, channel
+tile) step instead of once per product, so bf16 results stay within the
+accumulated bf16 rounding of the float64 result rather than matching Linalg's
+per-operation rounding bit for bit.
+
+**Lane path** (`conv_1d/2d/3d`, bf16): 32 outputs per vector, one SDMA,
+`mul.vs` and `add.vv` per tap in Linalg order; bit-exact per-operation bf16.
+
+**Scalar path**: integer inputs (i8, i16, i32) accumulated in i32 modulo 2^32,
+quantized zero points subtracted after the signed cast, odd byte alignment,
+strides the SDMA cannot express, and outputs aliasing an input (the kernel
+snapshots the aliased buffer first). Loops follow Linalg's reduction order, so
+bf16 here is bit-exact too. Empty reductions leave the output untouched.
+
+**Build and run.** `codegen/elf_image.py` compiles and packetizes the kernel
+with PPCI and links it with one data section: configuration words at
+`0x80000` (`ELF_CONFIG`, `kernels/elf_config.h`), then tensors and
+workspaces. atalla-sim loads that ELF; the functional simulator loads the
+`.in` written from the same ELF (`scripts/atalla_sim_elf.py --to-in`), so both
+execute identical packets. `execute_conv(..., cycle=True)` returns both
+simulators' buffers. `ATALLA_SIM_PATH` selects the atalla-sim checkout;
+`ATALLA_OBJ_CACHE` reuses compiled objects across data images.
+
+```python
+from graph.layout import TensorView
+from graph.conv import ConvOp
+from conv_runtime import execute_conv
+
+op = ConvOp('linalg.conv_2d_nhwc_fhwc', TensorView('x', (1, 6, 6, 3), 'bf16'),
+            TensorView('w', (4, 3, 3, 3), 'bf16'), TensorView('y', (1, 4, 4, 4), 'bf16'),
+            strides=(1, 1), dilations=(1, 1))
+result = execute_conv(op, {'x': x_bytes, 'w': w_bytes, 'y': y_bytes}, 'out/conv', cycle=True)
+result.buffers['y'], result.cycle.cycles
+```
+
+Tests: `pytest tests/test_conv.py -n 16` (both simulators; set
+`ATALLA_CONV_CYCLE=0` for the functional simulator only). Performance:
+`python scripts/conv_perf.py --out DIR` (atalla-sim with Ramulator DDR4).
+
+Toolchain findings that shape these kernels:
+
+* PPCI `-O2` miscompiles a value merged after a conditional assignment
+  (`int p = x; if (p > q) { p = q; }` yields `q`). ELF kernels build with the
+  O2 pass list minus CleanPass (`level='safe'`), the same workaround the
+  atalla-inference runner uses.
+* The functional simulator compares scalar branches unsigned (registers are
+  stored masked to 32 bits); atalla-sim and the RTL compare signed. Kernel
+  loops never branch on a negative value.
+* `build_compiler`'s scheduler (the `.in` flow) can place two ops for one
+  execute unit in a packet; atalla-sim's decode then stalls forever. ELFs use
+  PPCI's packetizer, which atalla-sim accepts with no RTL packet violations.
+* An SDMA row pitch smaller than the row width does not produce overlapping
+  rows, so shifted windows are loaded one DMA per tap.
+* The functional simulator's scratchpads hold 32 rows, so SP0 is time-shared
+  between the weight and activation tiles and no DMA overlaps compute.
+
 ## Kernel and training branch boundaries
 
 `atalla-linalg-kernels` is based on `main` and contains standalone kernels and
