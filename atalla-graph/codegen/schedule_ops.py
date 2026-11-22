@@ -70,7 +70,9 @@ def pair(value):
 
 
 def op_for(node):
-    aliases = {"aten.detach.default": "detach", "aten.clone.default": "contiguous",
+    # aten.alias is a no-op view (newer torch emits it where older emitted detach).
+    aliases = {"aten.detach.default": "detach", "aten.alias.default": "detach",
+               "aten.clone.default": "contiguous",
                "aten._to_copy.default": "cast", "aten.ones_like.default": "ones_like",
                **{f"aten.{op}.default": op for op in
                   ("mse_loss", "mse_loss_backward", "threshold_backward")},
