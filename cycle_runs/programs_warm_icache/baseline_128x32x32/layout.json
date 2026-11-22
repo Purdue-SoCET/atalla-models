@@ -1,0 +1,19 @@
+{
+ "M": 128,
+ "N": 32,
+ "K": 32,
+ "schedule": "baseline",
+ "k_stride": 32,
+ "ADDR_TABLE": 60,
+ "A_GMEM": 4096,
+ "W_GMEM": 16384,
+ "C_GMEM": 24576,
+ "Z_GMEM": 32768,
+ "seed": 42,
+ "traffic_model": {
+  "bytes_loaded": 24832,
+  "bytes_written": 8192,
+  "sdma": 20,
+  "lw_vi": 128
+ }
+}

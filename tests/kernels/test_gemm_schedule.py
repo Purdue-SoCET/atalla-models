@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GEMM schedule variants (``ATALLA_GEMM_SCHEDULE=baseline|double_buffer``).
+"""GEMM schedule variants (``ATALLA_GEMM_SCHEDULE=baseline|double_buffer|weight_stationary|auto``).
 
 Checks, for a 64x64x64 GEMM (2x2x2 tiles) and a partial-tile 40x20x100 GEMM:
 
@@ -7,7 +7,9 @@ Checks, for a 64x64x64 GEMM (2x2x2 tiles) and a partial-tile 40x20x100 GEMM:
 2. The ``double_buffer`` K-loop body issues exactly two ``scpad_load`` calls per
    iteration (the A tile and the next weight tile), and the C tile is loaded /
    stored once per (mi, ni) outside the K loop.
-3. Both variants run on the functional simulator through the same
+3. ``weight_stationary`` uses loop order ``ni > ki > mi`` with exactly one weight
+   fetch + push per (ni, ki) and C/A DMAs inside the mi loop.
+4. All variants run on the functional simulator through the same
    ``c_emitter`` pipeline ``run_graph.py`` uses, agree bit-for-bit, and match a
    NumPy BF16 reference (cosine >= 0.999).
 
@@ -49,8 +51,12 @@ def _load_graph_kernels():
 
 _gemm = _load_graph_kernels()
 SCHEDULES, gemm_c, gemm_schedule = _gemm.SCHEDULES, _gemm.gemm_c, _gemm.gemm_schedule
+gemm_traffic, auto_schedule = _gemm.gemm_traffic, _gemm.auto_schedule
 
 SHAPES = [(64, 64, 64), (40, 20, 100)]
+# Extra shapes for the sim agreement test: multi-M partial-N single-K (AlexNet conv
+# shape class), multi-M multi-N with a partial N tail and Kt > 1, and Mt = 1.
+SIM_SHAPES = SHAPES + [(96, 3, 27), (64, 40, 40), (1, 40, 40)]
 
 
 def _compile(c_source: str, tmp: Path, tag: str) -> str:
@@ -123,6 +129,21 @@ def test_both_variants_compile_and_double_buffer_structure():
             # Weight loop unrolled by 2.
             push_fn = db[db.index("void push_weights"):db.index("int main()")]
             assert push_fn.count("load_weights(") == 2 and "wi = wi + 2;" in push_fn
+
+            ws = gemm_c(M, N, K, schedule="weight_stationary")
+            main = ws[ws.index("int main()"):]
+            # Loop nest ni > ki > mi.
+            assert main.index("while (ni < N_tiles)") < main.index("while (ki < K_tiles)") \
+                < main.index("while (mi < M_tiles)")
+            wbody = _k_loop_body(ws)
+            mloop = wbody[wbody.index("while (mi < M_tiles)"):]
+            pre_m = wbody[:wbody.index("while (mi < M_tiles)")]
+            # One weight fetch + one push per (ni, ki), before (outside) the mi loop.
+            assert pre_m.count("fetch_weight_tile(") == 1 and pre_m.count("push_weights(") == 1
+            assert "fetch_weight_tile(" not in mloop and "push_weights(" not in mloop
+            # C round trip + A tile per (ni, ki, mi); A goes through SP1 after the push.
+            assert mloop.count("scpad_load(") == 2 and mloop.count("scpad_store(") == 1
+            assert "load_weights(" not in main, "lw.vi only via push_weights"
 
             base = gemm_c(M, N, K, schedule="baseline")
             bbody = _k_loop_body(base)
@@ -206,7 +227,7 @@ def _run_gemm_on_sim(M: int, N: int, K: int, sched: str, A: np.ndarray, W: np.nd
 def test_schedules_agree_on_sim():
     rng = np.random.default_rng(42)
     with tempfile.TemporaryDirectory() as td:
-        for M, N, K in SHAPES:
+        for M, N, K in SIM_SHAPES:
             A = _bf16_round(rng.standard_normal((M, K)).astype(np.float32))
             W = _bf16_round(rng.standard_normal((K, N)).astype(np.float32) * 0.2)
             ref = A @ W
@@ -218,15 +239,33 @@ def test_schedules_agree_on_sim():
                 r = ref.flatten()
                 cos = float(np.dot(c, r) / (np.linalg.norm(c) * np.linalg.norm(r)))
                 assert cos >= 0.999, f"{sched} {M}x{N}x{K}: cosine {cos}"
-            np.testing.assert_array_equal(
-                outs["baseline"].view(np.uint32), outs["double_buffer"].view(np.uint32),
-                err_msg=f"{M}x{N}x{K}: schedules differ bit-wise",
-            )
-            # Data-movement accounting: fewer DMA bytes, never more.
+            for sched in SCHEDULES[1:]:
+                np.testing.assert_array_equal(
+                    outs["baseline"].view(np.uint32), outs[sched].view(np.uint32),
+                    err_msg=f"{M}x{N}x{K}: {sched} differs bit-wise from baseline",
+                )
+            # Data-movement accounting matches the analytic model exactly.
+            for sched in SCHEDULES:
+                exp = gemm_traffic(M, N, K, sched)
+                for key in ("bytes_loaded", "bytes_written"):
+                    got = perfs[sched].get(key)
+                    if got is not None:
+                        assert got == exp[key], (M, N, K, sched, key, got, exp[key])
             b0 = perfs["baseline"].get("bytes_loaded")
             b1 = perfs["double_buffer"].get("bytes_loaded")
             if b0 is not None and b1 is not None:
                 assert b1 <= b0, (b0, b1)
+
+
+def test_auto_rule():
+    # AlexNetSmall conv shapes (Mt > 1, Kt = 1): weight-stationary.
+    for shape in [(1024, 1, 27), (256, 1, 9), (64, 3, 9), (64, 2, 27)]:
+        assert auto_schedule(*shape) == "weight_stationary", shape
+    # Mt = 1 (classifier / GPT-2 at T = 32) and multi-K multi-M: double_buffer.
+    for shape in [(1, 40, 40), (32, 128, 32), (32, 32, 128), (64, 64, 64), (40, 20, 100)]:
+        assert auto_schedule(*shape) == "double_buffer", shape
+    for M, N, K in SIM_SHAPES:
+        assert gemm_c(M, N, K, schedule="auto") == gemm_c(M, N, K, schedule=auto_schedule(M, N, K))
 
 
 if __name__ == "__main__":
@@ -236,4 +275,5 @@ if __name__ == "__main__":
     else:
         test_both_variants_compile_and_double_buffer_structure()
         test_schedules_agree_on_sim()
+        test_auto_rule()
         print("ok")

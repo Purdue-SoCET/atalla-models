@@ -1,0 +1,5 @@
+--input=params.npy@60:u32
+--input=a.npy@0x1000:bf16
+--input=wt.npy@0x4000:bf16
+--input=z.npy@0x8000:bf16
+--output=0x6000:128x32:bf16=C_cycle.npy

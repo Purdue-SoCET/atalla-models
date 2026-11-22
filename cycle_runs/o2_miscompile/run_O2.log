@@ -1,0 +1,48 @@
+assembly written to prog_O2.s
+gemm.c: 5600 cycles (0.9 s)
+machine: atalla-0x01: MEISSA, 16 lanes, 4 KB 4-way dcache, fixed 6-cycle DRAM, 8 B bursts
+
+5600 cycles
+
+where the cycles went:
+  frontend:refill            2321   41.4%
+  stall:hazard:sdma          1079   19.3%
+  frontend:icache             771   13.8%
+  issue                       657   11.7%
+  halt:drain                  350    6.2%
+  stall:hazard:scalar_alu      216    3.9%
+  stall:hazard:branch         126    2.2%
+  stall:hazard:scalar_load       56    1.0%
+  stall:regfile                19    0.3%
+  stall:ex4                     4    0.1%
+  stall:ex1                     1    0.0%
+
+issue: 657 packets (0.117/cycle), 700 ops (0.125/cycle), slots 26.6% full
+instruction mix: scalar_alu 259, branch 146, vreg_load 97, weight_load 32, convert 32, gemm 32, vector_lane 32, vreg_store 32, scalar_load 16, scalar_muldiv 9, scalar_store 7, sdma_load 4, sdma_store 1, halt 1
+
+unit busy:
+  dram_channel       1624   29.0%
+  gsau               1248   22.3%
+  sdma1              1063   19.0%
+  array              1024   18.3%
+  vlsu1               512    9.1%
+  sdma0               423    7.6%
+  dcache              267    4.8%
+  vlsu0               264    4.7%
+  lsu                 134    2.4%
+  lanes                64    1.1%
+  ex2                  32    0.6%
+  ex4                  18    0.3%
+
+DRAM: 12992 bytes in 1624 bursts, 2.32 B/cycle of 8 peak, channel busy 29.0%
+  icache      560 bursts     4480 bytes  waited 42 cycles
+  dcache       32 bursts      256 bytes  waited 8 cycles
+  scpad0      264 bursts     2112 bytes  waited 128 cycles
+  scpad1      768 bursts     6144 bytes  waited 488 cycles
+
+work: 66560 FLOPs (lanes 1024, array 65536), 11.9 FLOP/cycle, array MAC use 0.57%
+arithmetic intensity: 5.12 FLOP/DRAM byte
+
+reference result: not checked -- no reference for gemm in the compiler's harness
+output 0x7000 (bf16): shape 32x32, min 0, max 0, mean 0: [0, 0, 0, 0, 0, 0, ...]
+  saved to C_cycle.npy
