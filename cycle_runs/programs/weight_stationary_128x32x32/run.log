@@ -1,0 +1,58 @@
+assembly written to prog.s
+program image written to prog.in
+gemm.c: 28763 cycles (4.0 s)
+machine: atalla-0x01: MEISSA, 16 lanes, 4 KB 4-way dcache, fixed 6-cycle DRAM, 8 B bursts
+
+28763 cycles
+
+where the cycles went:
+  frontend:refill           14334   49.8%
+  issue                      5421   18.8%
+  stall:hazard:scalar_load     2575    9.0%
+  frontend:icache            2333    8.1%
+  stall:hazard:sdma          2099    7.3%
+  stall:hazard:scalar_alu     1188    4.1%
+  stall:hazard:branch         286    1.0%
+  stall:regfile               274    1.0%
+  halt:drain                  252    0.9%
+  stall:ex1                     1    0.0%
+
+issue: 5421 packets (0.188/cycle), 5697 ops (0.198/cycle), slots 26.3% full
+instruction mix: scalar_alu 2034, scalar_load 1417, vreg_load 704, vreg_store 544, branch 323, scalar_store 225, convert 128, gemm 128, vector_lane 128, weight_load 32, scalar_muldiv 20, sdma_load 9, sdma_store 4, halt 1
+
+unit busy:
+  gsau               4992   17.4%
+  lsu                4919   17.1%
+  dram_channel       4808   16.7%
+  dcache             4454   15.5%
+  array              4096   14.2%
+  vlsu3              2947   10.2%
+  sdma0              2713    9.4%
+  sdma1              2213    7.7%
+  vlsu1              1280    4.5%
+  vlsu0              1024    3.6%
+  lanes               256    0.9%
+  ex2                 128    0.4%
+  ex4                  40    0.1%
+
+DRAM: 38464 bytes in 4808 bursts, 1.34 B/cycle of 8 peak, channel busy 16.7%
+  icache     1416 bursts    11328 bytes  waited 338 cycles
+  dcache       64 bursts      512 bytes  waited 27 cycles
+  scpad0     2048 bursts    16384 bytes  waited 1662 cycles
+  scpad1     1280 bursts    10240 bytes  waited 896 cycles
+
+work: 266240 FLOPs (lanes 4096, array 262144), 9.3 FLOP/cycle, array MAC use 0.45%
+arithmetic intensity: 6.92 FLOP/DRAM byte
+
+performance report written to perf.json
+reference result: not checked -- no reference for gemm in the compiler's harness
+dependency check: 12 findings at 3 pcs
+  scpad.ld -> vreg.ld: a vreg.ld read a row an in-flight scpad.ld was still filling
+    0x320 (asm line 175), first at cycle 1237: vreg.ld of pad 1 row 0 (rs1 x10) while the scpad.ld at 0x12c (asm line 63) (rs1 x11) still fills rows 0-31; the load doesn't read x11, so nothing makes it wait
+      packet: vreg.ld v1, x10, x9
+    0x67c (asm line 347), first at cycle 1508: vreg.ld of pad 1 row 1 (rs1 x10) while the scpad.ld at 0x12c (asm line 63) (rs1 x11) still fills rows 0-31; the load doesn't read x11, so nothing makes it wait
+      packet: vreg.ld v1, x10, x9
+    0x201c (asm line 1682), first at cycle 4324 (10 times): vreg.ld of pad 1 row 0 (rs1 x10) while the scpad.ld at 0x1db0 (asm line 1554) (rs1 x11) still fills rows 0-31; the load doesn't read x11, so nothing makes it wait
+      packet: vreg.ld v1, x10, x9
+output 0x6000 (bf16): shape 128x32, min -4.438, max 4.469, mean 0.03336: [-1.422, 0.6094, 0.1309, 0.5078, 0.7422, -0.5391, ...]
+  saved to C_cycle.npy

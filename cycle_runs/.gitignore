@@ -1,0 +1,3 @@
+fsim/*.out
+fsim/*_mem.out
+C_cycle.npy.tmp

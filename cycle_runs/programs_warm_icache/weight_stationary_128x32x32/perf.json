@@ -1,0 +1,243 @@
+{
+ "cycles": 28220,
+ "cycle_breakdown": {
+  "frontend:refill": 14377,
+  "issue": 5421,
+  "stall:hazard:scalar_load": 2797,
+  "stall:hazard:sdma": 2127,
+  "frontend:icache": 1421,
+  "stall:hazard:scalar_alu": 1239,
+  "stall:hazard:branch": 288,
+  "stall:regfile": 274,
+  "halt:drain": 255,
+  "stall:hazard:scalar_muldiv": 20,
+  "stall:ex1": 1
+ },
+ "issue": {
+  "packets": 5421,
+  "packets_per_cycle": 0.19209780297661233,
+  "ops": 5697,
+  "ops_per_cycle": 0.2018781006378455,
+  "slot_utilization": 0.2627282789153293,
+  "flushes": 152,
+  "packets_fetched": 19719
+ },
+ "instruction_mix": {
+  "scalar_alu": 2034,
+  "scalar_load": 1417,
+  "vreg_load": 704,
+  "vreg_store": 544,
+  "branch": 323,
+  "scalar_store": 225,
+  "convert": 128,
+  "gemm": 128,
+  "vector_lane": 128,
+  "weight_load": 32,
+  "scalar_muldiv": 20,
+  "sdma_load": 9,
+  "sdma_store": 4,
+  "halt": 1
+ },
+ "unit_busy": {
+  "gsau": {
+   "cycles": 4992,
+   "fraction": 0.1768958185683912
+  },
+  "lsu": {
+   "cycles": 4945,
+   "fraction": 0.17523033309709427
+  },
+  "dcache": {
+   "cycles": 4441,
+   "fraction": 0.1573706591070163
+  },
+  "dram_channel": {
+   "cycles": 4192,
+   "fraction": 0.1485471296952516
+  },
+  "array": {
+   "cycles": 4096,
+   "fraction": 0.14514528703047483
+  },
+  "vlsu3": {
+   "cycles": 2947,
+   "fraction": 0.10442948263642807
+  },
+  "sdma0": {
+   "cycles": 2645,
+   "fraction": 0.09372785258681786
+  },
+  "sdma1": {
+   "cycles": 2198,
+   "fraction": 0.0778880226789511
+  },
+  "vlsu1": {
+   "cycles": 1280,
+   "fraction": 0.04535790219702339
+  },
+  "vlsu0": {
+   "cycles": 1024,
+   "fraction": 0.03628632175761871
+  },
+  "lanes": {
+   "cycles": 256,
+   "fraction": 0.009071580439404677
+  },
+  "ex2": {
+   "cycles": 128,
+   "fraction": 0.004535790219702338
+  },
+  "ex4": {
+   "cycles": 40,
+   "fraction": 0.001417434443656981
+  }
+ },
+ "memory": {
+  "dram_bursts": 4192,
+  "dram_bytes": 33536,
+  "dram_bytes_per_cycle": 1.1883770375620129,
+  "dram_peak_bytes_per_cycle": 8,
+  "dram_channel_busy": 0.1485471296952516,
+  "axi": null,
+  "masters": {
+   "icache": {
+    "bursts": 800,
+    "bytes": 6400,
+    "read_bytes": 6400,
+    "write_bytes": 0,
+    "wait_cycles": 305
+   },
+   "dcache": {
+    "bursts": 64,
+    "bytes": 512,
+    "read_bytes": 320,
+    "write_bytes": 192,
+    "wait_cycles": 19
+   },
+   "scpad0": {
+    "bursts": 2048,
+    "bytes": 16384,
+    "wait_cycles": 1573
+   },
+   "scpad1": {
+    "bursts": 1280,
+    "bytes": 10240,
+    "wait_cycles": 868
+   },
+   "scpad2": {
+    "bursts": 0,
+    "bytes": 0,
+    "wait_cycles": 0
+   },
+   "scpad3": {
+    "bursts": 0,
+    "bytes": 0,
+    "wait_cycles": 0
+   }
+  },
+  "icache": {
+   "fills": 100,
+   "iwait_cycles": 805
+  },
+  "dcache": {
+   "requests": 1642,
+   "hits": 1629,
+   "misses": 6,
+   "secondary": 7,
+   "retries": 0,
+   "fills": 6,
+   "present_fills": 1,
+   "evictions": 0,
+   "writebacks": 0,
+   "flush_writebacks": 3,
+   "max_mshrs": 2,
+   "fill_wait_cycles": 0,
+   "mem_wait_cycles": 44
+  },
+  "scratchpad": [
+   {
+    "tile": 0,
+    "reads": 256,
+    "writes": 256,
+    "stalls": 0,
+    "read_queue": 0,
+    "write_queue": 0
+   },
+   {
+    "tile": 1,
+    "reads": 160,
+    "writes": 160,
+    "stalls": 6,
+    "read_queue": 0,
+    "write_queue": 0
+   },
+   {
+    "tile": 2,
+    "reads": 0,
+    "writes": 0,
+    "stalls": 0,
+    "read_queue": 0,
+    "write_queue": 0
+   },
+   {
+    "tile": 3,
+    "reads": 416,
+    "writes": 416,
+    "stalls": 0,
+    "read_queue": 0,
+    "write_queue": 0
+   }
+  ]
+ },
+ "work": {
+  "flops": 266240,
+  "lane_flops": 4096,
+  "array_flops": 262144,
+  "flops_per_cycle": 9.434443656980864,
+  "array_mac_utilization": 0.004535790219702338,
+  "arithmetic_intensity": 7.938931297709924
+ },
+ "config": {
+  "name": "atalla-0x01",
+  "description": "the default machine: MEISSA array, 16 lanes, fixed-latency DRAM",
+  "core": {
+   "lane_count": 16,
+   "systolic_array": "meissa",
+   "lsu_depth": 4,
+   "warm_icache": true,
+   "icache_first_beat_wait": 0,
+   "icache_beat_wait": 0,
+   "ex_latency": {}
+  },
+  "dcache": {
+   "size_bytes": 4096,
+   "ways": 4,
+   "line_bytes": 64,
+   "mshrs": 8,
+   "targets_per_mshr": 8,
+   "sram_read_latency": 1,
+   "sram_write_latency": 4,
+   "beat_bytes": 8,
+   "first_beat_wait": 0,
+   "write_wait": 0
+  },
+  "memory": {
+   "dram": "fixed",
+   "dram_latency": 6,
+   "burst_bytes": 8,
+   "axi": "auto",
+   "ramulator_config": "rtl",
+   "ramulator": {},
+   "axi_params": {
+    "ar_depth": 4,
+    "aw_depth": 3,
+    "w_depth": 31,
+    "driver_beats": 4,
+    "drain_per_cycle": 8,
+    "burst_slots": 8192,
+    "single_depth": 8192,
+    "beat_bytes": 8
+   }
+  }
+ }
+}

@@ -1,0 +1,9 @@
+template_key,map_kind,map_M,map_N,map_K,n_layers,layer_names,sum_packets_executed,sum_instructions_executed,sum_sched_packets,sum_flops_total,sum_flops_matmul,mean_packet_share,sum_bytes_loaded,sum_bytes_written,sum_bytes_loaded_sp0,sum_bytes_loaded_sp1,sum_bytes_stored_sp0,sum_bytes_stored_sp1,reuse_R_A_gemm,reuse_R_W_gemm,sum_dyn_retired_branch_control,sum_dyn_retired_sdma,sum_dyn_retired_scalar_mem,sum_dyn_retired_scalar_alu,sum_dyn_retired_vector_mem,sum_dyn_retired_vector_alu,sum_dyn_retired_gemm_systolic,sum_dyn_retired_move_convert
+add|rows128|width32,add,128,32,,1,add_7,3503,5062,104,10029,0,0.069294,16384,8192,8192,8192,8192,0,,,275,12,996,2243,1152,256,0,128
+add|rows32|width32,add,32,32,,8,add_3;add_4;add_5;add;add_6;add_1;add_8;add_2,7240,10424,832,20184,0,0.017902,32768,16384,16384,16384,16384,0,,,568,24,2112,4648,2304,512,0,256
+gemm|M32|N128|K32,gemm,32,128,32,1,matmul_6,6409,7758,281,268874,262144,0.126778,24832,8192,8448,16384,0,8192,31.826941,16.410767,567,20,2443,2672,1544,128,256,128
+gemm|M32|N32|K128,gemm,32,32,128,1,matmul_7,6370,7719,281,268871,262144,0.126006,24832,8192,8448,16384,0,8192,31.826586,16.410583,555,20,2422,2666,1544,128,256,128
+gemm|M32|N32|K32,gemm,32,32,32,6,matmul_2;matmul_3;matmul_4;matmul;matmul_1;matmul_5,10032,12132,1686,403500,393216,0.033074,37248,12288,12672,24576,0,12288,31.841856,16.418457,882,30,3894,4242,2316,192,384,192
+layernorm|M32|D32,layernorm,32,32,,2,layer_norm;layer_norm_1,13662,17142,518,35502,0,0.135126,20480,4096,20480,0,4096,0,,,774,384,4724,7612,2112,896,0,640
+mul|mul|mul|,mul,mul,mul,,1,mul,1004,1305,110,2523,0,0.01986,4096,2048,2048,2048,2048,0,,,71,3,364,483,288,64,0,32
+softmax|rows32|len32,softmax,32,32,,1,softmax,2333,3047,106,9296,0,0.04615,2048,2048,2048,0,2048,0,,,67,64,751,1205,512,256,0,192
