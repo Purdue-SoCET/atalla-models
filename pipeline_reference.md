@@ -117,7 +117,7 @@ CLI: `--model {basic,alexnet_small,layernorm_smoke,vit_micro}`, `--mode {validat
 `load_model(name)` returns `(model, example_input, expected_output_or_None)`.
 
 - **`validate`:** compile → `build_compiler` → `.in` → emulator vs FX reference (cosine / max diff per node).
-- **`schedule`:** Vihaan's `generate_schedule` path (C-focused export).
+- **`schedule`:** `generate_schedule` uses `codegen/kernel_schedule.py` and the registry in `codegen/schedule_ops.py` to compose available kernels into one program. Forward coverage includes normalization, softmax, GELU, pooling, upsampling, and attention lowered to GEMM/mul/softmax. Basic MSE training graphs use existing loss/reduction/ReLU-backward kernels and explicit BF16/FP32 conversions. `--check-schedule` lists all unsupported operations/configurations. `--verify-schedule` compiles, simulates, and compares kernel and graph outputs (including loss/gradients) against PyTorch. See `atalla-graph/README.md` for limits and artifacts.
 - **`both`:** runs validate then schedule.
 - **`--training`:** `build_graph(include_backward=True)` captures forward + `nn.MSELoss` + `torch.autograd.grad`; validate then compares prediction, loss and every parameter gradient on the emulator. `run_schedule` still rejects combined graphs.
 

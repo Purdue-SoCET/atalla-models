@@ -94,6 +94,8 @@ class BackwardGraphTests(unittest.TestCase):
         # must not be reported as pending; the work list itself must exist.
         self.assertIn("pending_kernel_ops", gm.meta)
         self.assertNotIn("aten.threshold_backward.default", gm.meta["pending_kernel_ops"])
+        self.assertTrue(any(n.meta.get("atalla_op") == "aten.threshold_backward.default"
+                            for n in gm.graph.nodes))
         # Existing weights are live graph attributes, not frozen trace constants.
         with torch.no_grad():
             model.output.bias.add_(1)
@@ -151,11 +153,9 @@ class BackwardGraphTests(unittest.TestCase):
                              example_target=x, loss_fn=F.mse_loss)
             prediction, loss, gradients = gm(x.bfloat16(), x)
             self.assertTrue(gradients)
-        # Schedule emission of combined graphs is still rejected.
-        with self.assertRaisesRegex(NotImplementedError, "backward kernels"):
+        with self.assertRaisesRegex(ValueError, "requires expected_output"):
             run_schedule(gm, x, "unused")
-        # Gradient validation is implemented (--training); it requires the target.
-        with self.assertRaisesRegex(ValueError, "expected_output"):
+        with self.assertRaisesRegex(ValueError, "requires expected_output"):
             run_validate(gm, model, x, "unused")
 
 
