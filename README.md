@@ -76,7 +76,7 @@ instruction section ──── + ────── data section
 atalla-models/
     atalla-graph/
         graph/                 fx_capture.py, tile_planner.py (+ upstream export/lower/allocator)
-        codegen/               c_emitter.py, dram_builder.py
+        codegen/               c_emitter.py, kernel_schedule.py, schedule_ops.py, dram_builder.py
         kernels/               AtallaC generators (*.py) + static reference kernels (*.c)
         model/                 basic.py, alexnet_small.py, layernorm_smoke.py, vit_micro.py, ...
         scripts/               generate_schedule.py, golden/regression harnesses
@@ -103,6 +103,15 @@ python run_graph.py --model alexnet_small --mode validate --scale 0.01
 
 python run_graph.py --model basic --mode schedule --out-dir out/graph
 
+# Compile the complete forward schedule, simulate it, and compare with PyTorch.
+python run_graph.py --model basic --mode schedule --out-dir out/schedule --verify-schedule
+
+# Compile and verify prediction, loss, and all parameter gradients together.
+python run_graph.py --model basic --training --mode schedule --out-dir out/schedule-training --verify-schedule
+
+# List every missing kernel/configuration before generation.
+python run_graph.py --model vit_micro --training --mode schedule --check-schedule
+
 python run_graph.py --model alexnet_small --mode validate --metrics-json metrics_alexnet.json
 
 # training path: forward + MSE loss + backward graph, gradients validated on the emulator
@@ -111,6 +120,45 @@ python run_graph.py --model basic --mode validate --training --out-dir out/train
 
 Models: `basic`, `alexnet_small`, `layernorm_smoke`, `vit_micro` (`load_model` returns
 `(model, example_input, expected_output_or_None)`; names not yet re-registered raise `Unknown model`).
+
+
+Schedule mode prints every kernel call in graph order, including its source,
+output shape, and output address. `codegen/schedule_ops.py` registers the available
+kernel sources, interfaces, and restrictions; `kernel_schedule.py` connects them
+in one program. Coverage includes GEMM/linear, convolution, add/mul/ReLU, softmax,
+LayerNorm, GELU, evaluation BatchNorm, pooling, nearest upsampling, and attention.
+Attention lowers to GEMM, scaling, softmax, and GEMM using existing kernels.
+Convolution uses GEMM with runtime im2col and output-layout conversion. Pooling's
+horizontal reduction also executes on the simulator. Batch-one AlexNetSmall is
+supported with its default 32x32 input, including all five convolutions and three pools.
+Reshapes, transposes, permutations, broadcasts, and BF16/FP32 conversions execute
+in the schedule. Basic-model backward schedules also execute MSE forward/backward,
+leading-axis sums, and ReLU backward, and return predictions, loss, and named
+parameter gradients. Loss arithmetic uses the available BF16 kernels with explicit
+FP32 input/output conversions. This computes gradients without updating weights.
+Captured training adapters include convolution, LayerNorm, GELU, and softmax
+backward, native max-pool with int64 indices and backward, arbitrary-axis sums,
+and tuple-result selectors. The new kernels use device scalar loops and live
+buffers. AlexNetSmall, LayerNorm smoke, and ViT Micro training graphs pass
+`--check-schedule`; numerical accuracy is checked separately by
+`--verify-schedule`. There are no reference fallbacks in schedules.
+See `atalla-graph/README.md` for exact kernel shape/mode restrictions.
+
+`--verify-schedule` compiles `graph_schedule.c` to `graph_schedule.s`, assembles
+`graph_schedule.in`, and runs the whole program once in the functional simulator.
+It compares every kernel output and the graph outputs against the traced BF16
+PyTorch graph, with no reference intermediates injected into execution. It writes
+`schedule_verify.json` (errors and pass/fail) and `schedule_outputs.npz` (result and
+reference tensors). Verification requires cosine >= 0.999, relative L2 <= 0.02,
+and relative maximum error <= 0.05; a failure exits with a nonzero status.
+These limits apply to every intermediate as well as the final output. In the
+default AlexNetSmall example, the final prediction passes, while one intermediate
+ReLU has relative L2 error 0.020042 against the 0.02 limit; the overall check
+therefore reports failure rather than hiding accumulated BF16 numerical error.
+The input/output addresses are in `schedule.json`, and `dram.bin` contains initial
+data and zero-initialized intermediate buffers. Generation alone does not compile
+or simulate the schedule.
+
 
 ### Tests
 
